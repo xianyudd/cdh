@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =====================================
-# cdh 一键安装脚本
+# cdh 一键安装脚本（可检测 fish 自带函数冲突）
 # 支持：Linux / macOS，fish / bash / zsh
 # =====================================
 
@@ -123,9 +123,24 @@ install_shell_integration() {
     fish)
       funcdir="${HOME}/.config/fish/functions"
       mkdir -p "$funcdir"
-      # fish 下定义 cdh 函数：带自动 cd
+
+      # 检查 fish 自带 cdh 函数是否存在
+      if fish -c "functions cdh" >/dev/null 2>&1; then
+        warn "检测到 fish 自带函数 cdh（Change Directory History）"
+        read -p "是否覆盖它以启用 Rust cdh？(y/N): " ans
+        ans="${ans:-N}"
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          fish -c "functions --erase cdh" || true
+          ok "已移除 fish 内置 cdh"
+        else
+          ok "保留 fish 原有 cdh，不安装覆盖函数"
+          return 0
+        fi
+      fi
+
+      # 定义 cdh 函数（覆盖或新增）
       cat > "${funcdir}/cdh.fish" <<'FISH'
-function cdh -d "change directory via cdh TUI"
+function cdh -d "cd via Rust cdh (TUI)"
     set -l bin (command -v cdh)
     if not test -x "$bin"
         echo "cdh: not found" >&2
@@ -139,7 +154,7 @@ end
 FISH
       ok "已安装 fish 函数：cdh（含自动 cd）"
 
-      # 覆盖 cd 函数以记录历史
+      # 安装目录日志功能
       cat > "${funcdir}/cd.fish" <<'FISH'
 functions --erase cd 2>/dev/null
 function cd --wraps=cd -d "cd + log to ~/.cd_history(_raw)"
@@ -163,10 +178,9 @@ FISH
 
     bash|zsh|*)
       rc="${HOME}/.${SHELL_BASENAME}rc"
-      # 添加 cdh 函数
       if ! grep -q "__cdh_func" "$rc" 2>/dev/null; then
         cat >> "$rc" <<'SH'
-# --- cdh: 直接调用并 cd ---
+# --- cdh: 调用 Rust 版并自动 cd ---
 __cdh_func() {
   local bin sel
   bin="$(command -v cdh)" || { echo "cdh: not found" >&2; return 127; }
@@ -176,33 +190,6 @@ __cdh_func() {
 alias cdh="__cdh_func"
 SH
         ok "已写入 ${rc}：cdh 自动切换目录"
-      fi
-
-      # 目录日志
-      if ! grep -q "__cdh_log_prompt" "$rc" 2>/dev/null; then
-        cat >> "$rc" <<'SH'
-__cdh_log_prompt() {
-  local now raw uniq cur
-  cur="$PWD"
-  now="$(date +%s)"
-  raw="${HOME}/.cd_history_raw"
-  uniq="${HOME}/.cd_history"
-  [ -f "$raw" ] || : > "$raw"
-  [ -f "$uniq" ] || : > "$uniq"
-  if [ "${__CDH_LAST_DIR:-}" = "$cur" ] && [ $(( now - ${__CDH_LAST_TS:-0} )) -lt 2 ]; then
-    return
-  fi
-  printf "%s\t%s\n" "$now" "$cur" >> "$raw"
-  printf "%s\n" "$cur" >> "$uniq"
-  __CDH_LAST_DIR="$cur"
-  __CDH_LAST_TS="$now"
-}
-case ":$PROMPT_COMMAND:" in
-  *:"__cdh_log_prompt":*) ;;
-  *) PROMPT_COMMAND="__cdh_log_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}";;
-esac
-SH
-        ok "已写入 ${rc}：目录日志"
       fi
       ;;
   esac
@@ -215,7 +202,7 @@ post_message() {
 安装完成
 
 • 重新打开一个终端（或手动 source rc）后可用：
-    cdh             # 打开 TUI 选择目录（界面走 stderr，选中的目录写到 stdout 并 cd）
+    cdh             # 打开 TUI 并自动切换到选中目录
 
 • 目录日志：
   已为你的 Shell 装好轻量日志（~/.cd_history_raw / ~/.cd_history），
