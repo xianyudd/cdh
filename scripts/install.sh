@@ -2,7 +2,7 @@
 # cdh 一键安装/卸载脚本（Linux/macOS；bash/zsh/fish）
 # - TUI 渲染 stderr；stdout 仅输出最终选中目录
 # - 优先 aria2c 并发下载，回退 curl（IPv4/HTTP1.1 + 断点续传 + 重试）
-# - 支持 GH_TOKEN；可校验 .sha256；可卸载；修复 tmpdir 作用域问题
+# - 支持 GH_TOKEN；可校验 .sha256；可卸载；修复 tmpdir 作用域与 fish 去抖初始化问题
 set -Eeuo pipefail
 
 REPO="xianyudd/cdh"
@@ -12,14 +12,14 @@ APP="cdh"
 PREFIX_DEFAULT="${HOME}/.local"
 BIN_DIR_DEFAULT="${PREFIX_DEFAULT}/bin"
 
-CDH_VERSION="${CDH_VERSION:-}"            # vX.Y.Z；空则拉 latest
+CDH_VERSION="${CDH_VERSION:-}"              # vX.Y.Z；空则拉 latest
 CDH_BIN_DIR="${CDH_BIN_DIR:-$BIN_DIR_DEFAULT}"
-CDH_SHELL="${CDH_SHELL:-auto}"            # auto|bash|zsh|fish|all|none
+CDH_SHELL="${CDH_SHELL:-auto}"              # auto|bash|zsh|fish|all|none
 CDH_INSTALL_LOGGER="${CDH_INSTALL_LOGGER:-auto}"  # auto|none
-CDH_YES="${CDH_YES:-0}"                   # 1=不询问
-CDH_FORCE="${CDH_FORCE:-0}"               # 1=覆盖 fish 的同名函数
+CDH_YES="${CDH_YES:-0}"                     # 1=不询问
+CDH_FORCE="${CDH_FORCE:-0}"                 # 1=覆盖 fish 的同名函数
 DO_UNINSTALL=0
-VERIFY_SHA="${VERIFY_SHA:-auto}"          # auto|always|never
+VERIFY_SHA="${VERIFY_SHA:-auto}"            # auto|always|never
 
 # ---------------- 实用函数 ----------------
 color() { printf "\033[%sm%s\033[0m\n" "$1" "$2"; }
@@ -74,7 +74,7 @@ detect_target() {
     darwin-x86_64)  TARGET="x86_64-apple-darwin" ;;
     darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
     linux-aarch64)
-      err "当前未提供 Linux aarch64 预构建资产，请改用 x86_64 或后续版本（或从源码构建）。"
+      err "当前未提供 Linux aarch64 预构建资产；请改用 x86_64 或从源码构建。"
       exit 1
       ;;
   esac
@@ -130,7 +130,6 @@ get_asset_urls() {
   ASSET_URL="$(printf '%s' "$j2" | sed -n "s# *\"browser_download_url\": *\"\\(.*${ASSET_NAME}\\)\"#\\1#p" | head -n1)"
   [[ -n "${ASSET_URL:-}" ]] || { err "未找到资产：${ASSET_NAME}"; exit 1; }
 
-  # 尝试获取 .sha256（可选）
   CHECKSUM_URL="$(printf '%s' "$j2" | sed -n "s# *\"browser_download_url\": *\"\\(.*${ASSET_NAME}\\.sha256\\)\"#\\1#p" | head -n1 || true)"
 }
 
@@ -151,29 +150,25 @@ download_asset() {
 
 # ---------------- 校验（如果有 .sha256） ----------------
 verify_checksum() {
-  local file="$1" sum_file="$2"
-  if [[ -z "${sum_file:-}" ]]; then
+  local file="$1" sum_url="$2"
+  if [[ -z "${sum_url:-}" ]]; then
     [[ "$VERIFY_SHA" = "always" ]] && { err "未找到 .sha256；但 VERIFY_SHA=always"; exit 1; }
     warn "未找到校验文件，跳过校验（可设置 VERIFY_SHA=always 强制校验）"
     return 0
   fi
-  need_cmd sha256sum || true
-  local sum_local="${_CDH_TMPDIR}/${ASSET_NAME}.sha256"
+  need_cmd curl
+  local sum_local="${_CDH_TMPDIR}/$(basename "$file").sha256"
   info "下载校验文件"
-  curl -fL --http1.1 -4 -o "$sum_local" "$sum_file"
+  curl -fL --http1.1 -4 -o "$sum_local" "$sum_url"
+
   if command -v sha256sum >/dev/null 2>&1; then
     ( cd "$(dirname "$file")" && sha256sum -c "$(basename "$sum_local")" )
   else
-    # macOS 通常为 shasum
     need_cmd shasum
-    local expect
+    local expect got
     expect="$(cut -d' ' -f1 "$sum_local")"
-    local got
     got="$(shasum -a 256 "$file" | awk '{print $1}')"
-    if [[ "$expect" != "$got" ]]; then
-      err "SHA256 不匹配：expect=$expect got=$got"
-      exit 1
-    fi
+    [[ "$expect" == "$got" ]] || { err "SHA256 不匹配：expect=$expect got=$got"; exit 1; }
   fi
   ok "SHA256 校验通过"
 }
@@ -218,7 +213,7 @@ install_fish_wrapper() {
     fi
   fi
 
-  # 包装函数：stderr TUI，stdout 捕获后 cd
+  # 包装函数：stderr TUI，stdout 捕获后 cd（透传 --help/--version）
   cat > "${funcdir}/cdh.fish" <<'FISH'
 # >>> cdh (installer marker)
 function cdh -d "cd via Rust cdh (TUI)"
@@ -254,16 +249,32 @@ install_fish_logger() {
 functions --erase cd 2>/dev/null
 function cd --wraps=cd -d "cd + log to ~/.cd_history(_raw)"
     builtin cd -- $argv; or return
+
     set -l now (date +%s)
     set -l raw ~/.cd_history_raw
     set -l uniq ~/.cd_history
     test -e $raw; or touch $raw
     test -e $uniq; or touch $uniq
-    if test "$__CDH_LAST_DIR" = (pwd) -a (math "$now - $__CDH_LAST_TS" 2>/dev/null) -lt 2
+
+    # 初始化默认值，避免首次使用时 math 报错
+    set -l last_ts 0
+    if set -q __CDH_LAST_TS
+        set last_ts $__CDH_LAST_TS
+    end
+    set -l last_dir ""
+    if set -q __CDH_LAST_DIR
+        set last_dir $__CDH_LAST_DIR
+    end
+
+    # 2s 去抖：同目录且时间差 < 2 则不记录
+    if test "$last_dir" = (pwd)
+        and test (math "$now - $last_ts") -lt 2
         return
     end
+
     printf "%s\t%s\n" $now (pwd) >> $raw
     printf "%s\n" (pwd) >> $uniq
+
     set -g __CDH_LAST_DIR (pwd)
     set -g __CDH_LAST_TS $now
 end
