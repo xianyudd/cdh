@@ -1,5 +1,5 @@
-use crate::{recommend_paths, RecommendOpt};
 use crate::picker;
+use crate::{recommend_paths, RecommendOpt};
 
 use regex::Regex;
 use std::env;
@@ -90,7 +90,7 @@ pub fn run() -> i32 {
             let _ = io::stdout().flush();
             0
         }
-        Ok(None) => 1,          // 用户取消/超时
-        Err(_e) => 1,           // 渲染异常等
+        Ok(None) => 1, // 用户取消/超时
+        Err(_e) => 1,  // 渲染异常等
     }
 }

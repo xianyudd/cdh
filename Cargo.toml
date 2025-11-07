@@ -1,11 +1,31 @@
 [package]
 name = "cdh"
-version = "0.0.1"
-edition = "2024"
+version = "0.1.1"
+edition = "2021"                     # 若你确实用了 2024 特性，可改为 "2024"
+rust-version = "1.70"                # 最低编译版本声明（GitHub Actions 更稳）
+description = "A frecency-based smart directory jumper with a lightweight TUI."
+readme = "README.md"
+repository = "https://github.com/xianyudd/cdh"
+homepage = "https://github.com/xianyudd/cdh"
+license = "MIT"
+keywords = ["cd", "frecency", "tui", "navigation"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 crossterm = "0.27"
 regex = "1"
 unicode-width = "0.2"
+
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "cdh"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"        # 体积优先；若更关注性能可用 "s" 或 3
+lto = "fat"            # 更激进的链接时优化（比 thin 更小更稳）
+codegen-units = 1      # 提升优化机会
+panic = "abort"        # 更小的二进制
+strip = true           # 构建时去符号（需较新的 cargo）

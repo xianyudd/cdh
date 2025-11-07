@@ -19,14 +19,17 @@ use regex::Regex;
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{BufRead, BufReader, },
+    io::{BufRead, BufReader},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 #[inline]
 fn now_secs() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 /// 推荐结果
@@ -164,10 +167,7 @@ pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
     items.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.2.partial_cmp(&a.2)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
             .then(a.0.cmp(&b.0))
     });
 
@@ -323,8 +323,8 @@ fn normalize01(map: &HashMap<String, f64>) -> HashMap<String, f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, fs};
     use std::io::Write;
+    use std::{env, fs};
     fn tmp_file(name: &str) -> String {
         let mut p = env::temp_dir();
         p.push(format!("cdh_test_{}_{}", name, now_secs()));

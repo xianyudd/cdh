@@ -116,7 +116,10 @@ impl FrecencyIndex {
 
     /// 记录某目录一次访问
     pub fn record_visit<S: Into<String>>(&mut self, dir: S, ts: i64) {
-        let entry = self.map.entry(dir.into()).or_insert_with(FrecencyState::new);
+        let entry = self
+            .map
+            .entry(dir.into())
+            .or_insert_with(FrecencyState::new);
         entry.observe(ts, &self.model);
     }
 
@@ -135,12 +138,12 @@ impl FrecencyIndex {
             .iter()
             .map(|(k, st)| (k.clone(), st.score_at(now, &self.model)))
             .collect();
-        v.sort_by(|a, b| {
-            match b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal) {
+        v.sort_by(
+            |a, b| match b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal) {
                 Ordering::Equal => a.0.cmp(&b.0),
                 other => other,
-            }
-        });
+            },
+        );
         if v.len() > n {
             v.truncate(n);
         }
@@ -149,7 +152,8 @@ impl FrecencyIndex {
 
     /// 清理：低于阈值的条目
     pub fn prune_below(&mut self, now: i64, threshold: f64) {
-        self.map.retain(|_, st| st.score_at(now, &self.model) >= threshold);
+        self.map
+            .retain(|_, st| st.score_at(now, &self.model) >= threshold);
     }
 
     /// 容量上限：保留 now 分数最高的前 max_entries
@@ -215,7 +219,12 @@ mod tests {
         }
         let incr = st.score_at(now, &model);
 
-        assert!(approx_eq(batch, incr, 1e-12), "batch={} incr={}", batch, incr);
+        assert!(
+            approx_eq(batch, incr, 1e-12),
+            "batch={} incr={}",
+            batch,
+            incr
+        );
     }
 
     #[test]
