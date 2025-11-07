@@ -1,34 +1,48 @@
+# ===========================================================
+# 📦 Rust 项目跨平台自动构建 + 发布到 GitHub Releases
+# - 支持 Linux / macOS (x86_64 & arm64)
+# - 自动附加 dist/*.tar.gz 与校验文件
+# - 从 scripts/release_notes/vX.Y.Z.md 自动读取版本说明
+# ===========================================================
+
 name: release
 
 on:
   push:
     tags:
-      - 'v*'         # 打 tag 即触发
-  workflow_dispatch:  # 允许手动触发
+      - 'v*'              # 每次打 tag（例如 v0.1.1）时自动触发
+  workflow_dispatch:      # 也可手动触发
 
 permissions:
-  contents: write     # 发布 Release 需要
+  contents: write         # 发布 Release 需要此权限
 
 jobs:
+  # =========================================================
+  # 🧪 1. 测试阶段：验证代码能正确编译与通过单测
+  # =========================================================
   test:
     name: Test (ubuntu)
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout source
         uses: actions/checkout@v4
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo
+      - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
+      - name: Run cargo tests
         run: cargo test --locked --all
 
+  # =========================================================
+  # 🏗️ 2. 构建与发布阶段：编译 + 打包 + 上传 Release
+  # =========================================================
   build-and-release:
     name: Build ${{ matrix.target }} and publish
-    needs: [test]
+    needs: [test]                     # 测试通过后再构建
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -45,30 +59,37 @@ jobs:
             archive: tar.gz
 
     steps:
+      # 1️⃣ 拉取源码
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 2️⃣ 安装 stable Rust 工具链
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      # 3️⃣ 缓存 Cargo 构建目录，加快后续构建
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      # 4️⃣ 编译发布版
       - name: Build (release)
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # 5️⃣ 精简二进制（Linux）
       - name: Strip binary (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           strip "target/${{ matrix.target }}/release/cdh" || true
 
+      # 6️⃣ 精简二进制（macOS）
       - name: Strip binary (macOS)
         if: matrix.os == 'macos-latest'
         run: |
           strip -x "target/${{ matrix.target }}/release/cdh" || true
 
+      # 7️⃣ 打包产物
       - name: Package artifacts
         shell: bash
         run: |
@@ -79,35 +100,39 @@ jobs:
           BIN_DIR="target/${TARGET}/release"
           OUT="${APP_NAME}-${VERSION}-${TARGET}"
 
-          # 组织输出目录（可把 README / LICENSE / 安装脚本一起打包）
+          # 创建 dist 目录并复制文件
           mkdir -p "dist/${OUT}"
           cp "${BIN_DIR}/${APP_NAME}" "dist/${OUT}/"              || true
           test -f README.md  && cp README.md  "dist/${OUT}/"     || true
           test -f LICENSE    && cp LICENSE    "dist/${OUT}/"     || true
           test -f scripts/install.sh && cp scripts/install.sh "dist/${OUT}/" || true
 
-          # 打包
+          # 压缩
           (cd dist && tar -czf "${OUT}.tar.gz" "${OUT}")
 
-          # 生成 sha256 校验文件（兼容 Linux/macOS）
+          # 生成 sha256 校验
           if command -v sha256sum >/dev/null 2>&1; then
             (cd dist && sha256sum "${OUT}.tar.gz" > "${OUT}.tar.gz.sha256")
           else
             (cd dist && shasum -a 256 "${OUT}.tar.gz" | awk '{print $1}' > "${OUT}.tar.gz.sha256")
           fi
 
-      - name: Upload artifact (CI browsing)
+      # 8️⃣ 上传产物以供浏览
+      - name: Upload artifact (for CI browsing)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: dist/*
 
+      # 9️⃣ 发布到 GitHub Release
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*/*.tar.gz
             dist/*/*.tar.gz.sha256
-          generate_release_notes: true
+          generate_release_notes: false
+          body_path: scripts/release_notes/${{ github.ref_name }}.md   # 💡 自动匹配版本说明
+          overwrite: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
