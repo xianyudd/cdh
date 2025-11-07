@@ -7,7 +7,22 @@ PREFIX="${HOME}/.local"
 BINDIR="${PREFIX}/bin"
 OS="$(uname -s)"
 ARCH="$(uname -m)"
-SHELL_BASENAME="$(basename "${SHELL:-}")"
+
+# 自动检测当前运行的 Shell（更可靠 than $SHELL）
+# - fish 下执行脚本时会检测到 "fish"
+# - bash/zsh 下亦能正确识别
+# - 某些非交互 shell（如 /bin/sh）下 fallback 为 login shell
+detect_shell() {
+  local current_shell
+  current_shell="$(ps -p $$ -o comm= | head -n1 | xargs basename 2>/dev/null || echo sh)"
+  if [ -z "$current_shell" ] || [ "$current_shell" = "sh" ]; then
+    current_shell="$(basename "${SHELL:-sh}")"
+  fi
+  echo "$current_shell"
+}
+
+SHELL_BASENAME="$(detect_shell)"
+
 
 color() { printf "\033[%sm%s\033[0m\n" "$1" "$2"; }
 info()  { color "36" "==> $*"; }
