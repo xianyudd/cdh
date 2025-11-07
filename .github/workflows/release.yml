@@ -1,31 +1,30 @@
-# ===========================================================
-# 📦 Rust 项目跨平台自动构建 + 发布到 GitHub Releases
-# - 支持 Linux / macOS (x86_64 & arm64)
-# - 自动附加 dist/*.tar.gz 与校验文件
-# - 从 scripts/release_notes/vX.Y.Z.md 自动读取版本说明
-# ===========================================================
-
 name: release
+# ---------------------------
+# 自动化构建与发布流程：
+# - 当推送 tag（vX.Y.Z）时触发
+# - 可手动执行（workflow_dispatch）
+# ---------------------------
 
 on:
   push:
     tags:
-      - 'v*'              # 每次打 tag（例如 v0.1.1）时自动触发
-  workflow_dispatch:      # 也可手动触发
+      - 'v*'
+  workflow_dispatch:
 
+# 允许此 Workflow 写入 Release
 permissions:
-  contents: write         # 发布 Release 需要此权限
+  contents: write
 
 jobs:
-  # =========================================================
-  # 🧪 1. 测试阶段：验证代码能正确编译与通过单测
-  # =========================================================
+  # ==========================
+  # 1. 测试阶段（仅在 Linux）
+  # ==========================
   test:
     name: Test (ubuntu)
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install Rust (stable)
@@ -34,16 +33,17 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Run cargo tests
+      - name: Run tests
         run: cargo test --locked --all
 
-  # =========================================================
-  # 🏗️ 2. 构建与发布阶段：编译 + 打包 + 上传 Release
-  # =========================================================
+  # ==========================
+  # 2. 构建与发布阶段
+  # ==========================
   build-and-release:
     name: Build ${{ matrix.target }} and publish
-    needs: [test]                     # 测试通过后再构建
+    needs: [test]  # 等待测试完成后再执行
     runs-on: ${{ matrix.os }}
+
     strategy:
       fail-fast: false
       matrix:
@@ -59,80 +59,82 @@ jobs:
             archive: tar.gz
 
     steps:
-      # 1️⃣ 拉取源码
-      - name: Checkout
+      # 拉取代码
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2️⃣ 安装 stable Rust 工具链
+      # 安装 Rust
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # 3️⃣ 缓存 Cargo 构建目录，加快后续构建
-      - name: Cache Cargo
+      # 缓存 Cargo 构建目录
+      - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      # 4️⃣ 编译发布版
-      - name: Build (release)
+      # 编译 release 版本
+      - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      # 5️⃣ 精简二进制（Linux）
+      # 可执行文件瘦身（Linux）
       - name: Strip binary (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          strip "target/${{ matrix.target }}/release/cdh" || true
+        run: strip "target/${{ matrix.target }}/release/cdh" || true
 
-      # 6️⃣ 精简二进制（macOS）
+      # 可执行文件瘦身（macOS）
       - name: Strip binary (macOS)
         if: matrix.os == 'macos-latest'
-        run: |
-          strip -x "target/${{ matrix.target }}/release/cdh" || true
+        run: strip -x "target/${{ matrix.target }}/release/cdh" || true
 
-      # 7️⃣ 打包产物
+      # 打包构建产物
       - name: Package artifacts
         shell: bash
         run: |
           set -euxo pipefail
           APP_NAME=cdh
-          VERSION=${GITHUB_REF_NAME}                  # vX.Y.Z
+          VERSION=${GITHUB_REF_NAME}  # 形如 v0.1.1
           TARGET=${{ matrix.target }}
-          BIN_DIR="target/${TARGET}/release"
-          OUT="${APP_NAME}-${VERSION}-${TARGET}"
+          OUT_DIR="dist/${APP_NAME}-${VERSION}-${TARGET}"
 
-          # 创建 dist 目录并复制文件
-          mkdir -p "dist/${OUT}"
-          cp "${BIN_DIR}/${APP_NAME}" "dist/${OUT}/"              || true
-          test -f README.md  && cp README.md  "dist/${OUT}/"     || true
-          test -f LICENSE    && cp LICENSE    "dist/${OUT}/"     || true
-          test -f scripts/install.sh && cp scripts/install.sh "dist/${OUT}/" || true
+          mkdir -p "${OUT_DIR}"
+          cp "target/${TARGET}/release/${APP_NAME}" "${OUT_DIR}/"
+          cp -f LICENSE README.md scripts/install.sh "${OUT_DIR}/" || true
 
-          # 压缩
-          (cd dist && tar -czf "${OUT}.tar.gz" "${OUT}")
+          # 打包为 tar.gz
+          tar -C dist -czf "${OUT_DIR}.tar.gz" "$(basename "${OUT_DIR}")"
 
-          # 生成 sha256 校验
+          # 生成 sha256 校验文件
           if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "${OUT}.tar.gz" > "${OUT}.tar.gz.sha256")
+            (cd dist && sha256sum "$(basename "${OUT_DIR}").tar.gz" > "$(basename "${OUT_DIR}").tar.gz.sha256")
           else
-            (cd dist && shasum -a 256 "${OUT}.tar.gz" | awk '{print $1}' > "${OUT}.tar.gz.sha256")
+            (cd dist && shasum -a 256 "$(basename "${OUT_DIR}").tar.gz" | awk '{print $1}' > "$(basename "${OUT_DIR}").tar.gz.sha256")
           fi
 
-      # 8️⃣ 上传产物以供浏览
-      - name: Upload artifact (for CI browsing)
+      # 上传到 CI Artifact（用于调试）
+      - name: Upload artifacts for inspection
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: dist/*
 
-      # 9️⃣ 发布到 GitHub Release
+      # 发布到 GitHub Release
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # 上传所有 tar.gz 和校验文件
           files: |
-            dist/*/*.tar.gz
-            dist/*/*.tar.gz.sha256
+            dist/**/*.tar.gz
+            dist/**/*.tar.gz.sha256
+
+          # 使用本地说明文件作为 release 描述
+          body_path: scripts/release_notes/${{ github.ref_name }}.md
+
+          # 不自动生成说明
           generate_release_notes: false
-          body_path: scripts/release_notes/${{ github.ref_name }}.md   # 💡 自动匹配版本说明
-          overwrite: true
+
+          # 覆盖旧文件（v2 版字段）
+          overwrite_files: true
+
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
