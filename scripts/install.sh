@@ -1,276 +1,157 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# scripts/install.sh
+# 统一入口：检测可用 shell，交互选择；将 installers/<shell>/<action>.sh 下载到本地临时目录并“本地执行”
+set -Eeuo pipefail
 
-REPO="xianyudd/cdh"
-APP="cdh"
-PREFIX="${HOME}/.local"
-BINDIR="${PREFIX}/bin"
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-SHELL_BASENAME="$(basename "${SHELL:-}")"
+# 避免 locale 警告
+unset LC_ALL || true
+unset LANG   || true
 
-color() { printf "\033[%sm%s\033[0m\n" "$1" "$2"; }
-info()  { color "36" "==> $*"; }
-ok()    { color "32" "✔ $*"; }
-warn()  { color "33" "⚠ $*"; }
-err()   { color "31" "✘ $*" >&2; }
+OWNER="xianyudd"
+REPO="cdh"
+BRANCH="main"
+RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/scripts"
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || { err "缺少依赖：$1"; exit 1; }; }
+# ---------- 阶段目录（本脚本退出时自动清理） ----------
+STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cdh-stage.XXXXXX")"
+_cleanup() { rm -rf "${STAGE_DIR}" || true; }
+trap _cleanup EXIT
 
-detect_target() {
-  case "$OS" in
-    Linux)  os_tag=linux ;;
-    Darwin) os_tag=darwin ;;
-    *) err "不支持的系统：$OS"; exit 1;;
-  esac
-
-  case "$ARCH" in
-    x86_64|amd64) arch_tag=x86_64 ;;
-    arm64|aarch64) arch_tag=aarch64 ;;
-    *) err "不支持的架构：$ARCH"; exit 1;;
-  esac
-
-  if [ "$os_tag" = "linux" ] && [ "$arch_tag" = "aarch64" ]; then
-    # 你当前 CI 只构建了 x86_64-unknown-linux-gnu；若以后补上 aarch64 就能自动生效
-    err "暂未提供 Linux aarch64 构建资产"
-    exit 1
+# ---------- 下载器 ----------
+_fetch() {
+  local url="$1" out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 1 --connect-timeout 2 -o "$out" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$out" "$url"
+  else
+    echo "[cdh] 需要 curl 或 wget 以下载远端脚本。" >&2
+    return 127
   fi
-
-  case "${os_tag}-${arch_tag}" in
-    linux-x86_64)   TARGET="x86_64-unknown-linux-gnu" ;;
-    darwin-x86_64)  TARGET="x86_64-apple-darwin" ;;
-    darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
-  esac
 }
 
-get_latest_asset_url() {
-  # 允许用户指定版本：CDH_VERSION=v0.1.0
-  local version="${CDH_VERSION:-}"
-  if [ -z "${version}" ]; then
-    need_cmd curl
-    # 取最新 release
-    local api="https://api.github.com/repos/${REPO}/releases/latest"
-    info "查询最新版本…"
-    # 尽量不用 jq；用 grep/sed 抽取
-    local json
-    json="$(curl -fsSL "$api")"
-    version="$(printf '%s' "$json" | sed -n 's/ *"tag_name": *"\(v[^"]*\)".*/\1/p' | head -n1)"
-    [ -n "$version" ] || { err "无法解析最新版本 tag"; exit 1; }
-  fi
+_usage() {
+  cat <<USAGE
+Usage:
+  $(basename "$0") [--action install|uninstall|selfcheck]
 
-  ASSET_NAME="${APP}-${version}-${TARGET}.tar.gz"
-  local api_tag="https://api.github.com/repos/${REPO}/releases/tags/${version}"
-  local json2
-  json2="$(curl -fsSL "$api_tag")" || { err "获取 ${version} 版本信息失败"; exit 1; }
-  ASSET_URL="$(printf '%s' "$json2" | sed -n "s# *\"browser_download_url\": *\"\\(.*${ASSET_NAME}\\)\"#\\1#p" | head -n1)"
-  [ -n "${ASSET_URL:-}" ] || { err "未找到资产：${ASSET_NAME}"; exit 1; }
+无参数：交互选择要安装到的 shell（当前仅实现 fish）。
+USAGE
 }
 
-ensure_bindir() {
-  mkdir -p "$BINDIR"
-  case ":$PATH:" in
-    *":$BINDIR:"*) ;; # already
-    *)
-      warn "你的 PATH 中尚无 ${BINDIR}"
-      case "$SHELL_BASENAME" in
-        fish)
-          if command -v fish >/dev/null 2>&1; then
-            fish -lc "set -Ux fish_user_paths ${BINDIR} \$fish_user_paths" || true
-            ok "已为 fish 加入 PATH：${BINDIR}"
-          fi
-          ;;
-        zsh)
-          echo "export PATH=\"${BINDIR}:\$PATH\"" >> "${HOME}/.zshrc"
-          ok "已写入 ~/.zshrc：PATH+=${BINDIR}"
-          ;;
-        bash|sh|*)
-          echo "export PATH=\"${BINDIR}:\$PATH\"" >> "${HOME}/.bashrc"
-          ok "已写入 ~/.bashrc：PATH+=${BINDIR}"
-          ;;
-      esac
-      ;;
+_list_installed_shells() {
+  local out=()
+  command -v fish >/dev/null 2>&1 && out+=("fish")
+  command -v zsh  >/dev/null 2>&1 && out+=("zsh")
+  command -v bash >/dev/null 2>&1 && out+=("bash")
+  printf "%s\n" "${out[@]}"
+}
+
+_detect_current_shell() {
+  case "${SHELL##*/}" in
+    fish) echo fish ;;
+    zsh)  echo zsh  ;;
+    bash) echo bash ;;
+    *)    echo ""   ;;
   esac
 }
 
-install_binary() {
-  need_cmd curl
-  need_cmd tar
-  detect_target
-  get_latest_asset_url
-
-  info "下载 ${ASSET_NAME}"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  curl -fL "$ASSET_URL" -o "$tmpdir/$ASSET_NAME"
-  info "解压到临时目录"
-  tar -C "$tmpdir" -xzf "$tmpdir/$ASSET_NAME"
-  # 包内目录形如 cdh-vX.Y.Z-TARGET/cdh
-  bin_path="$(find "$tmpdir" -type f -name "${APP}" -perm -111 | head -n1)"
-  [ -n "$bin_path" ] || { err "未在压缩包中找到可执行文件 ${APP}"; exit 1; }
-
-  info "安装到 ${BINDIR}/${APP}"
-  install -m 0755 "$bin_path" "${BINDIR}/${APP}"
-  ok "二进制安装完成：$(command -v ${APP} || echo ${BINDIR}/${APP})"
-}
-
-install_shell_integration() {
-  case "$SHELL_BASENAME" in
-    fish)
-      # 1) 交互调用器：cdf（TUI 走 stderr；stdout 只有目录）
-      funcdir="${HOME}/.config/fish/functions"
-      mkdir -p "$funcdir"
-      cat > "${funcdir}/cdf.fish" <<'FISH'
-function cdf -d "cd via cdh (Rust TUI: stderr UI, stdout path)"
-    set -l bin (command -v cdh)
-    if not test -x "$bin"
-        echo "cdh: not found" >&2
-        return 127
-    end
-    set -l sel (command $bin $argv)
-    if test -n "$sel"
-        builtin cd -- "$sel"
-    end
-end
-FISH
-      ok "已安装 fish 函数：cdf"
-
-      # 2) 目录日志：覆盖 cd（轻量版，产生 ~/.cd_history 与 ~/.cd_history_raw）
-      cat > "${funcdir}/cd.fish" <<'FISH'
-functions --erase cd 2>/dev/null
-function cd --wraps=cd -d "cd + log to ~/.cd_history(_raw)"
-    builtin cd -- $argv; or return
-    set -l now (date +%s)
-    set -l raw ~/.cd_history_raw
-    set -l uniq ~/.cd_history
-    test -e $raw; or touch $raw
-    test -e $uniq; or touch $uniq
-    # 去抖：同路径 2 秒内不重复
-    if test "$__CDH_LAST_DIR" = (pwd) -a (math "$now - $__CDH_LAST_TS" 2>/dev/null) -lt 2
-        return
-    end
-    printf "%s\t%s\n" $now (pwd) >> $raw
-    printf "%s\n" (pwd) >> $uniq
-    set -g __CDH_LAST_DIR (pwd)
-    set -g __CDH_LAST_TS $now
-end
-FISH
-      ok "已安装 fish 目录日志（覆盖 cd）"
-      ;;
-
-    zsh)
-      rc="${HOME}/.zshrc"
-      # 调用器：cdf
-      if ! grep -q "__cdh_cdf" "$rc" 2>/dev/null; then
-        cat >> "$rc" <<'ZSH'
-# --- cdh: cdf 调用器（TUI->stderr, stdout->path） ---
-__cdh_cdf() {
-  local bin
-  bin="$(command -v cdh)" || { print -u2 -- "cdh: not found"; return 127; }
-  local sel
-  sel="$("$bin" "$@" 2>/dev/tty)"
-  [ -n "$sel" ] && builtin cd -- "$sel"
-}
-alias cdf="__cdh_cdf"
-ZSH
-        ok "已写入 ~/.zshrc：cdf 调用器"
-      fi
-      # 目录日志：chpwd hook
-      if ! grep -q "__cdh_log_chpwd" "$rc" 2>/dev/null; then
-        cat >> "$rc" <<'ZSH'
-# --- cdh: 目录日志（~/.cd_history_raw & ~/.cd_history） ---
-__cdh_log_chpwd() {
-  local now raw uniq
-  now="$(date +%s)"
-  raw="${HOME}/.cd_history_raw"
-  uniq="${HOME}/.cd_history"
-  : > /dev/null
-  [ -f "$raw" ] || : > "$raw"
-  [ -f "$uniq" ] || : > "$uniq"
-  # 去抖：同路径 2 秒内不重复
-  if [ "${__CDH_LAST_DIR:-}" = "$PWD" ] && [ $(( now - ${__CDH_LAST_TS:-0} )) -lt 2 ]; then
-    return
+_read_line() {
+  local __var="$1"; shift || true
+  local __prompt="${*:-}"
+  [[ -n "$__prompt" ]] && printf "%s" "$__prompt"
+  local ans=""
+  if [ -t 0 ]; then
+    read -r ans || true
+  elif [ -r /dev/tty ]; then
+    # shellcheck disable=SC2162
+    read -r ans < /dev/tty || true
   fi
-  printf "%s\t%s\n" "$now" "$PWD" >> "$raw"
-  printf "%s\n" "$PWD" >> "$uniq"
-  __CDH_LAST_DIR="$PWD"
-  __CDH_LAST_TS="$now"
+  printf -v "${__var}" '%s' "${ans}"
 }
-autoload -Uz add-zsh-hook 2>/dev/null || true
-add-zsh-hook chpwd __cdh_log_chpwd
-ZSH
-        ok "已写入 ~/.zshrc：目录日志 hook"
-      fi
-      ;;
 
-    bash|sh|*)
-      rc="${HOME}/.bashrc"
-      # 调用器：cdf
-      if ! grep -q "__cdh_cdf" "$rc" 2>/dev/null; then
-        cat >> "$rc" <<'BASH'
-# --- cdh: cdf 调用器（TUI->stderr, stdout->path） ---
-__cdh_cdf() {
-  local bin
-  bin="$(command -v cdh)" || { echo "cdh: not found" >&2; return 127; }
-  local sel
-  sel="$("$bin" "$@" 2>/dev/tty)"
-  [ -n "$sel" ] && builtin cd -- "$sel"
+_choose_shell() {
+  local installed; installed="$(_list_installed_shells | tr '\n' ' ')"
+  local def; def="$(_detect_current_shell)"; [[ -z "$def" ]] && def="fish"
+
+  echo "[cdh] 检测到 shell: ${installed:-<none>}"
+  echo "[cdh] 请选择要安装到的 shell（已实现：fish）："
+  local idx=1
+  for s in ${installed}; do
+    if [[ "$s" == "fish" ]]; then
+      printf "  %d) %s\n" "$idx" "$s"
+    else
+      printf "  %d) %s  （尚未实现安装器）\n" "$idx" "$s"
+    fi
+    idx=$((idx+1))
+  done
+  echo "  q) 退出"
+  _read_line ans "[cdh] 输入序号或名称（回车默认 ${def}）："
+
+  case "${ans:-}" in
+    q|Q) echo ""; return 0 ;;
+    "")  echo "${def}"; return 0 ;;
+    1)   echo ${installed} | awk '{print $1}'; return 0 ;;
+    2)   echo ${installed} | awk '{print $2}'; return 0 ;;
+    3)   echo ${installed} | awk '{print $3}'; return 0 ;;
+    fish|zsh|bash) echo "${ans}"; return 0 ;;
+    *)   echo "${def}"; return 0 ;;
+  esac
 }
-alias cdf="__cdh_cdf"
-BASH
-        ok "已写入 ~/.bashrc：cdf 调用器"
-      fi
-      # 目录日志：PROMPT_COMMAND（检测目录变化）
-      if ! grep -q "__cdh_log_prompt" "$rc" 2>/dev/null; then
-        cat >> "$rc" <<'BASH'
-# --- cdh: 目录日志（~/.cd_history_raw & ~/.cd_history） ---
-__cdh_log_prompt() {
-  local now raw uniq cur
-  cur="$PWD"
-  now="$(date +%s)"
-  raw="${HOME}/.cd_history_raw"
-  uniq="${HOME}/.cd_history"
-  [ -f "$raw" ] || : > "$raw"
-  [ -f "$uniq" ] || : > "$uniq"
-  # 去抖：同路径 2 秒内不重复
-  if [ "${__CDH_LAST_DIR:-}" = "$cur" ] && [ $(( now - ${__CDH_LAST_TS:-0} )) -lt 2 ]; then
-    return
+
+# 将远端 installers/<shell>/<action>.sh 下载到本地并执行（不使用 exec，返回后统一清理 STAGE_DIR）
+_run_remote_staged() {
+  # $1=shell $2=action
+  local sh="$1" act="$2" dst="${STAGE_DIR}/${sh}-${act}.sh"
+  local url="${RAW_BASE}/installers/${sh}/${act}.sh"
+  echo "[cdh] 下载 ${sh}/${act}.sh ..."
+  _fetch "$url" "$dst"
+  chmod +x "$dst"
+  echo "[cdh] 执行 ${dst} ..."
+  # 透传 STAGE_DIR 给子脚本使用（子脚本若检测到该变量存在，则不再清理它）
+  STAGE_DIR="${STAGE_DIR}" env -u LC_ALL -u LANG bash "$dst"
+}
+
+_selfcheck_fish() {
+  command -v fish >/dev/null 2>&1 || { echo "[cdh] 未安装 fish" >&2; return 1; }
+  fish -lc 'type -q cdh'           || { echo "[cdh] cdh 函数未生效；请先安装并执行：exec fish -l" >&2; return 2; }
+  if fish -lc 'cd ~; cd /; cd ~; test -s ~/.cd_history_raw'; then
+    echo "[cdh] 历史文件 OK：~/.cd_history_raw"
+  else
+    echo "[cdh] 历史为空；多切换几个目录后再试。"
   fi
-  printf "%s\t%s\n" "$now" "$cur" >> "$raw"
-  printf "%s\n" "$cur" >> "$uniq"
-  __CDH_LAST_DIR="$cur"
-  __CDH_LAST_TS="$now"
+  if fish -lc 'command -sq cdh; or test -x ~/.local/bin/cdh'; then
+    echo "[cdh] 检测到外部二进制（PATH 或 ~/.local/bin/cdh）"
+  else
+    echo "[cdh] 未检测到外部二进制；运行时会提示安装（正常）。"
+  fi
 }
-case ":$PROMPT_COMMAND:" in
-  *:"__cdh_log_prompt":*) ;;
-  *) PROMPT_COMMAND="__cdh_log_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}";;
+
+# -------- 主流程 --------
+ACTION=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --action) ACTION="${2:-}"; shift 2 ;;
+    -h|--help) _usage; exit 0 ;;
+    *) break ;;
+  esac
+done
+[[ -z "${ACTION}" ]] && ACTION="install"
+
+SEL_SHELL="$(_choose_shell)"
+[[ -z "${SEL_SHELL}" ]] && { echo "[cdh] 已取消。"; exit 0; }
+
+if [[ "${SEL_SHELL}" != "fish" ]]; then
+  case "${ACTION}" in
+    install|uninstall) echo "[cdh] ${SEL_SHELL} 的安装/卸载脚本尚未实现；当前仅支持 fish。" >&2; exit 10 ;;
+    selfcheck)         echo "[cdh] 仅 fish 支持自检。" >&2; exit 11 ;;
+  esac
+fi
+
+case "${ACTION}" in
+  install|uninstall) _run_remote_staged "fish" "${ACTION}" ;;
+  selfcheck)         _selfcheck_fish ;;
+  *) echo "[cdh] 未知动作：${ACTION}" >&2; exit 12 ;;
 esac
-BASH
-        ok "已写入 ~/.bashrc：目录日志 PROMPT_COMMAND"
-      fi
-      ;;
-  esac
-}
 
-post_message() {
-  cat <<'TXT'
-----------------------------------------
-安装完成 🎉
-
-• 重新打开一个终端（或手动 source rc）后可用：
-    cdf             # 打开 TUI 选择目录（界面走 stderr，选中的目录写到 stdout 并 cd）
-
-• 目录日志：
-  已为你的 Shell 装好轻量日志（~/.cd_history_raw / ~/.cd_history），
-  cdh 推荐会基于这些数据工作。
-
-• 验证：
-    cdh --help   # 看二进制是否就绪
-    cdf          # 是否能弹出 TUI（有历史时）
-----------------------------------------
-TXT
-}
-
-ensure_bindir
-install_binary
-install_shell_integration
-post_message
+echo "[cdh] 完成。"
