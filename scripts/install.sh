@@ -8,7 +8,7 @@ set -Eeuo pipefail
 
 # ---- 避免 locale 警告（调用时可再加：env -u LC_ALL -u LANG bash --noprofile --norc）----
 unset LC_ALL || true
-unset LANG   || true
+unset LANG || true
 
 OWNER="xianyudd"
 REPO="cdh"
@@ -39,9 +39,9 @@ trap _cleanup EXIT
 # ---------- 下载器 ----------
 _fetch() {
   local url="$1" out="$2"
-  if command -v curl >/dev/null 2>&1; then
+  if command -v curl > /dev/null 2>&1; then
     curl -fsSL --retry 1 --connect-timeout 4 -o "$out" "$url"
-  elif command -v wget >/vol/null 2>&1; then
+  elif command -v wget > /dev/null 2>&1; then
     wget -q -O "$out" "$url"
   else
     _tty "[cdh] 需要 curl 或 wget 以下载：$url"
@@ -52,10 +52,10 @@ _fetch() {
 # ---------- 解析“最新版本”（可被 CDH_VERSION 覆盖） ----------
 _resolve_latest_version() {
   local eff
-  eff="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${OWNER}/${REPO}/releases/latest" 2>/dev/null || true)"
+  eff="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${OWNER}/${REPO}/releases/latest" 2> /dev/null || true)"
   case "${eff}" in
     */tag/*) printf "%s" "${eff##*/tag/}" ;;
-    *)       printf "" ;;
+    *) printf "" ;;
   esac
 }
 
@@ -66,7 +66,7 @@ _install_binary_latest() {
   mkdir -p "${bindir}" "${STAGE_DIR}"
 
   # 已存在则跳过
-  if command -v cdh >/dev/null 2>&1 || [[ -x "${bindir}/cdh" ]]; then
+  if command -v cdh > /dev/null 2>&1 || [[ -x "${bindir}/cdh" ]]; then
     _tty "[cdh] 检测到已存在的 cdh 二进制，跳过下载。"
     return 0
   fi
@@ -85,14 +85,14 @@ _install_binary_latest() {
   fi
 
   case "$(uname -s || echo Linux)" in
-    Linux)  os_triple="unknown-linux-gnu" ;;
+    Linux) os_triple="unknown-linux-gnu" ;;
     Darwin) os_triple="apple-darwin" ;;
-    *)      os_triple="unknown-linux-gnu" ;;
+    *) os_triple="unknown-linux-gnu" ;;
   esac
   case "$(uname -m || echo x86_64)" in
-    x86_64|amd64)  arch_triple="x86_64" ;;
-    aarch64|arm64) arch_triple="aarch64" ;;
-    *)             arch_triple="x86_64" ;;
+    x86_64 | amd64) arch_triple="x86_64" ;;
+    aarch64 | arm64) arch_triple="aarch64" ;;
+    *) arch_triple="x86_64" ;;
   esac
 
   tarball="cdh-${version}-${arch_triple}-${os_triple}.tar.gz"
@@ -109,8 +109,8 @@ _install_binary_latest() {
   # 智能定位可执行文件
   found=""
   [[ -x "${unpack}/cdh" ]] && found="${unpack}/cdh"
-  [[ -z "${found}" ]] && found="$(find "${unpack}" -maxdepth 3 -type f -name 'cdh'  -perm -u+x -print -quit 2>/dev/null || true)"
-  [[ -z "${found}" ]] && found="$(find "${unpack}" -maxdepth 3 -type f -name 'cdh*' -perm -u+x -print -quit 2>/dev/null || true)"
+  [[ -z "${found}" ]] && found="$(find "${unpack}" -maxdepth 3 -type f -name 'cdh' -perm -u+x -print -quit 2> /dev/null || true)"
+  [[ -z "${found}" ]] && found="$(find "${unpack}" -maxdepth 3 -type f -name 'cdh*' -perm -u+x -print -quit 2> /dev/null || true)"
 
   if [[ -z "${found}" ]]; then
     _tty "[cdh] 警告：未在压缩包中定位到可执行文件。以下为内容清单："
@@ -127,7 +127,7 @@ _uninstall_binary_and_data() {
   local bindir="${HOME}/.local/bin"
   local bin="${bindir}/cdh"
   local hist="${HOME}/.cd_history_raw"
-  rm -f "${bin}" "${hist}" 2>/dev/null || true
+  rm -f "${bin}" "${hist}" 2> /dev/null || true
   _tty "[cdh] 已卸载二进制与历史（若存在则已删除）："
   _tty " - ${bin}"
   _tty " - ${hist}"
@@ -138,43 +138,57 @@ _has_fish_integration() {
   [[ -e "${HOME}/.config/fish/functions/cdh.fish" || -e "${HOME}/.config/fish/conf.d/cdh_log.fish" ]]
 }
 _has_bash_integration() {
-  [[ -e "${HOME}/.config/cdh/bash/cdh.bash" ]] || grep -q '^# >>> cdh installer >>>$' "${HOME}/.bashrc" 2>/dev/null
+  [[ -e "${HOME}/.config/cdh/bash/cdh.bash" ]] || grep -q '^# >>> cdh installer >>>$' "${HOME}/.bashrc" 2> /dev/null
 }
 declare -a SHELLS=()
-_add_if() { command -v "$1" >/dev/null 2>&1 && SHELLS+=("$1"); }
+_add_if() { command -v "$1" > /dev/null 2>&1 && SHELLS+=("$1"); }
 
 # ---------- 必须选择 shell（仅安装时使用） ----------
 _choose_shell_interactive() {
-  SHELLS=(); _add_if fish; _add_if zsh; _add_if bash
-  if (( ${#SHELLS[@]} == 0 )); then _tty "[cdh] 未检测到可用 shell。"; exit 65; fi
+  SHELLS=()
+  _add_if fish
+  _add_if zsh
+  _add_if bash
+  if ((${#SHELLS[@]} == 0)); then
+    _tty "[cdh] 未检测到可用 shell。"
+    exit 65
+  fi
   local ans
   while :; do
     _tty "[cdh] 请选择要安装到的 shell："
     local i
-    for ((i=0; i<${#SHELLS[@]}; i++)); do
+    for ((i = 0; i < ${#SHELLS[@]}; i++)); do
       case "${SHELLS[i]}" in
-        fish|bash) _tty "  $((i+1))) ${SHELLS[i]}" ;;
-        *)         _tty "  $((i+1))) ${SHELLS[i]}  （未实现安装器）" ;;
-      endesac
+        fish | bash) _tty "  $((i + 1))) ${SHELLS[i]}" ;;
+        *) _tty "  $((i + 1))) ${SHELLS[i]}  （未实现安装器）" ;;
+      esac
     done
     _tty "  q) 退出"
     printf "[cdh] 请输入序号或名称： " > /dev/tty
     # shellcheck disable=SC2162
     read -r ans < /dev/tty || true
     case "${ans}" in
-      q|Q) echo ""; return 0 ;;
-      '' ) _tty "[cdh] 不能为空，请重新输入。";;
-      *  )
+      q | Q)
+        echo ""
+        return 0
+        ;;
+      '') _tty "[cdh] 不能为空，请重新输入。" ;;
+      *)
         if [[ "${ans}" =~ ^[0-9]+$ ]]; then
-          local idx=$((ans-1))
-          if (( idx >=0 && idx < ${#SHELLS[@]} )); then
-            echo "${SHELLS[idx]}"; return 0
+          local idx=$((ans - 1))
+          if ((idx >= 0 && idx < ${#SHELLS[@]})); then
+            echo "${SHELLS[idx]}"
+            return 0
           else
             _tty "[cdh] 无效序号：${ans}"
           fi
         else
-          local s; for s in "${SHELLS[@]}"; do
-            [[ "${ans}" == "${s}" ]] && { echo "${s}"; return 0; }
+          local s
+          for s in "${SHELLS[@]}"; do
+            [[ "${ans}" == "${s}" ]] && {
+              echo "${s}"
+              return 0
+            }
           done
           _tty "[cdh] 非法名称：${ans}"
         fi
@@ -185,7 +199,7 @@ _choose_shell_interactive() {
 
 # ---------- 运行子安装/卸载器（子脚本只做集成，不动二进制） ----------
 _run_child_staged() {
-  local sel="$1" kind="$2"  # kind: install|uninstall
+  local sel="$1" kind="$2" # kind: install|uninstall
   local dst="${STAGE_DIR}/${sel}-${kind}.sh"
   local url="${RAW_BASE}/installers/${sel}/${kind}.sh"
   _tty "[cdh] 下载 ${sel} ${kind} 脚本 ..."
@@ -200,12 +214,21 @@ case "${ACTION}" in
   install)
     _install_binary_latest || _tty "[cdh] 二进制安装可能未完成，请检查上述提示。"
     SEL_SHELL="$(_choose_shell_interactive)"
-    [[ -z "${SEL_SHELL}" ]] && { _tty "[cdh] 已取消。"; exit 0; }
+    [[ -z "${SEL_SHELL}" ]] && {
+      _tty "[cdh] 已取消。"
+      exit 0
+    }
     case "${SEL_SHELL}" in
       fish) _run_child_staged "fish" "install" ;;
       bash) _run_child_staged "bash" "install" ;;
-      zsh)  _tty "[cdh] zsh 的安装器暂未实现。"; exit 10 ;;
-      *)    _tty "[cdh] 未识别的 shell：${SEL_SHELL}"; exit 11 ;;
+      zsh)
+        _tty "[cdh] zsh 的安装器暂未实现。"
+        exit 10
+        ;;
+      *)
+        _tty "[cdh] 未识别的 shell：${SEL_SHELL}"
+        exit 11
+        ;;
     esac
     _tty "[cdh] 安装完成。"
     _tty " - 如为 fish：执行  exec fish -l"
@@ -213,12 +236,12 @@ case "${ACTION}" in
     ;;
   uninstall)
     # —— 自动检测，无需交互 ——
-    if command -v fish >/dev/null 2>&1 && _has_fish_integration; then
+    if command -v fish > /dev/null 2>&1 && _has_fish_integration; then
       _run_child_staged "fish" "uninstall"
     else
       _tty "[cdh] 未发现 fish 集成（跳过子卸载）。"
     fi
-    if command -v bash >/dev/null 2>&1 && _has_bash_integration; then
+    if command -v bash > /dev/null 2>&1 && _has_bash_integration; then
       _run_child_staged "bash" "uninstall"
     else
       _tty "[cdh] 未发现 bash 集成（跳过子卸载）。"
@@ -229,5 +252,7 @@ case "${ACTION}" in
     _tty " - 如为 bash：执行  source ~/.bashrc"
     ;;
   *)
-    _tty "[cdh] 未知动作：${ACTION}"; exit 12 ;;
+    _tty "[cdh] 未知动作：${ACTION}"
+    exit 12
+    ;;
 esac
