@@ -1,171 +1,145 @@
-# cdh — Frecency 驱动的目录跳转工具（含 TUI）
+# cdh — Frecency 驱动的目录跳转（含 TUI）
 
-`cdh` 根据你访问目录的 **频次** 与 **时间衰减（半衰期）** 计算「相关性分数」，并提供一个 **终端交互界面（TUI）** 快速选择与跳转。适合在多个项目目录间频繁切换的开发者。
+`cdh` 基于“访问频次 × 时间衰减（半衰期）”对目录打分，提供一个终端 TUI 供你选中后快速跳转。
 
----
-
-## 功能摘要
-
-* **Frecency 推荐**：近期常用目录排名更靠前；半衰期可配置。
-* **多源融合**：原始访问日志（raw）与去重列表（uniq）综合打分。
-* **交互式 TUI**：键盘/鼠标、模糊搜索、页内数字直达。
-* **过滤与校验**：关键词/正则过滤；可选跳过目录存在性检查。
-* **轻量 & 跨平台**：Rust 实现，Linux / macOS / Windows（含 WSL）。
+> 当前已实现 **fish** 的安装/卸载集成；**bash / zsh** 集成在路线图中。
 
 ---
 
-## 安装
+## 快速安装与卸载
 
-### 方法一：下载预构建二进制（推荐）
-
-到 GitHub Releases 页面，下载与你系统匹配的压缩包并解压，将二进制加入 `PATH`。
-
-* Linux/macOS 通常放入 `/usr/local/bin` 或 `~/.local/bin`
-* Windows 建议放入用户 PATH 目录，或与 Shell 启动脚本一同放置
-
-### 方法二：源码构建
+### 安装（交互选择 Shell）
 
 ```bash
-git clone https://github.com/<your-username>/cdh
-cd cdh
-cargo build --release
-# 将 target/release/cdh 复制到 PATH
+curl -fsSL https://raw.githubusercontent.com/xianyudd/cdh/main/scripts/install.sh | bash --noprofile --norc
+# 选择 1) fish；完成后：
+exec fish -l
 ```
 
-> Windows/WSL 提示：在 WSL 内编译得到的是 Linux ELF。如需 Windows 可执行文件，请在 Windows 环境构建，或在 GitHub Actions 上产出。
+### 卸载（自动检测、无需交互）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xianyudd/cdh/main/scripts/install.sh | bash --noprofile --norc -s -- --action uninstall
+# 若卸载了 fish 集成，建议执行：
+exec fish -l
+```
+
+**说明**
+
+* 顶层安装器自动解析 **最新 Release**，将二进制安装到 `~/.local/bin/cdh`，再为所选 Shell 写入集成。
+* 安装需要可交互 TTY（菜单通过 `/dev/tty`）；卸载不需要交互。
+* 安装过程使用临时目录，退出自动清理，不在本机落盘日志。
 
 ---
 
-## 快速开始
+## 用法
 
 ```bash
-# 直接运行，显示推荐列表（TUI）
+# 打开 TUI，选择后跳转
 cdh
 
-# 只想打印前 N 条结果，用于脚本
-cdh -l 10
-
-# 指定半衰期（单位：秒），例如 3 天
-cdh --half-life 259200
-
-# 关键词过滤（空格分隔，大小写不敏感）
-cdh project rust
-
-# 跳过目录存在性校验（跨机器同步历史时有用）
-cdh --no-check-dir
+# 查看帮助（建议从这里了解当前可用选项）
+cdh -h
 ```
 
----
-
-## 命令行参数
-
-| 选项                    | 说明              | 默认          |
-| --------------------- | --------------- | ----------- |
-| `-l, --limit <N>`     | 返回最大条数          | 20          |
-| `--half-life <sec>`   | Frecency 半衰期（秒） | 604800（7 天） |
-| `--threshold <f64>`   | 最低分阈值           | 0（关闭）       |
-| `--ignore-re <regex>` | 忽略路径的正则         | 无           |
-| `--no-check-dir`      | 不检查目录存在性        | false       |
-| `-h, --help`          | 帮助              | -           |
+> 首次无历史时，TUI 会提示如何快速生成一些历史（先多切换几个常用目录再执行 `cdh`）。
 
 ---
 
-## 环境变量
+## 工作方式与数据
 
-| 变量               | 说明                     | 默认     |
-| ---------------- | ---------------------- | ------ |
-| `CDH_HALF_LIFE`  | Frecency 半衰期（秒）        | 604800 |
-| `CDH_IGNORE_RE`  | 默认忽略正则                 | 无      |
-| `CDH_W_FRECENCY` | frecency 权重            | 0.7    |
-| `CDH_W_UNIQ`     | uniq 权重                | 0.3    |
-| `CDH_UNIQ_DECAY` | uniq 衰减系数              | 0.85   |
-| `CDH_COLOR`      | 彩色输出                   | true   |
-| `CDH_MOUSE`      | 鼠标支持                   | true   |
-| `CDH_INPUT_POS`  | 搜索输入位置（`top`/`bottom`） | bottom |
+* **fish 侧只写原始历史**：`~/.cd_history_raw`（每行格式 `epoch\tpath`）。
+* **2 秒去抖**：同一路径 2 秒内重复进入不追加，降低写盘抖动。
+* 去重/聚合（如 `~/.cd_history`）将在后续版本由二进制生成；当前保持“只写 raw”的简单稳定策略。
 
 ---
 
-## TUI 操作
+## Shell 集成
 
-* **导航**：`↑/↓` 或 `j/k`；翻页：`←/→` 或 `p/n`
-* **选择**：`Enter`；**退出**：`q`
-* **搜索**：按 `i` 进入，输入关键字；`Backspace` 删除；`Esc` 退出搜索
-* **数字跳转**：`0-9` 快速选中当前页的对应序号
-* **鼠标**：单击移动，双击选中，滚轮滚动
+### fish（已实现）
+
+安装器写入：
+
+* `~/.config/fish/functions/cdh.fish`
+* `~/.config/fish/conf.d/cdh_log.fish`
+
+行为约定（返回码）：
+
+* 找不到外部二进制：提示安装并返回 **127**。
+* 用户取消/未选择：返回 **1**。
+* 未匹配到目录：返回 **2**。
+
+> fish 可能存在同名 `cdh`，安装器会覆盖为自定义函数，但**始终调用外部二进制**。
+
+### bash / zsh（规划中）
+
+尚未提供安装/卸载脚本；见“路线图”。
 
 ---
 
-## 数据文件
+## 故障排查（简要）
 
-* `~/.cd_history_raw`：原始访问日志，行格式 `timestamp<TAB>path`
-* `~/.cd_history`：去重后的最近访问目录（每行一个路径）
-
-> 建议用 dotfiles 管理在多台机器共享。若路径不完全一致，建议配合 `--no-check-dir` 或忽略规则使用。
+* **`cdh` 命令不存在**：确认 `~/.local/bin` 在 `PATH` 中；或重新执行安装命令。
+* **TUI 显示“暂无历史”**：先切换几个目录产生日志（如：`cd ~/projects; cd ~; cd /etc; cd ~; cdh`）。
+* **下载慢**：可设置 `http_proxy` / `https_proxy`；安装器会使用。
+* **Locale 警告**：建议使用 `bash --noprofile --norc` 执行安装命令。
 
 ---
 
-## Shell 集成（可选）
+## 发行与二进制
 
-### Fish
-
-```fish
-function cd
-    if test (count $argv) -eq 1
-        cdh $argv[1] | read -l sel
-        and test -n "$sel"
-        and cd "$sel"
-    else
-        builtin cd $argv
-    end
-end
-```
-
-### Bash / Zsh
+* 由 GitHub Actions 构建发布（Linux / macOS，x86_64 与 arm64 变体）。
+* 产物命名示例：`cdh-v0.1.2-x86_64-unknown-linux-gnu.tar.gz`。
+* 默认解析 **最新 Release**；如需指定版本：
 
 ```bash
-function cd() {
-  if [ $# -eq 1 ]; then
-    local sel
-    sel="$(cdh "$1")"
-    if [ -n "$sel" ]; then
-      cd "$sel"
-      return
-    fi
-  fi
-  builtin cd "$@"
-}
-```
-
-### Nushell
-
-```nu
-def cdh_cd [dir?: string] {
-  if ($dir | is-empty) { cd } else {
-    let sel = (cdh $dir | str trim)
-    if ($sel != "") { cd $sel }
-  }
-}
+CDH_VERSION=v0.1.2 curl -fsSL https://raw.githubusercontent.com/xianyudd/cdh/main/scripts/install.sh | bash --noprofile --norc
 ```
 
 ---
 
-## 设计要点
+## 开发者
 
-* **Frecency**：对每次访问按时间指数衰减；半衰期可调。
-* **融合评分**：`final = 0.7 * frecency_norm + 0.3 * uniq_norm`（可通过环境变量调整）。
-* **性能**：流式读取、哈希聚合、仅存必要状态。
+目录结构（节选）：
+
+```
+scripts/
+  install.sh                 # 顶层入口：安装/卸载；安装二进制；交互选 Shell；路由子脚本
+  installers/
+    fish/
+      install.sh            # 写入 fish 集成（functions / conf.d），不下载二进制
+      uninstall.sh          # 清理 fish 集成
+      payload/
+        cdh.fish
+        cdh_log.fish
+  tools/
+    git-add-guard.sh        # 可选：git add 前 shfmt + 语法检查
+```
+
+本地调试：
+
+```bash
+# 安装（交互）
+bash --noprofile --norc scripts/install.sh
+# 卸载（自动检测）
+bash --noprofile --norc scripts/install.sh --action uninstall
+```
 
 ---
 
-## 故障排查
+## 路线图：bash / zsh 集成
 
-* **没有候选**：确认历史文件存在且非空 → `ls -la ~/.cd_history ~/.cd_history_raw`
-* **结果不准**：缩短半衰期或提高 frecency 权重
-* **WSL 路径不一致**：使用 `--no-check-dir` 或忽略规则
+* **注入点**：
+
+  * *bash*：`~/.bashrc`（登录/非登录兼容）。
+  * *zsh*：`~/.zshrc`（考虑 oh-my-zsh 等加载顺序）。
+* **冲突与回退**：检测既有 alias/函数；同名时以安装器标记包裹，确保可回滚。
+* **自检**：与 fish 的返回码约定对齐；提供 `bash -lc` / `zsh -lic` 检验命令。
+* **卸载**：按安装器标记精准删除注入片段，不误删用户自定义内容。
+* **测试矩阵**：Ubuntu（bash/zsh）、macOS（zsh）、WSL（bash/zsh），登录/非登录、管道/本地两种安装方式。
 
 ---
 
 ## 许可证
 
 MIT
-
