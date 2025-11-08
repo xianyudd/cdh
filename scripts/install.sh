@@ -99,7 +99,7 @@ _choose_shell() {
   esac
 }
 
-# 将远端 installers/<shell>/<action>.sh 下载到本地并执行（不使用 exec，返回后统一清理 STAGE_DIR）
+# 将远端 installers/<shell>/<action>.sh 下载到本地并执行（从本地执行，返回后统一清理 STAGE_DIR）
 _run_remote_staged() {
   # $1=shell $2=action
   local sh="$1" act="$2" dst="${STAGE_DIR}/${sh}-${act}.sh"
@@ -108,7 +108,7 @@ _run_remote_staged() {
   _fetch "$url" "$dst"
   chmod +x "$dst"
   echo "[cdh] 执行 ${dst} ..."
-  # 透传 STAGE_DIR 给子脚本使用（子脚本若检测到该变量存在，则不再清理它）
+  # 透传 STAGE_DIR 给子脚本（子脚本若检测到该变量存在，则不再清理它）
   STAGE_DIR="${STAGE_DIR}" env -u LC_ALL -u LANG bash "$dst"
 }
 

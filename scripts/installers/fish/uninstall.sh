@@ -1,23 +1,32 @@
 #!/usr/bin/env bash
 # scripts/installers/fish/uninstall.sh
+# fish 卸载器：移除函数/钩子/二进制/历史；不保存日志；配合入口的阶段目录清理
 set -Eeuo pipefail
+
+unset LC_ALL || true
+unset LANG   || true
+
+# -------- 阶段目录（若父脚本未提供则自建并自行清理） --------
+if [[ -n "${STAGE_DIR:-}" ]]; then
+  CLEAN_STAGE=0
+else
+  STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cdh-stage.XXXXXX")"
+  CLEAN_STAGE=1
+fi
+_cleanup() { [[ "${CLEAN_STAGE}" -eq 1 ]] && rm -rf "${STAGE_DIR}" || true; }
+trap _cleanup EXIT
 
 FISH_FUNC="${HOME}/.config/fish/functions/cdh.fish"
 FISH_CONF="${HOME}/.config/fish/conf.d/cdh_log.fish"
 BIN="${HOME}/.local/bin/cdh"
-RAW="${HOME}/.cd_history_raw"
+HIST="${HOME}/.cd_history_raw"
 
-printf "[cdh] 开始卸载 fish 集成...\n" >&2
+# 逐项删除（存在即删）
+rm -f "${FISH_FUNC}" "${FISH_CONF}" "${BIN}" "${HIST}" || true
 
-# 安全删除（存在即删，不报错）
-rm -f "${FISH_FUNC}" || true
-rm -f "${FISH_CONF}" || true
-rm -f "${BIN}" || true
-rm -f "${RAW}" || true
-
-printf "[cdh] 卸载完成：\n" >&2
-printf " - 已移除 %s（若存在）\n" "${FISH_FUNC}" >&2
-printf " - 已移除 %s（若存在）\n" "${FISH_CONF}" >&2
-printf " - 已移除 %s（若存在）\n" "${BIN}" >&2
-printf " - 已移除 %s（若存在）\n" "${RAW}" >&2
-printf "[cdh] 建议：exec fish -l 以刷新 shell\n" >&2
+echo "[cdh] 已卸载（若存在则已删除）："
+echo " - ${FISH_FUNC}"
+echo " - ${FISH_CONF}"
+echo " - ${BIN}"
+echo " - ${HIST}"
+echo "[cdh] 建议执行：exec fish -l"
