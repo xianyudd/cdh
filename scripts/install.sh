@@ -41,7 +41,7 @@ _fetch() {
   local url="$1" out="$2"
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL --retry 1 --connect-timeout 4 -o "$out" "$url"
-  elif command -v wget >/dev/null 2>&1; then
+  elif command -v wget >/vol/null 2>&1; then
     wget -q -O "$out" "$url"
   else
     _tty "[cdh] 需要 curl 或 wget 以下载：$url"
@@ -137,6 +137,9 @@ _uninstall_binary_and_data() {
 _has_fish_integration() {
   [[ -e "${HOME}/.config/fish/functions/cdh.fish" || -e "${HOME}/.config/fish/conf.d/cdh_log.fish" ]]
 }
+_has_bash_integration() {
+  [[ -e "${HOME}/.config/cdh/bash/cdh.bash" ]] || grep -q '^# >>> cdh installer >>>$' "${HOME}/.bashrc" 2>/dev/null
+}
 declare -a SHELLS=()
 _add_if() { command -v "$1" >/dev/null 2>&1 && SHELLS+=("$1"); }
 
@@ -149,11 +152,10 @@ _choose_shell_interactive() {
     _tty "[cdh] 请选择要安装到的 shell："
     local i
     for ((i=0; i<${#SHELLS[@]}; i++)); do
-      if [[ "${SHELLS[i]}" == "fish" ]]; then
-        _tty "  $((i+1))) ${SHELLS[i]}"
-      else
-        _tty "  $((i+1))) ${SHELLS[i]}  （未实现安装器）"
-      fi
+      case "${SHELLS[i]}" in
+        fish|bash) _tty "  $((i+1))) ${SHELLS[i]}" ;;
+        *)         _tty "  $((i+1))) ${SHELLS[i]}  （未实现安装器）" ;;
+      endesac
     done
     _tty "  q) 退出"
     printf "[cdh] 请输入序号或名称： " > /dev/tty
@@ -201,10 +203,13 @@ case "${ACTION}" in
     [[ -z "${SEL_SHELL}" ]] && { _tty "[cdh] 已取消。"; exit 0; }
     case "${SEL_SHELL}" in
       fish) _run_child_staged "fish" "install" ;;
-      zsh|bash) _tty "[cdh] ${SEL_SHELL} 的安装器暂未实现。"; exit 10 ;;
-      *) _tty "[cdh] 未识别的 shell：${SEL_SHELL}"; exit 11 ;;
+      bash) _run_child_staged "bash" "install" ;;
+      zsh)  _tty "[cdh] zsh 的安装器暂未实现。"; exit 10 ;;
+      *)    _tty "[cdh] 未识别的 shell：${SEL_SHELL}"; exit 11 ;;
     esac
-    _tty "[cdh] 安装完成。若是 fish，请执行：exec fish -l"
+    _tty "[cdh] 安装完成。"
+    _tty " - 如为 fish：执行  exec fish -l"
+    _tty " - 如为 bash：执行  source ~/.bashrc"
     ;;
   uninstall)
     # —— 自动检测，无需交互 ——
@@ -213,8 +218,15 @@ case "${ACTION}" in
     else
       _tty "[cdh] 未发现 fish 集成（跳过子卸载）。"
     fi
+    if command -v bash >/dev/null 2>&1 && _has_bash_integration; then
+      _run_child_staged "bash" "uninstall"
+    else
+      _tty "[cdh] 未发现 bash 集成（跳过子卸载）。"
+    fi
     _uninstall_binary_and_data
-    _tty "[cdh] 卸载完成。若是 fish，请执行：exec fish -l"
+    _tty "[cdh] 卸载完成。"
+    _tty " - 如为 fish：执行  exec fish -l"
+    _tty " - 如为 bash：执行  source ~/.bashrc"
     ;;
   *)
     _tty "[cdh] 未知动作：${ACTION}"; exit 12 ;;
