@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Bash 集成卸载器（本地版）
+# Bash 集成卸载器（远端版）
 # - 从 ~/.bashrc 移除带标记片段
 # - 删除 payload
-# - 当前会话移除 PROMPT_COMMAND 中的 __cdh_log（若存在）
+# - 尝试在当前会话移除 PROMPT_COMMAND 钩子与函数
 set -Eeuo pipefail
+
 unset LC_ALL || true
 unset LANG   || true
 
 PAYDIR="$HOME/.config/cdh/bash"
 BASHRC="$HOME/.bashrc"
 
-# 移除 ~/.bashrc 标记块
+# 1) 移除 ~/.bashrc 标记块
 if [ -f "$BASHRC" ]; then
   TMP="$(mktemp)"
   awk '
@@ -22,14 +23,13 @@ if [ -f "$BASHRC" ]; then
   mv "$TMP" "$BASHRC"
 fi
 
-# 删除 payload
+# 2) 删除 payload
 rm -f "$PAYDIR/cdh.bash" "$PAYDIR/cdh_log.bash" 2>/dev/null || true
 rmdir -p "$PAYDIR" 2>/dev/null || true || true
 
-# 当前会话：去除 PROMPT_COMMAND 里的 __cdh_log
+# 3) 当前会话：去除 PROMPT_COMMAND 里的 __cdh_log，并移除函数
 unset -f __cdh_log cdh 2>/dev/null || true
 if [ -n "${PROMPT_COMMAND:-}" ]; then
-  # 兼容数组/字符串两种形式
   if declare -p PROMPT_COMMAND 2>/dev/null | grep -q 'declare \-a PROMPT_COMMAND='; then
     eval "pc=(\"\${PROMPT_COMMAND[@]}\")"
     new=()
@@ -47,6 +47,8 @@ if [ -n "${PROMPT_COMMAND:-}" ]; then
     [[ "$PROMPT_COMMAND" == *"__cdh_log"* ]] && unset PROMPT_COMMAND || true
   fi
 fi
-
-echo "[cdh][bash] 已卸载：移除 ~/.bashrc 标记块并删除 payload"
-echo "[cdh][bash] 如仍在当前 bash 会话，请执行：source ~/.bashrc"
+echo "[cdh][bash] 卸载完成："
+echo " - 已清理 ~/.bashrc 中的注入块"
+echo " - 已删除 payload：$PAYDIR/cdh.bash, $PAYDIR/cdh_log.bash"
+echo " - 让当前会话立即生效："
+echo "   打开新 bash：exec bash -l"

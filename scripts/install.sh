@@ -232,7 +232,7 @@ case "${ACTION}" in
     esac
     _tty "[cdh] 安装完成。"
     _tty " - 如为 fish：执行  exec fish -l"
-    _tty " - 如为 bash：执行  source ~/.bashrc"
+    _tty " - 如为 bash：执行  exec bash -l"
     ;;
   uninstall)
     # —— 自动检测，无需交互 ——
@@ -249,7 +249,7 @@ case "${ACTION}" in
     _uninstall_binary_and_data
     _tty "[cdh] 卸载完成。"
     _tty " - 如为 fish：执行  exec fish -l"
-    _tty " - 如为 bash：执行  source ~/.bashrc"
+    _tty " - 如为 bash：执行  exec bash -l"
     ;;
   *)
     _tty "[cdh] 未知动作：${ACTION}"
