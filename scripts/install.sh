@@ -140,6 +140,10 @@ _has_fish_integration() {
 _has_bash_integration() {
   [[ -e "${HOME}/.config/cdh/bash/cdh.bash" ]] || grep -q '^# >>> cdh installer >>>$' "${HOME}/.bashrc" 2> /dev/null
 }
+_has_zsh_integration() {
+  [[ -e "${HOME}/.config/cdh/zsh/cdh.zsh" ]] || grep -q '^# >>> cdh zsh integration >>>$' "${HOME}/.zshrc" 2> /dev/null
+}
+
 declare -a SHELLS=()
 _add_if() { command -v "$1" > /dev/null 2>&1 && SHELLS+=("$1"); }
 
@@ -159,7 +163,7 @@ _choose_shell_interactive() {
     local i
     for ((i = 0; i < ${#SHELLS[@]}; i++)); do
       case "${SHELLS[i]}" in
-        fish | bash) _tty "  $((i + 1))) ${SHELLS[i]}" ;;
+        fish | bash | zsh) _tty "  $((i + 1))) ${SHELLS[i]}" ;;
         *) _tty "  $((i + 1))) ${SHELLS[i]}  （未实现安装器）" ;;
       esac
     done
@@ -221,10 +225,7 @@ case "${ACTION}" in
     case "${SEL_SHELL}" in
       fish) _run_child_staged "fish" "install" ;;
       bash) _run_child_staged "bash" "install" ;;
-      zsh)
-        _tty "[cdh] zsh 的安装器暂未实现。"
-        exit 10
-        ;;
+      zsh)  _run_child_staged "zsh"  "install" ;;
       *)
         _tty "[cdh] 未识别的 shell：${SEL_SHELL}"
         exit 11
@@ -233,6 +234,7 @@ case "${ACTION}" in
     _tty "[cdh] 安装完成。"
     _tty " - 如为 fish：执行  exec fish -l"
     _tty " - 如为 bash：执行  exec bash -l"
+    _tty " - 如为 zsh：执行  exec zsh -l"
     ;;
   uninstall)
     # —— 自动检测，无需交互 ——
@@ -241,18 +243,28 @@ case "${ACTION}" in
     else
       _tty "[cdh] 未发现 fish 集成（跳过子卸载）。"
     fi
+
     if command -v bash > /dev/null 2>&1 && _has_bash_integration; then
       _run_child_staged "bash" "uninstall"
     else
       _tty "[cdh] 未发现 bash 集成（跳过子卸载）。"
     fi
+
+    if command -v zsh > /dev/null 2>&1 && _has_zsh_integration; then
+      _run_child_staged "zsh" "uninstall"
+    else
+      _tty "[cdh] 未发现 zsh 集成（跳过子卸载）。"
+    fi
+
     _uninstall_binary_and_data
     _tty "[cdh] 卸载完成。"
     _tty " - 如为 fish：执行  exec fish -l"
     _tty " - 如为 bash：执行  exec bash -l"
+    _tty " - 如为 zsh：执行  exec zsh -l"
     ;;
   *)
     _tty "[cdh] 未知动作：${ACTION}"
     exit 12
     ;;
 esac
+
