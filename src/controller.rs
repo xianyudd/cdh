@@ -1,31 +1,70 @@
 use crate::picker;
 use crate::{recommend_paths, RecommendOpt};
+use crate::AppContext;
+use crate::history; // 新增：历史子系统
 
 use regex::Regex;
 use std::env;
 use std::io::{self, Write};
 
 /// 运行控制器：
-/// 1) 解析 CLI/ENV -> RecommendOpt
-/// 2) 调用智能排序 -> 路径列表
-/// 3) 调用 TUI 选择器 -> 输出所选路径到 stdout（无换行）
+/// - 默认模式：推荐 + 选择（相当于 `cdh pick`）
+/// - 子命令：`cdh log --dir <path>` 追加历史日志
 ///
-/// 退出码：0 选中 / 1 取消或错误 / 2 无可用候选
-pub fn run() -> i32 {
-    // 1) 构造 RecommendOpt（默认从 ENV 读取：CDH_HALF_LIFE/CDH_IGNORE_RE 等）
+/// 退出码：
+///   - 0：成功（选中 或 log 成功）
+///   - 1：错误 / 用户取消 / log 失败
+///   - 2：无可用候选
+pub fn run(ctx: &AppContext) -> i32 {
+    // 0) 先看看是不是子命令：cdh log ...
+    let mut args = env::args().skip(1).peekable();
+
+    if let Some(cmd) = args.peek() {
+        if cmd == "log" {
+            // 消费掉 "log" 这个单词，剩下的是 log 的参数
+            args.next();
+            return run_log_subcommand(ctx, args);
+        }
+    }
+
+    // 1) 默认模式：构造 RecommendOpt
     let mut opt = RecommendOpt::default();
 
-    // 2) 解析命令行（仅覆盖必要项；其余用 ENV 或默认）
+    // 1.1 用全局 Paths 覆盖历史文件路径
+    opt.raw = ctx.paths.history_raw.to_string_lossy().into_owned();
+    opt.uniq = ctx.paths.history_uniq.to_string_lossy().into_owned();
+
+    // 1.2 用全局配置覆盖算法参数（ENV 已反映在 ctx.config 中）
+    let cfg = &ctx.config;
+    opt.limit = cfg.limit;
+    opt.half_life = cfg.half_life;
+    opt.threshold = cfg.threshold;
+    opt.ignore_re = cfg.ignore_re.clone();
+    opt.check_dir = cfg.check_dir;
+    opt.uniq_decay = cfg.uniq_decay;
+    opt.w_frecency = cfg.w_frecency;
+    opt.w_uniq = cfg.w_uniq;
+
+    // 2) 解析命令行（仅覆盖必要项；其余用 config/默认）
     // 支持：
-    //  -l/--limit <N>
-    //  --half-life <secs>
-    //  --threshold <f64>
-    //  --ignore-re <regex>
-    //  --no-check-dir
+    //  -v, --version        显示版本后退出
+    //  -l, --limit <N>      返回最大条数
+    //      --half-life <s>  半衰期（秒）
+    //      --threshold <f>  评分阈值
+    //      --ignore-re <re> 忽略路径正则
+    //      --no-check-dir   不检查目录是否存在
+    //      --help, -h       显示帮助
     //  其余位置参数作为 tokens 参与过滤（大小写不敏感子串）
-    let mut args = env::args().skip(1);
+    let mut args = args; // 复用上面的迭代器（已经消耗/判断过 log 子命令）
     while let Some(a) = args.next() {
         match a.as_str() {
+            // 版本输出
+            "-v" | "--version" => {
+                // 版本号来自 Cargo.toml 的 [package] version
+                eprintln!("cdh {}", env!("CARGO_PKG_VERSION"));
+                return 0;
+            }
+
             "-l" | "--limit" => {
                 if let Some(v) = args.next() {
                     if let Ok(n) = v.parse::<usize>() {
@@ -59,12 +98,18 @@ pub fn run() -> i32 {
             }
             "--help" | "-h" => {
                 eprintln!(
-                    "用法: cdh [选项] [关键字...]
-  -l, --limit <N>        返回最大条数（默认取 ENV:CDH_LIMIT 或 20）
-      --half-life <sec>  半衰期（秒）（默认取 ENV:CDH_HALF_LIFE 或 7*24*3600）
-      --threshold <f64>  评分阈值（低于阈值的条目被过滤，默认 0 不启用）
+                    "用法:
+  cdh [选项] [关键字...]      # 交互选择历史目录（默认模式）
+  cdh log --dir <path>       # 记录一次目录访问（供 shell hook 使用）
+
+选项:
+  -v, --version          显示版本并退出
+  -l, --limit <N>        返回最大条数（默认 20，可用环境变量 CDH_LIMIT 覆盖）
+      --half-life <sec>  Frecency 半衰期（默认 7 天，可用 CDH_HALF_LIFE 覆盖）
+      --threshold <f64>  融合分阈值（默认 0，可用 CDH_THRESHOLD 覆盖）
       --ignore-re <re>   忽略路径正则（默认取 ENV:CDH_IGNORE_RE）
-      --no-check-dir     不检查目录是否存在（跨机器日志时可打开）
+      --no-check-dir     不检查目录是否存在（默认检查，可用 CDH_CHECK_DIR=false 关闭）
+
   其余位置参数作为过滤关键字（大小写不敏感，命中任一即可）"
                 );
                 return 0;
@@ -94,3 +139,61 @@ pub fn run() -> i32 {
         Err(_e) => 1,  // 渲染异常等
     }
 }
+
+/// 处理子命令：`cdh log --dir <path>`
+///
+/// 用法:
+///   cdh log --dir /some/path
+///   cdh log /some/path   # 简写形式, 也支持
+fn run_log_subcommand(ctx: &AppContext, mut args: impl Iterator<Item = String>) -> i32 {
+    let mut dir: Option<String> = None;
+
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--dir" => {
+                if let Some(v) = args.next() {
+                    dir = Some(v);
+                } else {
+                    eprintln!("cdh log: --dir 需要一个路径参数");
+                    return 1;
+                }
+            }
+            "--help" | "-h" => {
+                eprintln!(
+                    "用法: cdh log --dir <path>
+
+示例:
+  cdh log --dir \"$PWD\"    # 记录当前目录一次访问
+  cdh log /some/path       # 简写形式"
+                );
+                return 0;
+            }
+            other => {
+                // 支持简写：cdh log /path
+                if dir.is_none() {
+                    dir = Some(other.to_string());
+                } else {
+                    eprintln!("cdh log: 多余的参数: {other}");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    let dir = match dir {
+        Some(d) => d,
+        None => {
+            eprintln!("cdh log: 必须指定 --dir <path>");
+            return 1;
+        }
+    };
+
+    match history::append_raw(ctx, &dir) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("cdh log: 写入历史失败: {e}");
+            1
+        }
+    }
+}
+
