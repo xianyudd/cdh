@@ -1,14 +1,14 @@
 use crate::picker;
 use crate::{recommend_paths, RecommendOpt};
 use crate::AppContext;
-use crate::history; // 新增：历史子系统
+use crate::history; // 历史子系统
 
 use regex::Regex;
 use std::env;
 use std::io::{self, Write};
 
 /// 运行控制器：
-/// - 默认模式：推荐 + 选择（相当于 `cdh pick`）
+/// - 默认模式：推荐 + 选择（交互选目录）
 /// - 子命令：`cdh log --dir <path>` 追加历史日志
 ///
 /// 退出码：
@@ -30,11 +30,11 @@ pub fn run(ctx: &AppContext) -> i32 {
     // 1) 默认模式：构造 RecommendOpt
     let mut opt = RecommendOpt::default();
 
-    // 1.1 用全局 Paths 覆盖历史文件路径
+    // 1.1 用全局 Paths 覆盖历史文件路径（由 XDG 解析出来）
     opt.raw = ctx.paths.history_raw.to_string_lossy().into_owned();
     opt.uniq = ctx.paths.history_uniq.to_string_lossy().into_owned();
 
-    // 1.2 用全局配置覆盖算法参数（ENV 已反映在 ctx.config 中）
+    // 1.2 用全局配置覆盖算法参数（ENV + 配置文件已经合并到 ctx.config 里）
     let cfg = &ctx.config;
     opt.limit = cfg.limit;
     opt.half_life = cfg.half_life;
@@ -121,7 +121,7 @@ pub fn run(ctx: &AppContext) -> i32 {
         }
     }
 
-    // 3) 计算推荐路径
+    // 3) 计算推荐路径（推荐算法完全由 recommend_paths 控制）
     let paths = recommend_paths(&opt);
     if paths.is_empty() {
         return 2;
@@ -160,7 +160,7 @@ fn run_log_subcommand(ctx: &AppContext, mut args: impl Iterator<Item = String>) 
             }
             "--help" | "-h" => {
                 eprintln!(
-                    "用法: cdh log --dir <path>
+"用法: cdh log --dir <path>
 
 示例:
   cdh log --dir \"$PWD\"    # 记录当前目录一次访问
@@ -188,7 +188,8 @@ fn run_log_subcommand(ctx: &AppContext, mut args: impl Iterator<Item = String>) 
         }
     };
 
-    match history::append_raw(ctx, &dir) {
+    // 统一走 history 子系统的高层入口：log_visit（内部会写 raw + 更新 uniq）
+    match history::log_visit(ctx, &dir) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("cdh log: 写入历史失败: {e}");
