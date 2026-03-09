@@ -2,7 +2,7 @@
 //! 历史子系统：统一管理 history_raw（原始日志）和 history_uniq（最近唯一列表）。
 //!
 //! 约定：
-//!   - history_raw: 每行 `<ts_ms>\t<abs_path>`
+//!   - history_raw: 每行 `<ts_secs>\t<abs_path>`
 //!   - history_uniq: 每行一个 `<abs_path>`，从旧到新，同一路径最多出现一次
 //!
 //! 对外主要 API：
@@ -28,18 +28,18 @@ const HISTORY_LOCK_STALE_SECS: u64 = 30;
 /// 一条历史记录（来自 history_raw）
 #[derive(Debug, Clone)]
 pub struct HistoryEntry {
-    /// 访问时间戳（毫秒）
-    pub ts_ms: i64,
+    /// 访问时间戳（秒）
+    pub ts_secs: i64,
     /// 访问的目录路径
     pub path: PathBuf,
 }
 
-/// 统一获取当前时间戳（毫秒）
-fn now_millis() -> i64 {
+/// 统一获取当前时间戳（秒）
+fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as i64
+        .as_secs() as i64
 }
 
 /// 追加一条记录到 history_raw。
@@ -48,15 +48,15 @@ fn now_millis() -> i64 {
 /// - 这只是“写 raw 文件”的最小单位操作。
 /// - 不做加锁；外层应通过 `log_visit` 来保证并发安全。
 pub fn append_raw(ctx: &AppContext, dir: &str) -> io::Result<()> {
-    let ts_ms = now_millis();
+    let ts_secs = now_secs();
 
     let mut f = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&ctx.paths.history_raw)?;
 
-    // 格式：<ts_ms>\t<dir>\n
-    writeln!(f, "{ts_ms}\t{dir}")?;
+    // 格式：<ts_secs>\t<dir>\n
+    writeln!(f, "{ts_secs}\t{dir}")?;
 
     Ok(())
 }
@@ -199,7 +199,7 @@ pub fn load_raw(ctx: &AppContext) -> io::Result<Vec<HistoryEntry>> {
 }
 
 /// 从指定路径解析历史文件。
-/// 文件格式：每行 `<ts_ms>\t<path>`
+/// 文件格式：每行 `<ts_secs>\t<path>`
 fn parse_history_file(path: &Path) -> io::Result<Vec<HistoryEntry>> {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -235,7 +235,7 @@ fn parse_history_file(path: &Path) -> io::Result<Vec<HistoryEntry>> {
 
         if let Ok(ts) = ts_str.parse::<i64>() {
             res.push(HistoryEntry {
-                ts_ms: ts,
+                ts_secs: ts,
                 path: PathBuf::from(path_str),
             });
         }
