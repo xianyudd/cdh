@@ -1,6 +1,6 @@
 # ~/.config/cdh/bash/cdh.bash
 cdh() {
-  local bin="" sel st raw="$HOME/.cd_history_raw"
+  local bin="" sel st
 
   if [ -n "${CDH_BIN:-}" ] && [ -x "$CDH_BIN" ]; then
     bin="$CDH_BIN"
@@ -15,13 +15,6 @@ cdh() {
     echo "示例（统一入口）：" >&2
     echo "  curl -fsSL https://raw.githubusercontent.com/xianyudd/cdh/main/scripts/install.sh | bash --noprofile --norc" >&2
     return 127
-  fi
-
-  if [ ! -s "$raw" ]; then
-    echo "cdh: 暂无历史可供推荐。" >&2
-    echo "提示：先切换几个目录后再试，例如：" >&2
-    echo "  cd ~/projects; cd ~; cd /etc; cd ~; cdh" >&2
-    return 0
   fi
 
   sel="$("$bin" "$@")"; st=$?

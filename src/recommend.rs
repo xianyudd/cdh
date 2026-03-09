@@ -1,5 +1,5 @@
 // src/recommend.rs
-//! 智能目录推荐（融合 `~/.cd_history_raw` + `~/.cd_history` 的最优实现）
+//! 智能目录推荐（融合 `history_raw` + `history_uniq` 的最优实现）
 //!
 //! 设计要点：
 //! - 以 raw 的 Frecency 分数为主、uniq 的“最近唯一”几何衰减分为辅，线性融合（可调权重）。
@@ -42,9 +42,9 @@ pub struct Recommendation {
 /// 融合推荐的配置
 #[derive(Debug, Clone)]
 pub struct RecommendOpt {
-    /// 原始频次日志：`ts<TAB>path`（默认 `$HOME/.cd_history_raw`）
+    /// 原始频次日志：`ts<TAB>path`（由 controller 注入 XDG history_raw 路径）
     pub raw: String,
-    /// 最近唯一列表：一行一个 path（默认 `$HOME/.cd_history`）
+    /// 最近唯一列表：一行一个 path（由 controller 注入 XDG history_uniq 路径）
     pub uniq: String,
     /// 返回最大条数（默认 20）
     pub limit: usize,

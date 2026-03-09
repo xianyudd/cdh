@@ -14,14 +14,6 @@ function cdh -d "智能 cd 历史（Rust 版 TUI）"
         return 127
     end
 
-    set -l raw "$HOME/.cd_history_raw"
-    if not test -s "$raw"
-        echo "cdh: 暂无历史可供推荐。" >&2
-        echo "提示：先切换几个目录再试，例如：" >&2
-        echo "  cd ~/projects; cd ~; cd /etc; cd ~; 然后执行：cdh" >&2
-        return 0
-    end
-
     set -l sel ( $bin $argv )
     set -l st $status
 

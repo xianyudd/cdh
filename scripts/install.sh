@@ -126,11 +126,20 @@ _install_binary_latest() {
 _uninstall_binary_and_data() {
   local bindir="${HOME}/.local/bin"
   local bin="${bindir}/cdh"
-  local hist="${HOME}/.cd_history_raw"
-  rm -f "${bin}" "${hist}" 2> /dev/null || true
+  local legacy_hist="${HOME}/.cd_history_raw"
+  local data_base="${XDG_DATA_HOME:-${HOME}/.local/share}"
+  local state_base="${XDG_STATE_HOME:-${HOME}/.local/state}"
+  local data_dir="${data_base}/cdh"
+  local state_dir="${state_base}/cdh"
+
+  rm -f "${bin}" "${legacy_hist}" 2> /dev/null || true
+  rm -rf "${data_dir}" "${state_dir}" 2> /dev/null || true
+
   _tty "[cdh] 已卸载二进制与历史（若存在则已删除）："
   _tty " - ${bin}"
-  _tty " - ${hist}"
+  _tty " - ${legacy_hist}"
+  _tty " - ${data_dir}"
+  _tty " - ${state_dir}"
 }
 
 # ---------- 检测/枚举 shell ----------

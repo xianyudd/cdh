@@ -58,23 +58,39 @@ bash --noprofile --norc scripts/install.sh --action uninstall
 
 ### 日志采集
 
-安装完成后，各 shell 通过轻量级 hook 把目录访问记录到 `~/.cd_history_raw`：
+安装完成后，各 shell 通过轻量级 hook 调用：
+
+```bash
+cdh log --dir "$PWD"
+```
+
+由 `cdh` 二进制统一把目录访问写入 XDG 历史目录：
+
+* `DATA/history/history_raw`
+* `DATA/history/history_uniq`
+
+其中：
+
+* `DATA = ${XDG_DATA_HOME:-$HOME/.local/share}/cdh`
+* `STATE = ${XDG_STATE_HOME:-$HOME/.local/state}/cdh`
+
+各 shell 的挂载方式：
 
 * fish：`cdh_log.fish` 通过 fish 的 hook 挂载；
-* bash：`cdh_log.bash` 通过 `PROMPT_COMMAND` 或 `DEBUG` trap 挂载；
-* zsh：`cdh_log.zsh` 通过 `chpwd_functions` / `precmd` 挂载。
+* bash：`cdh_log.bash` 通过 `PROMPT_COMMAND` 挂载；
+* zsh：`cdh_log.zsh` 通过 `chpwd_functions` 挂载。
 
-每一行形如：
+`history_raw` 每一行形如：
 
 ```text
-<TIMESTAMP> <ABS_PATH>
+<TIMESTAMP>\t<ABS_PATH>
 ```
 
 例如：
 
 ```text
-1763319252 /tmp
-1763319270 /home/tester/cdh
+1763319252	/tmp
+1763319270	/home/tester/cdh
 ```
 
 ### 基本用法
@@ -87,7 +103,7 @@ cdh
 
 默认行为：
 
-* 从 `~/.cd_history_raw`（以及去重后的 uniq 文件）读取历史；
+* 从 XDG 历史目录中的 `history_raw` 与 `history_uniq` 读取历史；
 * 按 Frecency 算法打分并排序；
 * 启动一个 TUI 列表供你选择目录；
 * 选择后，shell 包装函数会 `cd` 到该目录。
