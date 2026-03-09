@@ -11,13 +11,19 @@
 //!   - load_raw(ctx): 读 raw 为 HistoryEntry 列表
 //!
 //! 写入安全：
-//!   - 使用粗粒度文件锁 + “临时文件 + rename” 来保证 history_uniq 的更新在进程间是原子的。
+//!   - 使用粗粒度文件锁 + 短暂重试/过期锁清理，降低并发写失败概率；
+//!   - 使用“临时文件 + rename”保证 history_uniq 的更新尽量原子。
 
 use crate::AppContext;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const HISTORY_LOCK_RETRY_MS: u64 = 50;
+const HISTORY_LOCK_RETRIES: usize = 20;
+const HISTORY_LOCK_STALE_SECS: u64 = 30;
 
 /// 一条历史记录（来自 history_raw）
 #[derive(Debug, Clone)]
@@ -94,23 +100,26 @@ fn update_uniq_after_visit(ctx: &AppContext, dir: &str) -> io::Result<()> {
 
     // 1) 读旧 uniq
     let mut paths: Vec<String> = Vec::new();
-    if let Ok(file) = File::open(uniq_path) {
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+    match File::open(uniq_path) {
+        Ok(file) => {
+            let reader = BufReader::new(file);
+            for line_res in reader.lines() {
+                let line = line_res?;
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if line == dir {
+                    // 去掉旧记录
+                    continue;
+                }
+                paths.push(line.to_string());
             }
-            if line == dir {
-                // 去掉旧记录
-                continue;
-            }
-            paths.push(line.to_string());
         }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // 不存在视为空 uniq
+        }
+        Err(e) => return Err(e),
     }
 
     // 2) 追加当前目录
@@ -118,7 +127,7 @@ fn update_uniq_after_visit(ctx: &AppContext, dir: &str) -> io::Result<()> {
 
     // 3) 写入临时文件
     if let Some(parent) = uniq_path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)?;
     }
     {
         let file = File::create(&tmp_path)?;
@@ -126,7 +135,7 @@ fn update_uniq_after_visit(ctx: &AppContext, dir: &str) -> io::Result<()> {
         for p in &paths {
             writeln!(writer, "{p}")?;
         }
-        // BufWriter drop 时会 flush
+        writer.flush()?;
     }
 
     // 4) 原子替换
@@ -207,13 +216,38 @@ impl FileLock {
             fs::create_dir_all(parent)?;
         }
 
-        // 使用 create_new 保证“如果文件已存在就失败”，实现互斥
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)?;
+        let mut last_err: Option<io::Error> = None;
 
-        Ok(FileLock { path, file })
+        for attempt in 0..=HISTORY_LOCK_RETRIES {
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok(FileLock { path, file }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    last_err = Some(e);
+
+                    if maybe_clear_stale_lock(&path) {
+                        continue;
+                    }
+
+                    if attempt == HISTORY_LOCK_RETRIES {
+                        break;
+                    }
+
+                    thread::sleep(Duration::from_millis(HISTORY_LOCK_RETRY_MS));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to acquire history lock: {}", path.display()),
+            )
+        }))
     }
 }
 
@@ -221,6 +255,34 @@ impl Drop for FileLock {
     fn drop(&mut self) {
         // 释放锁：删除锁文件，忽略错误
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// 如果锁文件明显过期，尝试清理它。
+fn maybe_clear_stale_lock(path: &Path) -> bool {
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
+
+    let modified = match meta.modified() {
+        Ok(modified) => modified,
+        Err(_) => return false,
+    };
+
+    let elapsed = match modified.elapsed() {
+        Ok(elapsed) => elapsed,
+        Err(_) => return false,
+    };
+
+    if elapsed < Duration::from_secs(HISTORY_LOCK_STALE_SECS) {
+        return false;
+    }
+
+    match fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+        Err(_) => false,
     }
 }
 
@@ -240,3 +302,133 @@ where
     f()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AppContext, EffectiveConfig, Paths};
+    use std::env;
+    use std::process;
+
+    fn test_config() -> EffectiveConfig {
+        EffectiveConfig {
+            limit: 20,
+            half_life: 7.0 * 24.0 * 3600.0,
+            threshold: 0.0,
+            ignore_re: None,
+            check_dir: true,
+            uniq_decay: 0.85,
+            w_frecency: 0.7,
+            w_uniq: 0.3,
+        }
+    }
+
+    fn make_test_ctx(name: &str) -> (PathBuf, AppContext) {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "cdh_history_test_{}_{}_{}",
+            name,
+            process::id(),
+            uniq
+        ));
+
+        let paths = Paths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            history_raw: root.join("data").join("history").join("history_raw"),
+            history_uniq: root.join("data").join("history").join("history_uniq"),
+        };
+
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        fs::create_dir_all(&paths.cache_dir).unwrap();
+        if let Some(parent) = paths.history_raw.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        (
+            root,
+            AppContext {
+                paths,
+                config: test_config(),
+            },
+        )
+    }
+
+    fn read_lines(path: &Path) -> Vec<String> {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn log_visit_writes_raw_and_uniq() {
+        let (root, ctx) = make_test_ctx("writes_raw_and_uniq");
+        let dir = root.join("visited_dir");
+        fs::create_dir_all(&dir).unwrap();
+
+        log_visit(&ctx, dir.to_str().unwrap()).unwrap();
+
+        let raw = fs::read_to_string(&ctx.paths.history_raw).unwrap();
+        let raw_line = raw.trim();
+        let mut parts = raw_line.splitn(2, '\t');
+        let ts = parts.next().unwrap();
+        let path = parts.next().unwrap();
+
+        assert!(ts.parse::<i64>().is_ok());
+        assert_eq!(path, dir.to_string_lossy());
+        assert_eq!(
+            read_lines(&ctx.paths.history_uniq),
+            vec![dir.to_string_lossy().to_string()]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn log_visit_moves_existing_path_to_end_of_uniq() {
+        let (root, ctx) = make_test_ctx("moves_existing_path");
+        let dir_a = root.join("a");
+        let dir_b = root.join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        log_visit(&ctx, dir_a.to_str().unwrap()).unwrap();
+        log_visit(&ctx, dir_b.to_str().unwrap()).unwrap();
+        log_visit(&ctx, dir_a.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            read_lines(&ctx.paths.history_uniq),
+            vec![
+                dir_b.to_string_lossy().to_string(),
+                dir_a.to_string_lossy().to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn log_visit_returns_error_when_uniq_path_is_invalid() {
+        let (root, mut ctx) = make_test_ctx("uniq_open_error");
+        let bad_parent = root.join("not_a_dir");
+        let dir = root.join("visited_dir");
+
+        fs::write(&bad_parent, b"not a directory").unwrap();
+        fs::create_dir_all(&dir).unwrap();
+
+        ctx.paths.history_uniq = bad_parent.join("history_uniq");
+
+        let result = log_visit(&ctx, dir.to_str().unwrap());
+        assert!(result.is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+}
