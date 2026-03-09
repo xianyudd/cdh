@@ -77,7 +77,7 @@ _install_binary_latest() {
     if [[ -n "${version}" ]]; then
       _tty "[cdh] 使用最新版本：${version}"
     else
-      version="v0.1.1"
+      version="v0.2.0"
       _tty "[cdh] 警告：解析最新版本失败，回落到 ${version}"
     fi
   else
