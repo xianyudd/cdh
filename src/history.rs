@@ -17,7 +17,7 @@
 use crate::AppContext;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -73,13 +73,59 @@ pub fn log_visit(ctx: &AppContext, dir: &str) -> io::Result<()> {
         return Ok(());
     }
 
+    let dir = normalize_history_path(dir)?;
+
     with_history_lock(ctx, || {
         // 1) 追加到 raw
-        append_raw(ctx, dir)?;
+        append_raw(ctx, &dir)?;
         // 2) 更新 uniq（最近唯一列表）
-        update_uniq_after_visit(ctx, dir)?;
+        update_uniq_after_visit(ctx, &dir)?;
         Ok(())
     })
+}
+
+/// 规范化用于写入历史文件的路径，保证尽量写入绝对路径。
+///
+/// 规则：
+/// - 相对路径会基于当前工作目录转成绝对路径；
+/// - 如果目标存在，优先 canonicalize，去掉 `.` / `..` 并解析软链接；
+/// - 如果目标暂时不存在，则退化为词法级规范化，至少保证是绝对路径。
+fn normalize_history_path(dir: &str) -> io::Result<String> {
+    let path = Path::new(dir);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    let normalized = match fs::canonicalize(&abs) {
+        Ok(path) => path,
+        Err(_) => normalize_lexically(&abs),
+    };
+
+    Ok(normalized.to_string_lossy().into_owned())
+}
+
+/// 对路径做不访问文件系统的词法级规范化。
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    let is_absolute = path.is_absolute();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() && !is_absolute {
+                    out.push(component.as_os_str());
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+
+    out
 }
 
 /// 在一次新的访问之后，按“最近唯一”语义更新 history_uniq。
@@ -428,6 +474,37 @@ mod tests {
 
         let result = log_visit(&ctx, dir.to_str().unwrap());
         assert!(result.is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn log_visit_normalizes_relative_path_to_absolute() {
+        let (root, ctx) = make_test_ctx("normalize_relative_path");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+        let target = workspace.join("target_dir");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&target).unwrap();
+
+        let old_cwd = env::current_dir().unwrap();
+        env::set_current_dir(&nested).unwrap();
+
+        let result = log_visit(&ctx, "../target_dir");
+
+        env::set_current_dir(old_cwd).unwrap();
+        result.unwrap();
+
+        let expected = fs::canonicalize(&target)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let raw = fs::read_to_string(&ctx.paths.history_raw).unwrap();
+        let raw_path = raw.trim().splitn(2, '\t').nth(1).unwrap();
+
+        assert_eq!(raw_path, expected);
+        assert_eq!(read_lines(&ctx.paths.history_uniq), vec![expected]);
 
         let _ = fs::remove_dir_all(root);
     }
