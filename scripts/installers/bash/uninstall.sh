@@ -16,8 +16,8 @@ if [ -f "$BASHRC" ]; then
   TMP="$(mktemp)"
   awk '
     BEGIN{skip=0}
-    /^\s*#\s*>>>\s*cdh installer\s*>>>\s*$/ {skip=1; next}
-    /^\s*#\s*<<<\s*cdh installer\s*<<<\s*$/ {skip=0; next}
+    /^[[:space:]]*#[[:space:]]*>>>[[:space:]]*cdh installer[[:space:]]*>>>[[:space:]]*$/ {skip=1; next}
+    /^[[:space:]]*#[[:space:]]*<<<[[:space:]]*cdh installer[[:space:]]*<<<[[:space:]]*$/ {skip=0; next}
     skip==0 {print}
   ' "$BASHRC" > "$TMP"
   mv "$TMP" "$BASHRC"

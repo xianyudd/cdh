@@ -19,7 +19,7 @@ cdh() {
 
   sel="$("$bin" "$@")"; st=$?
   case "$st" in
-    0) [ -n "$sel" ] && builtin cd -- "$sel" ;;
+    0) [ -n "$sel" ] && builtin cd -- "$sel"; return 0 ;;
     1) return 0 ;;
     2) echo "cdh: 未匹配到目录（可尝试输入关键字）" >&2; return 2 ;;
     *) echo "cdh: 执行错误（退出码 $st）" >&2; return "$st" ;;
