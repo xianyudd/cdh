@@ -43,9 +43,9 @@ trap _cleanup EXIT
 _fetch() {
   local url="$1" out="$2"
   if command -v curl > /dev/null 2>&1; then
-    curl -fsSL --retry 1 --connect-timeout 4 -o "$out" "$url"
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o "$out" "$url"
   elif command -v wget > /dev/null 2>&1; then
-    wget -q -O "$out" "$url"
+    wget -q --timeout=120 --tries=3 -O "$out" "$url"
   else
     _tty "[cdh] 需要 curl 或 wget 以下载：$url"
     return 127
@@ -55,7 +55,13 @@ _fetch() {
 # ---------- 解析“最新版本”（可被 CDH_VERSION 覆盖） ----------
 _resolve_latest_version() {
   local eff
-  eff="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${OWNER}/${REPO}/releases/latest" 2> /dev/null || true)"
+  if command -v curl > /dev/null 2>&1; then
+    eff="$(curl -fsSLI --retry 2 --connect-timeout 15 --max-time 60 -o /dev/null -w '%{url_effective}' "https://github.com/${OWNER}/${REPO}/releases/latest" 2> /dev/null || true)"
+  elif command -v wget > /dev/null 2>&1; then
+    eff="$(wget -q --timeout=60 --tries=2 --max-redirect=5 --spider --server-response "https://github.com/${OWNER}/${REPO}/releases/latest" 2>&1 | awk '/^  Location: / {print $2}' | tail -n 1 | tr -d '\r' || true)"
+  else
+    eff=""
+  fi
   case "${eff}" in
     */tag/*) printf "%s" "${eff##*/tag/}" ;;
     *) printf "" ;;
@@ -103,11 +109,21 @@ _install_binary_latest() {
   tarpath="${STAGE_DIR}/${tarball}"
 
   _tty "[cdh] 获取二进制：${url}"
-  _fetch "${url}" "${tarpath}"
+  if ! _fetch "${url}" "${tarpath}"; then
+    _tty "[cdh] 错误：二进制下载失败：${url}"
+    return 1
+  fi
+  if [[ ! -s "${tarpath}" ]]; then
+    _tty "[cdh] 错误：下载文件为空：${url}"
+    return 1
+  fi
 
   unpack="${STAGE_DIR}/unpack"
   mkdir -p "${unpack}"
-  tar -xzf "${tarpath}" -C "${unpack}"
+  if ! tar -xzf "${tarpath}" -C "${unpack}"; then
+    _tty "[cdh] 错误：无法解压二进制包：${tarpath}"
+    return 1
+  fi
 
   # 智能定位可执行文件
   found=""
@@ -228,7 +244,10 @@ _run_child_staged() {
 # ================= 主流程 =================
 case "${ACTION}" in
   install)
-    _install_binary_latest || _tty "[cdh] 二进制安装可能未完成，请检查上述提示。"
+    if ! _install_binary_latest; then
+      _tty "[cdh] 安装中止：二进制安装失败。"
+      exit 20
+    fi
     SEL_SHELL="$(_choose_shell_interactive)"
     [[ -z "${SEL_SHELL}" ]] && {
       _tty "[cdh] 已取消。"
