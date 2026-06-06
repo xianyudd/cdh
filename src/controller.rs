@@ -1,7 +1,7 @@
-use crate::picker;
-use crate::{recommend_paths, RecommendOpt};
-use crate::AppContext;
 use crate::history; // 历史子系统
+use crate::picker;
+use crate::AppContext;
+use crate::{recommend_paths, RecommendOpt};
 
 use regex::Regex;
 use std::env;
@@ -16,8 +16,12 @@ use std::io::{self, Write};
 ///   - 1：错误 / 用户取消 / log 失败
 ///   - 2：无可用候选
 pub fn run(ctx: &AppContext) -> i32 {
+    run_with_args(ctx, env::args().skip(1))
+}
+
+fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
     // 0) 先看看是不是子命令：cdh log ...
-    let mut args = env::args().skip(1).peekable();
+    let mut args = args.peekable();
 
     if let Some(cmd) = args.peek() {
         if cmd == "log" {
@@ -75,6 +79,10 @@ pub fn run(ctx: &AppContext) -> i32 {
             "--half-life" => {
                 if let Some(v) = args.next() {
                     if let Ok(secs) = v.parse::<f64>() {
+                        if !secs.is_finite() || secs <= 0.0 {
+                            eprintln!("cdh: --half-life 必须是大于 0 的有限数字");
+                            return 1;
+                        }
                         opt.half_life = secs;
                     }
                 }
@@ -140,6 +148,76 @@ pub fn run(ctx: &AppContext) -> i32 {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EffectiveConfig, Paths};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_ctx(name: &str) -> (PathBuf, AppContext) {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cdh_controller_test_{name}_{uniq}"));
+        let paths = Paths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            history_raw: root.join("data").join("history").join("history_raw"),
+            history_uniq: root.join("data").join("history").join("history_uniq"),
+        };
+        fs::create_dir_all(paths.history_raw.parent().unwrap()).unwrap();
+        fs::write(&paths.history_raw, format!("1\t{}\n", root.display())).unwrap();
+        fs::write(&paths.history_uniq, format!("{}\n", root.display())).unwrap();
+        (
+            root,
+            AppContext {
+                paths,
+                config: EffectiveConfig {
+                    limit: 20,
+                    half_life: 7.0 * 24.0 * 3600.0,
+                    threshold: 0.0,
+                    ignore_re: None,
+                    check_dir: false,
+                    uniq_decay: 0.85,
+                    w_frecency: 0.7,
+                    w_uniq: 0.3,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn half_life_zero_returns_error_instead_of_panicking() {
+        let (root, ctx) = test_ctx("half_life_zero");
+        let status = run_with_args(
+            &ctx,
+            ["--half-life", "0", "--no-check-dir"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(status, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn half_life_negative_returns_error_instead_of_panicking() {
+        let (root, ctx) = test_ctx("half_life_negative");
+        let status = run_with_args(
+            &ctx,
+            ["--half-life", "-1", "--no-check-dir"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(status, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
 /// 处理子命令：`cdh log --dir <path>`
 ///
 /// 用法:
@@ -160,7 +238,7 @@ fn run_log_subcommand(ctx: &AppContext, mut args: impl Iterator<Item = String>) 
             }
             "--help" | "-h" => {
                 eprintln!(
-"用法: cdh log --dir <path>
+                    "用法: cdh log --dir <path>
 
 示例:
   cdh log --dir \"$PWD\"    # 记录当前目录一次访问
@@ -197,4 +275,3 @@ fn run_log_subcommand(ctx: &AppContext, mut args: impl Iterator<Item = String>) 
         }
     }
 }
-

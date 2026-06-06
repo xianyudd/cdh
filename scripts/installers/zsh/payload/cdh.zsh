@@ -15,12 +15,11 @@ _cdh_resolve_bin() {
       return 0
     else
       echo "cdh: \$CDH_BIN 指向的文件不可执行: $bin" >&2
-      return 1
     fi
   fi
 
-  # 2) 回退到 PATH 中的 cdh
-  bin="$(command -v cdh 2>/dev/null)"
+  # 2) 回退到 PATH 中的外部 cdh，避免命中当前 shell 函数递归
+  bin="$(whence -p cdh 2>/dev/null)"
   if [[ -n "$bin" ]]; then
     echo "$bin"
     return 0
@@ -64,4 +63,3 @@ cdh() {
 
   builtin cd -- "$dest"
 }
-

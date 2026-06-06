@@ -1,6 +1,6 @@
 function cdh -d "智能 cd 历史（Rust 版 TUI）"
     set -l bin ""
-    if test -n "$CDH_BIN"
+    if test -n "$CDH_BIN" -a -x "$CDH_BIN"
         set bin "$CDH_BIN"
     else if command -sq cdh
         set bin (command -v cdh)

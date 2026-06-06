@@ -11,7 +11,7 @@ _cdh_resolve_bin() {
     [[ -x "$bin" ]] && { print -r -- "$bin"; return 0; }
   fi
 
-  bin="$(command -v cdh 2>/dev/null)"
+  bin="$(whence -p cdh 2>/dev/null)"
   [[ -n "$bin" && -x "$bin" ]] && { print -r -- "$bin"; return 0; }
 
   [[ -x "$HOME/.local/bin/cdh" ]] && { print -r -- "$HOME/.local/bin/cdh"; return 0; }
