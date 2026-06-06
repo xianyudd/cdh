@@ -146,6 +146,10 @@ CDH_IGNORE_RE='\.git($|/)' cdh
 
 ## 开发者说明
 
+已知问题记录：
+
+* [Shell Path Migration Issue](./docs/issues/2026-03-20-shell-path-migration.md)
+
 ### 目录结构（节选）
 
 ```text
@@ -187,4 +191,3 @@ src/
 ## 许可证
 
 [MIT](./LICENSE)
-
