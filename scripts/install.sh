@@ -23,10 +23,13 @@ if [[ $# -ge 2 && "$1" == "--action" ]]; then
 fi
 
 # ---- 仅 install 需要交互式 TTY；uninstall 不需要 ----
-_tty() {
-  if [[ -w /dev/tty ]]; then printf "%s\n" "$*" > /dev/tty; else printf "%s\n" "$*"; fi
+_has_tty() {
+  [[ -r /dev/tty && -w /dev/tty ]] && { : > /dev/tty; } 2> /dev/null
 }
-if [[ "${ACTION}" == "install" && ! -w /dev/tty ]]; then
+_tty() {
+  if _has_tty; then printf "%s\n" "$*" > /dev/tty; else printf "%s\n" "$*"; fi
+}
+if [[ "${ACTION}" == "install" ]] && ! _has_tty; then
   echo "[cdh] 需要可交互的 TTY 才能选择目标 shell。请在交互式终端运行此命令。" >&2
   exit 64
 fi
@@ -276,4 +279,3 @@ case "${ACTION}" in
     exit 12
     ;;
 esac
-
