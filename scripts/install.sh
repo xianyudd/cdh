@@ -86,8 +86,8 @@ _install_binary_latest() {
     if [[ -n "${version}" ]]; then
       _tty "[cdh] 使用最新版本：${version}"
     else
-      version="v0.2.0"
-      _tty "[cdh] 警告：解析最新版本失败，回落到 ${version}"
+      _tty "[cdh] 错误：解析最新版本失败。请检查网络，或使用 CDH_VERSION=vX.Y.Z 指定版本。"
+      return 1
     fi
   else
     _tty "[cdh] 使用环境指定版本：${version}"
