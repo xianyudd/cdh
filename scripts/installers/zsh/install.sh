@@ -10,9 +10,9 @@ set -Eeuo pipefail
 _fetch() {
   local url="$1" out="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 1 --connect-timeout 4 -o "$out" "$url"
+    curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 -o "$out" "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$out" "$url"
+    wget -q --timeout=600 --tries=5 -O "$out" "$url"
   else
     echo "[cdh][zsh] 需要 curl 或 wget 以下载：$url" >&2
     return 127
@@ -60,4 +60,3 @@ else
 fi
 
 echo "[cdh][zsh] zsh 集成安装完成。请重新打开 zsh，或执行：source \"${ZSHRC}\""
-

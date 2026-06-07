@@ -28,9 +28,9 @@ trap _cleanup EXIT
 _fetch() {
   local url="$1" out="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 1 --connect-timeout 2 -o "$out" "$url"
+    curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 -o "$out" "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$out" "$url"
+    wget -q --timeout=600 --tries=5 -O "$out" "$url"
   else
     echo "[cdh] 需要 curl 或 wget 用于下载：$url" >&2
     return 127
@@ -51,14 +51,8 @@ PAYLOAD_DIR="${STAGE_DIR}/payload"
 mkdir -p "${PAYLOAD_DIR}"
 
 echo "[cdh] 获取 payload ..."
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL --retry 1 --connect-timeout 2 \
-    -o "${PAYLOAD_DIR}/cdh.fish"     "${RAW_BASE}/installers/fish/payload/cdh.fish" \
-    -o "${PAYLOAD_DIR}/cdh_log.fish" "${RAW_BASE}/installers/fish/payload/cdh_log.fish"
-else
-  _fetch "${RAW_BASE}/installers/fish/payload/cdh.fish"     "${PAYLOAD_DIR}/cdh.fish"
-  _fetch "${RAW_BASE}/installers/fish/payload/cdh_log.fish" "${PAYLOAD_DIR}/cdh_log.fish"
-fi
+_fetch "${RAW_BASE}/installers/fish/payload/cdh.fish"     "${PAYLOAD_DIR}/cdh.fish"
+_fetch "${RAW_BASE}/installers/fish/payload/cdh_log.fish" "${PAYLOAD_DIR}/cdh_log.fish"
 
 # -------- 2) 若缺少二进制则从 Release 下载并安装 --------
 need_bin=1
