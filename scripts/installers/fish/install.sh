@@ -10,8 +10,8 @@ OWNER="xianyudd"
 REPO="cdh"
 # 发布版本（可用环境变量覆盖：CDH_VERSION=v0.2.0）
 VERSION="${CDH_VERSION:-v0.2.0}"
-BRANCH="main"
-RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/scripts"
+: "${BRANCH:=main}"
+: "${RAW_BASE:=https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/scripts}"
 REL_BASE="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}"
 
 # -------- 阶段目录（若父脚本未提供则自建并自行清理） --------

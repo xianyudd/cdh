@@ -10,8 +10,8 @@ unset LANG   || true
 
 OWNER="xianyudd"
 REPO="cdh"
-BRANCH="main"
-RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/scripts"
+: "${BRANCH:=main}"
+: "${RAW_BASE:=https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/scripts}"
 
 # ----- 阶段目录（复用父级 STAGE_DIR；否则自建并清理） -----
 if [[ -n "${STAGE_DIR:-}" ]]; then

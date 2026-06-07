@@ -1,6 +1,6 @@
 [package]
 name = "cdh"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"                     # 若你确实用了 2024 特性，可改为 "2024"
 rust-version = "1.70"                # 最低编译版本声明（GitHub Actions 更稳）
 description = "A frecency-based smart directory jumper with a lightweight TUI."

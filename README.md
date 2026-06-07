@@ -41,9 +41,9 @@ curl -fsSL https://raw.githubusercontent.com/xianyudd/cdh/main/scripts/install.s
 也可以直接使用 GitHub release 打包产物安装，适合 `raw.githubusercontent.com` 不稳定但 release asset 可下载的环境：
 
 ```bash
-curl -fsSL https://github.com/xianyudd/cdh/releases/download/v0.2.7/cdh-v0.2.7-x86_64-unknown-linux-gnu.tar.gz \
+curl -fsSL https://github.com/xianyudd/cdh/releases/download/v0.2.8/cdh-v0.2.8-x86_64-unknown-linux-gnu.tar.gz \
   | tar -xz
-cd cdh-v0.2.7-x86_64-unknown-linux-gnu
+cd cdh-v0.2.8-x86_64-unknown-linux-gnu
 bash --noprofile --norc install.sh
 ```
 
