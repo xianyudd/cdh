@@ -43,9 +43,9 @@ trap _cleanup EXIT
 _fetch() {
   local url="$1" out="$2"
   if command -v curl > /dev/null 2>&1; then
-    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o "$out" "$url"
+    curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 -o "$out" "$url"
   elif command -v wget > /dev/null 2>&1; then
-    wget -q --timeout=120 --tries=3 -O "$out" "$url"
+    wget -q --timeout=600 --tries=5 -O "$out" "$url"
   else
     _tty "[cdh] 需要 curl 或 wget 以下载：$url"
     return 127
