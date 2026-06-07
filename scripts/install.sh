@@ -14,6 +14,11 @@ OWNER="xianyudd"
 REPO="cdh"
 BRANCH="main"
 RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/scripts"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+PACKAGE_ROOT="${CDH_PACKAGE_ROOT:-}"
+if [[ -z "${PACKAGE_ROOT}" && -x "${SCRIPT_DIR}/cdh" && -d "${SCRIPT_DIR}/scripts/installers" ]]; then
+  PACKAGE_ROOT="${SCRIPT_DIR}"
+fi
 
 # ================= 参数解析（先解析，以便决定是否需要 TTY） =================
 ACTION="install"
@@ -77,6 +82,12 @@ _install_binary_latest() {
   # 已存在则跳过
   if command -v cdh > /dev/null 2>&1 || [[ -x "${bindir}/cdh" ]]; then
     _tty "[cdh] 检测到已存在的 cdh 二进制，跳过下载。"
+    return 0
+  fi
+
+  if [[ -n "${PACKAGE_ROOT}" && -x "${PACKAGE_ROOT}/cdh" ]]; then
+    install -m 0755 "${PACKAGE_ROOT}/cdh" "${bindir}/cdh"
+    _tty "[cdh] 已从发布包安装二进制到：${bindir}/cdh"
     return 0
   fi
 
@@ -234,11 +245,21 @@ _run_child_staged() {
   local sel="$1" kind="$2" # kind: install|uninstall
   local dst="${STAGE_DIR}/${sel}-${kind}.sh"
   local url="${RAW_BASE}/installers/${sel}/${kind}.sh"
-  _tty "[cdh] 下载 ${sel} ${kind} 脚本 ..."
-  _fetch "$url" "$dst"
+  if [[ -n "${PACKAGE_ROOT}" && -f "${PACKAGE_ROOT}/scripts/installers/${sel}/${kind}.sh" ]]; then
+    _tty "[cdh] 使用发布包内 ${sel} ${kind} 脚本 ..."
+    cp "${PACKAGE_ROOT}/scripts/installers/${sel}/${kind}.sh" "$dst"
+    if [[ -d "${PACKAGE_ROOT}/scripts/installers/${sel}/payload" ]]; then
+      mkdir -p "${STAGE_DIR}/payload"
+      cp -R "${PACKAGE_ROOT}/scripts/installers/${sel}/payload/." "${STAGE_DIR}/payload/"
+    fi
+    RAW_BASE="${PACKAGE_ROOT}/scripts"
+  else
+    _tty "[cdh] 下载 ${sel} ${kind} 脚本 ..."
+    _fetch "$url" "$dst"
+  fi
   chmod +x "$dst"
   _tty "[cdh] 执行 ${kind} ..."
-  STAGE_DIR="${STAGE_DIR}" env -u LC_ALL -u LANG bash "$dst"
+  env -u LC_ALL -u LANG STAGE_DIR="${STAGE_DIR}" RAW_BASE="${RAW_BASE}" bash "$dst"
 }
 
 # ================= 主流程 =================

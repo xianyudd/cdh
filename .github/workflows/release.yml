@@ -100,6 +100,8 @@ jobs:
           mkdir -p "${OUT_DIR}"
           cp "target/${TARGET}/release/${APP_NAME}" "${OUT_DIR}/"
           cp -f LICENSE README.md scripts/install.sh "${OUT_DIR}/" || true
+          mkdir -p "${OUT_DIR}/scripts"
+          cp -R scripts/installers "${OUT_DIR}/scripts/"
 
           # 打包为 tar.gz
           tar -C dist -czf "${OUT_DIR}.tar.gz" "$(basename "${OUT_DIR}")"

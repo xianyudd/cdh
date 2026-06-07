@@ -27,6 +27,10 @@ trap _cleanup EXIT
 # -------- 下载器 --------
 _fetch() {
   local url="$1" out="$2"
+  if [[ "${url}" == /* ]]; then
+    cp "$url" "$out"
+    return 0
+  fi
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 -o "$out" "$url"
   elif command -v wget >/dev/null 2>&1; then
