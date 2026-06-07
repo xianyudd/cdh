@@ -14,9 +14,13 @@ OWNER="xianyudd"
 REPO="cdh"
 BRANCH="main"
 RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/scripts"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+SCRIPT_DIR=""
+if [[ -n "${SCRIPT_SOURCE}" && -e "${SCRIPT_SOURCE}" ]]; then
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${SCRIPT_SOURCE}")" >/dev/null 2>&1 && pwd -P)"
+fi
 PACKAGE_ROOT="${CDH_PACKAGE_ROOT:-}"
-if [[ -z "${PACKAGE_ROOT}" && -x "${SCRIPT_DIR}/cdh" && -d "${SCRIPT_DIR}/scripts/installers" ]]; then
+if [[ -z "${PACKAGE_ROOT}" && -n "${SCRIPT_DIR}" && -x "${SCRIPT_DIR}/cdh" && -d "${SCRIPT_DIR}/scripts/installers" ]]; then
   PACKAGE_ROOT="${SCRIPT_DIR}"
 fi
 
