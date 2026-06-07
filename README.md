@@ -31,6 +31,13 @@ exec bash -l
 exec zsh -l
 ```
 
+如果所在网络访问 GitHub latest 跳转不稳定，可以固定安装指定版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xianyudd/cdh/main/scripts/install.sh \
+  | CDH_VERSION=v0.2.6 bash --noprofile --norc
+```
+
 也可以本地调试安装脚本（在仓库根目录）：
 
 ```bash
