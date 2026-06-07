@@ -6,4 +6,3 @@ fn main() {
     // 把上下文传给 controller，让 controller 不再自己管路径细节
     std::process::exit(cdh::controller::run(&ctx));
 }
-

@@ -265,11 +265,7 @@ impl FileLock {
         let mut last_err: Option<io::Error> = None;
 
         for attempt in 0..=HISTORY_LOCK_RETRIES {
-            match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-            {
+            match OpenOptions::new().create_new(true).write(true).open(&path) {
                 Ok(file) => return Ok(FileLock { path, file }),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     last_err = Some(e);

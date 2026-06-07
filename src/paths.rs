@@ -58,13 +58,13 @@ impl Paths {
 
         // 本项目自己的子目录
         let config_dir = config_base.join("cdh");
-        let data_dir   = data_base.join("cdh");
-        let state_dir  = state_base.join("cdh");
-        let cache_dir  = cache_base.join("cdh");
+        let data_dir = data_base.join("cdh");
+        let state_dir = state_base.join("cdh");
+        let cache_dir = cache_base.join("cdh");
 
         // 历史文件放在 DATA/cdh/history/ 下面
-        let history_dir  = data_dir.join("history");
-        let history_raw  = history_dir.join("history_raw");
+        let history_dir = data_dir.join("history");
+        let history_raw = history_dir.join("history_raw");
         let history_uniq = history_dir.join("history_uniq");
 
         Self {
@@ -77,4 +77,3 @@ impl Paths {
         }
     }
 }
-

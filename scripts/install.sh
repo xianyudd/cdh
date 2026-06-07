@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/install.sh
 # 顶层入口：
-# - install：解析“最新”版本 → 安装 ~/.local/bin/cdh → 交互选择 shell → 执行子安装器（仅集成）
+# - install：解析“最新”版本 → 安装 ~/.local/bin/cdh → 自动识别/选择 shell → 执行子安装器（仅集成）
 # - uninstall：自动检测 shell 集成 → 执行子卸载器（仅集成）→ 顶层移除二进制与历史
 # - 资源均落到临时目录，退出自动清理；不落盘日志
 set -Eeuo pipefail
@@ -26,10 +26,36 @@ fi
 
 # ================= 参数解析（先解析，以便决定是否需要 TTY） =================
 ACTION="install"
-if [[ $# -ge 2 && "$1" == "--action" ]]; then
-  ACTION="$2"
-  shift 2
-fi
+TARGET_SHELL=""
+INTERACTIVE=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --action)
+      [[ $# -ge 2 ]] || {
+        echo "[cdh] --action 需要参数：install 或 uninstall" >&2
+        exit 12
+      }
+      ACTION="$2"
+      shift 2
+      ;;
+    --shell)
+      [[ $# -ge 2 ]] || {
+        echo "[cdh] --shell 需要参数：bash、zsh、fish 或 current" >&2
+        exit 12
+      }
+      TARGET_SHELL="$2"
+      shift 2
+      ;;
+    --interactive)
+      INTERACTIVE=1
+      shift
+      ;;
+    *)
+      echo "[cdh] 未知参数：$1" >&2
+      exit 12
+      ;;
+  esac
+done
 
 # ---- 仅 install 需要交互式 TTY；uninstall 不需要 ----
 _has_tty() {
@@ -38,7 +64,10 @@ _has_tty() {
 _tty() {
   if _has_tty; then printf "%s\n" "$*" > /dev/tty; else printf "%s\n" "$*"; fi
 }
-if [[ "${ACTION}" == "install" ]] && ! _has_tty; then
+_note() {
+  if _has_tty; then printf "%s\n" "$*" > /dev/tty; else printf "%s\n" "$*" >&2; fi
+}
+if [[ "${ACTION}" == "install" && "${INTERACTIVE}" -eq 1 ]] && ! _has_tty; then
   echo "[cdh] 需要可交互的 TTY 才能选择目标 shell。请在交互式终端运行此命令。" >&2
   exit 64
 fi
@@ -189,8 +218,68 @@ _has_zsh_integration() {
 
 declare -a SHELLS=()
 _add_if() { command -v "$1" > /dev/null 2>&1 && SHELLS+=("$1"); }
+_is_supported_shell() {
+  case "$1" in
+    fish | bash | zsh) command -v "$1" > /dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+_detect_current_shell() {
+  local shell_name
+  shell_name="$(basename "${SHELL:-}")"
+  if _is_supported_shell "${shell_name}"; then
+    printf "%s" "${shell_name}"
+    return 0
+  fi
+  return 1
+}
+_resolve_target_shell() {
+  local selected=""
+  case "${TARGET_SHELL}" in
+    "")
+      if [[ "${INTERACTIVE}" -eq 0 ]]; then
+        selected="$(_detect_current_shell || true)"
+        if [[ -n "${selected}" ]]; then
+          _note "[cdh] 自动识别当前 shell：${selected}"
+          printf "%s" "${selected}"
+          return 0
+        fi
+      fi
+      ;;
+    current)
+      selected="$(_detect_current_shell || true)"
+      if [[ -n "${selected}" ]]; then
+        _note "[cdh] 自动识别当前 shell：${selected}"
+        printf "%s" "${selected}"
+        return 0
+      fi
+      _note "[cdh] 无法从 SHELL=${SHELL:-<empty>} 识别支持的 shell。"
+      return 1
+      ;;
+    fish | bash | zsh)
+      if _is_supported_shell "${TARGET_SHELL}"; then
+        _note "[cdh] 使用指定 shell：${TARGET_SHELL}"
+        printf "%s" "${TARGET_SHELL}"
+        return 0
+      fi
+      _note "[cdh] 指定的 shell 未安装或不可用：${TARGET_SHELL}"
+      return 1
+      ;;
+    *)
+      _note "[cdh] 不支持的 shell：${TARGET_SHELL}（支持：fish / zsh / bash）"
+      return 1
+      ;;
+  esac
 
-# ---------- 必须选择 shell（仅安装时使用） ----------
+  if ! _has_tty; then
+    _note "[cdh] 无法自动识别支持的 shell，且当前没有可交互 TTY。"
+    _note "[cdh] 请设置 SHELL，或使用 --shell bash|zsh|fish 指定。"
+    return 1
+  fi
+  _choose_shell_interactive
+}
+
+# ---------- 交互选择 shell（仅安装时作为兜底使用） ----------
 _choose_shell_interactive() {
   SHELLS=()
   _add_if fish
@@ -269,15 +358,15 @@ _run_child_staged() {
 # ================= 主流程 =================
 case "${ACTION}" in
   install)
-    if ! _install_binary_latest; then
-      _tty "[cdh] 安装中止：二进制安装失败。"
-      exit 20
-    fi
-    SEL_SHELL="$(_choose_shell_interactive)"
+    SEL_SHELL="$(_resolve_target_shell)" || exit 11
     [[ -z "${SEL_SHELL}" ]] && {
       _tty "[cdh] 已取消。"
       exit 0
     }
+    if ! _install_binary_latest; then
+      _tty "[cdh] 安装中止：二进制安装失败。"
+      exit 20
+    fi
     case "${SEL_SHELL}" in
       fish) _run_child_staged "fish" "install" ;;
       bash) _run_child_staged "bash" "install" ;;

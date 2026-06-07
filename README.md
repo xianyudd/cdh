@@ -5,20 +5,21 @@
 > 当前已支持 **fish / bash / zsh** 的安装与卸载集成。
 
 * 仓库地址：[https://github.com/xianyudd/cdh](https://github.com/xianyudd/cdh)
-* 安装脚本：[https://raw.githubusercontent.com/xianyudd/cdh/main/scripts/install.sh](https://raw.githubusercontent.com/xianyudd/cdh/main/scripts/install.sh)
+* 安装脚本：[https://xianyudd.github.io/cdh/install.sh](https://xianyudd.github.io/cdh/install.sh)
 
 ---
 
 ## 快速安装与卸载
 
-### 一键安装（交互选择 Shell）
+### 一键安装（自动识别当前 Shell）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xianyudd/cdh/main/scripts/install.sh \
-  | bash --noprofile --norc
+curl -fsSL https://xianyudd.github.io/cdh/install.sh | bash
 ```
 
-然后根据提示选择 shell（fish / bash / zsh），安装完成后执行对应命令重新加载：
+> 使用短链接前，需要在 GitHub Pages 中启用 `main` 分支的 `/docs` 目录。未启用时可临时使用 `https://raw.githubusercontent.com/xianyudd/cdh/main/scripts/install.sh`。
+
+安装器会根据 `$SHELL` 自动安装到 fish / bash / zsh。安装完成后执行对应命令重新加载：
 
 ```bash
 # fish
@@ -31,11 +32,18 @@ exec bash -l
 exec zsh -l
 ```
 
+也可以手动指定 shell，或强制进入交互选择：
+
+```bash
+curl -fsSL https://xianyudd.github.io/cdh/install.sh | bash -s -- --shell zsh
+curl -fsSL https://xianyudd.github.io/cdh/install.sh | bash -s -- --interactive
+```
+
 如果所在网络访问 GitHub latest 跳转不稳定，可以固定安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xianyudd/cdh/main/scripts/install.sh \
-  | CDH_VERSION=v0.2.6 bash --noprofile --norc
+curl -fsSL https://xianyudd.github.io/cdh/install.sh \
+  | CDH_VERSION=v0.2.8 bash
 ```
 
 也可以直接使用 GitHub release 打包产物安装，适合 `raw.githubusercontent.com` 不稳定但 release asset 可下载的环境：
@@ -58,8 +66,7 @@ bash --noprofile --norc scripts/install.sh
 远程卸载（自动清理 shell 集成 + 二进制 + 历史文件）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xianyudd/cdh/main/scripts/install.sh \
-  | bash --noprofile --norc -s -- --action uninstall
+curl -fsSL https://xianyudd.github.io/cdh/install.sh | bash -s -- --action uninstall
 ```
 
 本地卸载：

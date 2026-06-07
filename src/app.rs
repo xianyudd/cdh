@@ -1,8 +1,8 @@
 // src/app.rs
 //! 全局运行时上下文：汇总 Paths + Config 等信息。
 
-use crate::paths::Paths;
 use crate::config::EffectiveConfig;
+use crate::paths::Paths;
 use std::fs;
 use std::path::Path;
 
@@ -46,7 +46,10 @@ fn ensure_dirs_and_files(paths: &Paths) {
     // 2. 创建 history 目录（以 history_raw 的 parent 为准）
     if let Some(history_dir) = paths.history_raw.parent() {
         if let Err(e) = fs::create_dir_all(history_dir) {
-            eprintln!("[cdh] warn: failed to create history dir {:?}: {e}", history_dir);
+            eprintln!(
+                "[cdh] warn: failed to create history dir {:?}: {e}",
+                history_dir
+            );
         }
     }
 
@@ -74,4 +77,3 @@ fn touch_file(path: &Path) {
         eprintln!("[cdh] warn: failed to create file {:?}: {e}", path);
     }
 }
-

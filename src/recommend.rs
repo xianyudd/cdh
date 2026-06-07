@@ -70,21 +70,20 @@ impl Default for RecommendOpt {
         // 这里只保留“纯算法默认值”，不再读取环境变量，不再决定文件路径。
         // 路径由 AppContext::paths 决定，参数由 EffectiveConfig 决定。
         Self {
-            raw: String::new(),                  // 稍后由 controller 用 ctx.paths 覆盖
-            uniq: String::new(),                 // 同上
-            limit: 20,                           // 默认 20；可被 config/CLI 覆盖
-            half_life: 7.0 * 24.0 * 3600.0,      // 默认 7 天；可被 config/CLI 覆盖
-            threshold: 0.0,                      // 默认不开启阈值
-            ignore_re: None,                     // 默认不忽略任何路径；可由 config/CLI 覆盖
+            raw: String::new(),             // 稍后由 controller 用 ctx.paths 覆盖
+            uniq: String::new(),            // 同上
+            limit: 20,                      // 默认 20；可被 config/CLI 覆盖
+            half_life: 7.0 * 24.0 * 3600.0, // 默认 7 天；可被 config/CLI 覆盖
+            threshold: 0.0,                 // 默认不开启阈值
+            ignore_re: None,                // 默认不忽略任何路径；可由 config/CLI 覆盖
             tokens: Vec::new(),
-            check_dir: true,                     // 默认检查目录存在性；可被 config 覆盖
-            uniq_decay: 0.85,                    // 默认几何衰减
-            w_frecency: 0.7,                     // 默认权重
+            check_dir: true,  // 默认检查目录存在性；可被 config 覆盖
+            uniq_decay: 0.85, // 默认几何衰减
+            w_frecency: 0.7,  // 默认权重
             w_uniq: 0.3,
         }
     }
 }
-
 
 /// 外部主接口：融合 RAW+UNIQ，返回路径+分数（按最终分降序）
 pub fn recommend(opt: &RecommendOpt) -> Vec<Recommendation> {
