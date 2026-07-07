@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: extractions/setup-just@v3
+
+      - name: Install shfmt
+        run: sudo apt-get update && sudo apt-get install -y shfmt
+
+      - name: Run format and test checks
+        run: |
+          just fmt-check
+          just shell-lint
+          just test
+
+      - name: Run strict clippy
+        run: just lint-strict

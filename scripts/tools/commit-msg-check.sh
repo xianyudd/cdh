@@ -18,7 +18,7 @@ scope_re='install|bash|fish|zsh|history|paths|recommend|controller|readme|releas
 pattern="^(${type_re})(\\((${scope_re})\\))?: .+"
 
 if ! printf '%s' "$subject" | grep -Eq "$pattern"; then
-  cat >&2 <<'EOF'
+  cat >&2 << 'EOF'
 提交信息格式不符合约定。
 
 期望格式：
@@ -46,7 +46,7 @@ if [[ ${#subject} -gt 72 ]]; then
 fi
 
 case "$subject" in
-  *'.'|*'。'|*'!'|*'！'|*'?'|*'？')
+  *'.' | *'。' | *'!' | *'！' | *'?' | *'？')
     echo "提交标题末尾不要添加句号或感叹号等标点。" >&2
     exit 1
     ;;
