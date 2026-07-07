@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 unset LC_ALL || true
-unset LANG   || true
+unset LANG || true
 
 OWNER="xianyudd"
 REPO="cdh"
@@ -31,9 +31,9 @@ _fetch() {
     cp "$url" "$out"
     return 0
   fi
-  if command -v curl >/dev/null 2>&1; then
+  if command -v curl > /dev/null 2>&1; then
     curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 -o "$out" "$url"
-  elif command -v wget >/dev/null 2>&1; then
+  elif command -v wget > /dev/null 2>&1; then
     wget -q --timeout=600 --tries=5 -O "$out" "$url"
   else
     echo "[cdh] 需要 curl 或 wget 用于下载：$url" >&2
@@ -55,30 +55,30 @@ PAYLOAD_DIR="${STAGE_DIR}/payload"
 mkdir -p "${PAYLOAD_DIR}"
 
 echo "[cdh] 获取 payload ..."
-_fetch "${RAW_BASE}/installers/fish/payload/cdh.fish"     "${PAYLOAD_DIR}/cdh.fish"
+_fetch "${RAW_BASE}/installers/fish/payload/cdh.fish" "${PAYLOAD_DIR}/cdh.fish"
 _fetch "${RAW_BASE}/installers/fish/payload/cdh_log.fish" "${PAYLOAD_DIR}/cdh_log.fish"
 
 # -------- 2) 若缺少二进制则从 Release 下载并安装 --------
 need_bin=1
-if command -v cdh >/dev/null 2>&1 || [[ -x "${BIN_DIR}/cdh" ]]; then
+if command -v cdh > /dev/null 2>&1 || [[ -x "${BIN_DIR}/cdh" ]]; then
   need_bin=0
 fi
 if [[ "${CDH_SKIP_BIN:-0}" == "1" ]]; then
   need_bin=0
 fi
 
-if (( need_bin )); then
+if ((need_bin)); then
   uname_s="$(uname -s || echo Linux)"
   uname_m="$(uname -m || echo x86_64)"
   case "${uname_s}" in
-    Linux)  os_triple="unknown-linux-gnu" ;;
-    Darwin) os_triple="apple-darwin" ;;  # 预留，将来支持 macOS
-    *)      os_triple="unknown-linux-gnu" ;;
+    Linux) os_triple="unknown-linux-gnu" ;;
+    Darwin) os_triple="apple-darwin" ;; # 预留，将来支持 macOS
+    *) os_triple="unknown-linux-gnu" ;;
   esac
   case "${uname_m}" in
-    x86_64|amd64)   arch_triple="x86_64" ;;
-    aarch64|arm64)  arch_triple="aarch64" ;;
-    *)              arch_triple="x86_64" ;;
+    x86_64 | amd64) arch_triple="x86_64" ;;
+    aarch64 | arm64) arch_triple="aarch64" ;;
+    *) arch_triple="x86_64" ;;
   esac
 
   TARBALL="cdh-${VERSION}-${arch_triple}-${os_triple}.tar.gz"

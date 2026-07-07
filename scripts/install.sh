@@ -17,7 +17,7 @@ RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/scripts"
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 SCRIPT_DIR=""
 if [[ -n "${SCRIPT_SOURCE}" && -e "${SCRIPT_SOURCE}" ]]; then
-  SCRIPT_DIR="$(cd -- "$(dirname -- "${SCRIPT_SOURCE}")" >/dev/null 2>&1 && pwd -P)"
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${SCRIPT_SOURCE}")" > /dev/null 2>&1 && pwd -P)"
 fi
 PACKAGE_ROOT="${CDH_PACKAGE_ROOT:-}"
 if [[ -z "${PACKAGE_ROOT}" && -n "${SCRIPT_DIR}" && -x "${SCRIPT_DIR}/cdh" && -d "${SCRIPT_DIR}/scripts/installers" ]]; then
@@ -550,7 +550,7 @@ case "${ACTION}" in
     case "${SEL_SHELL}" in
       fish) _run_child_staged "fish" "install" ;;
       bash) _run_child_staged "bash" "install" ;;
-      zsh)  _run_child_staged "zsh"  "install" ;;
+      zsh) _run_child_staged "zsh" "install" ;;
       *)
         _tty "[cdh] 未识别的 shell：${SEL_SHELL}"
         exit 11

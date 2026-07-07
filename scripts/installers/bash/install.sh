@@ -6,7 +6,7 @@ set -Eeuo pipefail
 
 # 避免 locale 警告
 unset LC_ALL || true
-unset LANG   || true
+unset LANG || true
 
 OWNER="xianyudd"
 REPO="cdh"
@@ -30,9 +30,9 @@ _fetch() {
     cp "$url" "$out"
     return 0
   fi
-  if command -v curl >/dev/null 2>&1; then
+  if command -v curl > /dev/null 2>&1; then
     curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 -o "$out" "$url"
-  elif command -v wget >/dev/null 2>&1; then
+  elif command -v wget > /dev/null 2>&1; then
     wget -q --timeout=600 --tries=5 -O "$out" "$url"
   else
     echo "[cdh][bash] 需要 curl 或 wget 以下载：$url" >&2
@@ -54,11 +54,11 @@ PAYLOAD_DIR="${STAGE_DIR}/payload"
 mkdir -p "$PAYLOAD_DIR"
 
 _fetch "${RAW_BASE}/installers/bash/payload/cdh_log.bash" "${PAYLOAD_DIR}/cdh_log.bash"
-_fetch "${RAW_BASE}/installers/bash/payload/cdh.bash"     "${PAYLOAD_DIR}/cdh.bash"
+_fetch "${RAW_BASE}/installers/bash/payload/cdh.bash" "${PAYLOAD_DIR}/cdh.bash"
 
 # 2) 安装 payload 到用户目录（0644）
 install -m 0644 "${PAYLOAD_DIR}/cdh_log.bash" "$PAYDIR/cdh_log.bash"
-install -m 0644 "${PAYLOAD_DIR}/cdh.bash"     "$PAYDIR/cdh.bash"
+install -m 0644 "${PAYLOAD_DIR}/cdh.bash" "$PAYDIR/cdh.bash"
 
 # 3) 注入 ~/.bashrc（幂等：先去旧块，再写新块）
 touch "$BASHRC"
@@ -70,7 +70,7 @@ awk '
   skip==0 {print}
 ' "$BASHRC" > "$TMP"
 
-cat >> "$TMP" <<'MARK'
+cat >> "$TMP" << 'MARK'
 # >>> cdh installer >>>
 # cdh: bash 集成（按需加载 payload；不改动 set -e/-u）
 [ -f "$HOME/.config/cdh/bash/cdh_log.bash" ] && . "$HOME/.config/cdh/bash/cdh_log.bash"
@@ -81,7 +81,7 @@ MARK
 mv "$TMP" "$BASHRC"
 
 # 4) 确保登录 shell 也能加载 .bashrc（如存在 .bash_profile 且尚未包含）
-if [ -f "$BASH_PROFILE" ] && ! grep -qE '(^|\s)source\s+~/.bashrc' "$BASH_PROFILE" 2>/dev/null; then
+if [ -f "$BASH_PROFILE" ] && ! grep -qE '(^|\s)source\s+~/.bashrc' "$BASH_PROFILE" 2> /dev/null; then
   printf '\n[[ -f ~/.bashrc ]] && source ~/.bashrc\n' >> "$BASH_PROFILE"
 fi
 

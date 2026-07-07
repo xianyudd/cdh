@@ -35,4 +35,3 @@ else
 fi
 
 echo "[cdh][zsh] zsh 集成卸载完成。"
-

@@ -13,9 +13,9 @@ _fetch() {
     cp "$url" "$out"
     return 0
   fi
-  if command -v curl >/dev/null 2>&1; then
+  if command -v curl > /dev/null 2>&1; then
     curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 -o "$out" "$url"
-  elif command -v wget >/dev/null 2>&1; then
+  elif command -v wget > /dev/null 2>&1; then
     wget -q --timeout=600 --tries=5 -O "$out" "$url"
   else
     echo "[cdh][zsh] 需要 curl 或 wget 以下载：$url" >&2
@@ -38,7 +38,8 @@ done
 
 BLOCK_START="# >>> cdh zsh integration >>>"
 BLOCK_END="# <<< cdh zsh integration <<<"
-BLOCK_CONTENT=$(cat <<'EOF'
+BLOCK_CONTENT=$(
+  cat << 'EOF'
 # >>> cdh zsh integration >>>
 # cdh zsh support
 [ -f "$HOME/.config/cdh/zsh/cdh.zsh" ] && source "$HOME/.config/cdh/zsh/cdh.zsh"

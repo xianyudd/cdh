@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 unset LC_ALL || true
-unset LANG   || true
+unset LANG || true
 
 # -------- 阶段目录（若父脚本未提供则自建并自行清理） --------
 if [[ -n "${STAGE_DIR:-}" ]]; then

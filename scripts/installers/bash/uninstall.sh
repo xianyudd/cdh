@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 
 unset LC_ALL || true
-unset LANG   || true
+unset LANG || true
 
 PAYDIR="$HOME/.config/cdh/bash"
 BASHRC="$HOME/.bashrc"
@@ -24,13 +24,13 @@ if [ -f "$BASHRC" ]; then
 fi
 
 # 2) 删除 payload
-rm -f "$PAYDIR/cdh.bash" "$PAYDIR/cdh_log.bash" 2>/dev/null || true
-rmdir -p "$PAYDIR" 2>/dev/null || true || true
+rm -f "$PAYDIR/cdh.bash" "$PAYDIR/cdh_log.bash" 2> /dev/null || true
+rmdir -p "$PAYDIR" 2> /dev/null || true || true
 
 # 3) 当前会话：去除 PROMPT_COMMAND 里的 __cdh_log，并移除函数
-unset -f __cdh_log cdh 2>/dev/null || true
+unset -f __cdh_log cdh 2> /dev/null || true
 if [ -n "${PROMPT_COMMAND:-}" ]; then
-  if declare -p PROMPT_COMMAND 2>/dev/null | grep -q 'declare \-a PROMPT_COMMAND='; then
+  if declare -p PROMPT_COMMAND 2> /dev/null | grep -q 'declare \-a PROMPT_COMMAND='; then
     eval "pc=(\"\${PROMPT_COMMAND[@]}\")"
     new=()
     for h in "${pc[@]}"; do
