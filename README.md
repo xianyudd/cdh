@@ -1,6 +1,6 @@
 # cdh — Frecency 驱动的目录跳转（含 TUI）
 
-`cdh` 基于“访问频次 × 时间衰减（半衰期）”对目录打分，提供一个终端 TUI，让你在历史目录里快速按分数排序选择并跳转。
+`cdh` 融合“访问频次 × 时间衰减 + 最近性 + 当前目录上下文”对历史目录多信号打分，提供一个终端 TUI，让你按分数排序快速选择并跳转。
 
 > 当前已支持 **fish / bash / zsh** 的安装与卸载集成。
 
@@ -127,9 +127,37 @@ cdh
 默认行为：
 
 * 从 XDG 历史目录中的 `history_raw` 与 `history_uniq` 读取历史；
-* 按 Frecency 算法打分并排序；
+* 按融合分（频次 + 最近性 + 上下文 + 最近唯一）打分并排序；
 * 启动一个 TUI 列表供你选择目录；
 * 选择后，shell 包装函数会 `cd` 到该目录。
+
+### TUI 操作
+
+打开后即是一个现代化的全屏选择器：深色卡片、青→紫渐变高亮条，右侧彩色分数条直观反映
+每个目录的 Frecency 融合分；`$HOME` 会缩写为 `~`。**打开即可直接输入**进行 fzf 风格的模糊
+搜索，命中字符会高亮，并按匹配质量排序。
+
+键位：
+
+| 按键 | 作用 |
+| --- | --- |
+| 任意字符 | 模糊搜索过滤 |
+| `↑` / `↓`、`Ctrl+P` / `Ctrl+N` | 上下移动（越界环绕） |
+| `PageUp` / `PageDown` | 翻页（±10） |
+| `Home` / `End` | 跳到首 / 末项 |
+| `Enter` / `Tab` | 跳转到选中目录 |
+| `Esc` | 有查询时清空查询，否则退出 |
+| `Ctrl+C` / `Ctrl+G` | 退出 |
+| `F1` | 打开帮助浮层 |
+| 鼠标 | 单击选中、双击跳转、滚轮滚动 |
+
+行为开关（环境变量）：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `CDH_COLOR` | `1` | 设为 `0` 关闭配色（分数条/高亮退化为反显） |
+| `CDH_MOUSE` | `1` | 设为 `0` 关闭鼠标捕获 |
+| `CDH_ANIM` | `1` | 设为 `0` 关闭平滑过渡动画（高亮缓动、分数条增长、淡入） |
 
 你也可以通过命令行参数控制行为（`cdh -h` 会打印完整帮助）：
 
@@ -139,7 +167,7 @@ cdh -h
 
 核心参数：
 
-* `-l, --limit <N>`：返回最大条数（默认取环境变量 `CDH_LIMIT` 或 20）；
+* `-l, --limit <N>`：限制最大候选数（默认不截断，让 TUI 搜索覆盖完整历史候选；也可用 `CDH_LIMIT` 设置）；
 * `--half-life <sec>`：半衰期（秒）（默认取环境变量 `CDH_HALF_LIFE` 或 7 天）；
 * `--threshold <f64>`：评分阈值（低于阈值的条目被过滤，默认 0 不启用）；
 * `--ignore-re <re>`：忽略路径正则（默认取 `CDH_IGNORE_RE`，比如忽略 `.git` 等）；
@@ -148,8 +176,34 @@ cdh -h
 退出码约定：
 
 * `0`：成功选中目录并输出路径；
-* `1`：用户取消（如按 `q` / Ctrl+C）或 TUI 渲染错误；
+* `1`：用户取消（如按 `Esc` / `Ctrl+C`）或 TUI 渲染错误；
 * `2`：没有可用候选（比如历史为空或全被过滤）。
+
+### 排序算法
+
+推荐分由四个归一化到 `[0,1]` 的信号线性融合（默认权重见下表）：
+
+| 信号 | 说明 | 默认权重 | 权重变量 |
+| --- | --- | --- | --- |
+| 频次 frecency | raw 日志的时间衰减访问分，经 `ln(1+s)` 对数压缩，避免 `$HOME` 这类高频目录压扁其余排序 | 0.40 | `CDH_W_FRECENCY` |
+| 最近性 recency | 独立的短半衰期信号，让“刚去过”的目录浮上来 | 0.30 | `CDH_W_RECENCY` |
+| 上下文 context | 从当前 `pwd` 出发的历史一阶转移 + 直接子目录小加成 | 0.20 | `CDH_W_CONTEXT` |
+| 最近唯一 uniq | uniq 文件的几何衰减名次 | 0.10 | `CDH_W_UNIQ` |
+
+另有两项关键处理：
+
+* **防抖**：同一目录在 `CDH_DEBOUNCE_SECS`（默认 600 秒）窗口内的重复访问只计一次频次，
+  抵消“每开一个 shell / 标签就记一条 `$HOME`”造成的分数虚高（设为 `0` 可关闭）；
+* **排除当前目录**：`pwd` 本身不会出现在候选里（跳到自己所在目录没有意义）。
+
+相关调节变量：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `CDH_HALF_LIFE` | `604800`（7 天） | 频次半衰期（秒） |
+| `CDH_RECENCY_HALF_LIFE` | `86400`（24 小时） | 最近性半衰期（秒） |
+| `CDH_DEBOUNCE_SECS` | `600` | 频次防抖窗口（秒），`0` 关闭 |
+| `CDH_UNIQ_DECAY` | `0.85` | uniq 几何衰减系数 |
 
 ### 示例
 
@@ -168,6 +222,45 @@ CDH_IGNORE_RE='\.git($|/)' cdh
 ---
 
 ## 开发者说明
+
+开发期自动化命令（推荐先安装 [`just`](https://github.com/casey/just)）：
+
+```bash
+cargo install just
+```
+
+常用命令：
+
+```bash
+just fmt          # 格式化 Rust + shell 脚本
+just fmt-check    # 检查格式是否符合要求
+just shell-lint   # bash -n 检查脚本语法
+just lint         # cargo clippy -- -D warnings
+just test         # cargo test --locked --all
+just check        # fmt-check + shell-lint + lint + test
+just build-release
+just release-dry-run
+just hooks-install # 安装 pre-commit / commit-msg hooks
+```
+
+Git hooks：
+
+- `pre-commit`：提交前执行格式/脚本语法/测试检查
+- `commit-msg`：检查提交信息是否符合约定
+- 依赖：`pre-commit` 优先使用 `just`，若未安装则自动回退到底层 `cargo fmt --check` / `shfmt` / `bash -n` / `cargo test`
+
+安装：
+
+```bash
+just hooks-install
+```
+
+验证：
+
+```bash
+git commit --allow-empty -m "bad message"   # 应被 commit-msg 拦下
+git commit --allow-empty -m "fix(ci): validate hooks"  # 应通过 hooks 检查
+```
 
 已知问题记录：
 
@@ -205,7 +298,7 @@ src/
   controller.rs              # CLI + env 解析、推荐 + TUI glue 逻辑
   frecency.rs                # Frecency 算法与打分
   recommend.rs               # 从 raw/uniq 历史生成推荐路径
-  picker.rs                  # crossterm TUI（列表 + 搜索 + 键盘/鼠标）
+  picker.rs                  # ratatui TUI（模糊搜索 + 分数条 + 动画 + 键盘/鼠标）
   lib.rs                     # 模块导出
 ```
 
