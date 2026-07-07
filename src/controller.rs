@@ -1,7 +1,7 @@
 use crate::history; // 历史子系统
 use crate::picker;
 use crate::AppContext;
-use crate::{recommend_paths, RecommendOpt};
+use crate::{recommend, RecommendOpt};
 
 use regex::Regex;
 use std::env;
@@ -32,27 +32,33 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
     }
 
     // 1) 默认模式：构造 RecommendOpt
-    let mut opt = RecommendOpt::default();
-
-    // 1.1 用全局 Paths 覆盖历史文件路径（由 XDG 解析出来）
-    opt.raw = ctx.paths.history_raw.to_string_lossy().into_owned();
-    opt.uniq = ctx.paths.history_uniq.to_string_lossy().into_owned();
-
-    // 1.2 用全局配置覆盖算法参数（ENV + 配置文件已经合并到 ctx.config 里）
     let cfg = &ctx.config;
-    opt.limit = cfg.limit;
-    opt.half_life = cfg.half_life;
-    opt.threshold = cfg.threshold;
-    opt.ignore_re = cfg.ignore_re.clone();
-    opt.check_dir = cfg.check_dir;
-    opt.uniq_decay = cfg.uniq_decay;
-    opt.w_frecency = cfg.w_frecency;
-    opt.w_uniq = cfg.w_uniq;
+    let mut opt = RecommendOpt {
+        raw: ctx.paths.history_raw.to_string_lossy().into_owned(),
+        uniq: ctx.paths.history_uniq.to_string_lossy().into_owned(),
+        limit: cfg.limit,
+        half_life: cfg.half_life,
+        threshold: cfg.threshold,
+        ignore_re: cfg.ignore_re.clone(),
+        tokens: Vec::new(),
+        check_dir: cfg.check_dir,
+        uniq_decay: cfg.uniq_decay,
+        // 当前目录：自身从候选中排除，并作为“上下文转移”的锚点
+        pwd: env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+        recency_half_life: cfg.recency_half_life,
+        debounce_secs: cfg.debounce_secs,
+        w_frecency: cfg.w_frecency,
+        w_uniq: cfg.w_uniq,
+        w_recency: cfg.w_recency,
+        w_context: cfg.w_context,
+    };
 
     // 2) 解析命令行（仅覆盖必要项；其余用 config/默认）
     // 支持：
     //  -v, --version        显示版本后退出
-    //  -l, --limit <N>      返回最大条数
+    //  -l, --limit <N>      限制返回最大条数
     //      --half-life <s>  半衰期（秒）
     //      --threshold <f>  评分阈值
     //      --ignore-re <re> 忽略路径正则
@@ -70,9 +76,15 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
             }
 
             "-l" | "--limit" => {
-                if let Some(v) = args.next() {
-                    if let Ok(n) = v.parse::<usize>() {
-                        opt.limit = n;
+                let Some(v) = args.next() else {
+                    eprintln!("cdh: --limit 需要一个大于 0 的整数");
+                    return 1;
+                };
+                match v.parse::<usize>() {
+                    Ok(n) if n > 0 => opt.limit = Some(n),
+                    _ => {
+                        eprintln!("cdh: --limit 必须是大于 0 的整数");
+                        return 1;
                     }
                 }
             }
@@ -112,7 +124,7 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
 
 选项:
   -v, --version          显示版本并退出
-  -l, --limit <N>        返回最大条数（默认 20，可用环境变量 CDH_LIMIT 覆盖）
+  -l, --limit <N>        限制最大候选数（默认不截断，可用环境变量 CDH_LIMIT 覆盖）
       --half-life <sec>  Frecency 半衰期（默认 7 天，可用 CDH_HALF_LIFE 覆盖）
       --threshold <f64>  融合分阈值（默认 0，可用 CDH_THRESHOLD 覆盖）
       --ignore-re <re>   忽略路径正则（默认取 ENV:CDH_IGNORE_RE）
@@ -124,19 +136,23 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
             }
             _ => {
                 // 关键字过滤 token
-                opt.tokens.push(a);
+                let token = a.trim();
+                if !token.is_empty() {
+                    opt.tokens.push(token.to_string());
+                }
             }
         }
     }
 
-    // 3) 计算推荐路径（推荐算法完全由 recommend_paths 控制）
-    let paths = recommend_paths(&opt);
-    if paths.is_empty() {
+    // 3) 计算推荐路径（推荐算法完全由 recommend 控制）
+    //    注意：这里保留 Recommendation（含融合分 score），交给 TUI 渲染分数条。
+    let items = recommend(&opt);
+    if items.is_empty() {
         return 2;
     }
 
     // 4) 打开 TUI 选择（非交互环境时 picker 会直接返回第一项）
-    match picker::pick(&paths) {
+    match picker::pick(&items) {
         Ok(Some(sel)) => {
             // 与 Fish 集成友好：不换行，避免命令替换多出 \n
             print!("{sel}");
@@ -145,76 +161,6 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
         }
         Ok(None) => 1, // 用户取消/超时
         Err(_e) => 1,  // 渲染异常等
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{EffectiveConfig, Paths};
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn test_ctx(name: &str) -> (PathBuf, AppContext) {
-        let uniq = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("cdh_controller_test_{name}_{uniq}"));
-        let paths = Paths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            state_dir: root.join("state"),
-            cache_dir: root.join("cache"),
-            history_raw: root.join("data").join("history").join("history_raw"),
-            history_uniq: root.join("data").join("history").join("history_uniq"),
-        };
-        fs::create_dir_all(paths.history_raw.parent().unwrap()).unwrap();
-        fs::write(&paths.history_raw, format!("1\t{}\n", root.display())).unwrap();
-        fs::write(&paths.history_uniq, format!("{}\n", root.display())).unwrap();
-        (
-            root,
-            AppContext {
-                paths,
-                config: EffectiveConfig {
-                    limit: 20,
-                    half_life: 7.0 * 24.0 * 3600.0,
-                    threshold: 0.0,
-                    ignore_re: None,
-                    check_dir: false,
-                    uniq_decay: 0.85,
-                    w_frecency: 0.7,
-                    w_uniq: 0.3,
-                },
-            },
-        )
-    }
-
-    #[test]
-    fn half_life_zero_returns_error_instead_of_panicking() {
-        let (root, ctx) = test_ctx("half_life_zero");
-        let status = run_with_args(
-            &ctx,
-            ["--half-life", "0", "--no-check-dir"]
-                .into_iter()
-                .map(String::from),
-        );
-        assert_eq!(status, 1);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn half_life_negative_returns_error_instead_of_panicking() {
-        let (root, ctx) = test_ctx("half_life_negative");
-        let status = run_with_args(
-            &ctx,
-            ["--half-life", "-1", "--no-check-dir"]
-                .into_iter()
-                .map(String::from),
-        );
-        assert_eq!(status, 1);
-        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -273,5 +219,113 @@ fn run_log_subcommand(ctx: &AppContext, mut args: impl Iterator<Item = String>) 
             eprintln!("cdh log: 写入历史失败: {e}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EffectiveConfig, Paths};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_ctx(name: &str) -> (PathBuf, AppContext) {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cdh_controller_test_{name}_{uniq}"));
+        let paths = Paths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            history_raw: root.join("data").join("history").join("history_raw"),
+            history_uniq: root.join("data").join("history").join("history_uniq"),
+        };
+        fs::create_dir_all(paths.history_raw.parent().unwrap()).unwrap();
+        fs::write(&paths.history_raw, format!("1\t{}\n", root.display())).unwrap();
+        fs::write(&paths.history_uniq, format!("{}\n", root.display())).unwrap();
+        (
+            root,
+            AppContext {
+                paths,
+                config: EffectiveConfig {
+                    limit: None,
+                    half_life: 7.0 * 24.0 * 3600.0,
+                    threshold: 0.0,
+                    ignore_re: None,
+                    check_dir: false,
+                    uniq_decay: 0.85,
+                    recency_half_life: 24.0 * 3600.0,
+                    debounce_secs: 600,
+                    w_frecency: 0.40,
+                    w_uniq: 0.10,
+                    w_recency: 0.30,
+                    w_context: 0.20,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn half_life_zero_returns_error_instead_of_panicking() {
+        let (root, ctx) = test_ctx("half_life_zero");
+        let status = run_with_args(
+            &ctx,
+            ["--half-life", "0", "--no-check-dir"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(status, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn half_life_negative_returns_error_instead_of_panicking() {
+        let (root, ctx) = test_ctx("half_life_negative");
+        let status = run_with_args(
+            &ctx,
+            ["--half-life", "-1", "--no-check-dir"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(status, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn empty_keyword_is_ignored() {
+        let (root, ctx) = test_ctx("empty_keyword");
+        let status = run_with_args(&ctx, ["", "--no-check-dir"].into_iter().map(String::from));
+        assert_eq!(status, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn limit_zero_returns_error() {
+        let (root, ctx) = test_ctx("limit_zero");
+        let status = run_with_args(
+            &ctx,
+            ["--limit", "0", "--no-check-dir"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(status, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn limit_invalid_returns_error() {
+        let (root, ctx) = test_ctx("limit_invalid");
+        let status = run_with_args(
+            &ctx,
+            ["--limit", "abc", "--no-check-dir"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(status, 1);
+        let _ = fs::remove_dir_all(root);
     }
 }

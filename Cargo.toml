@@ -2,7 +2,7 @@
 name = "cdh"
 version = "0.2.8"
 edition = "2021"                     # 若你确实用了 2024 特性，可改为 "2024"
-rust-version = "1.70"                # 最低编译版本声明（GitHub Actions 更稳）
+rust-version = "1.74"                # 最低编译版本（受 ratatui 0.29 约束）
 description = "A frecency-based smart directory jumper with a lightweight TUI."
 readme = "README.md"
 repository = "https://github.com/xianyudd/cdh"
@@ -12,7 +12,9 @@ keywords = ["cd", "frecency", "tui", "navigation"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-crossterm = "0.27"
+crossterm = "0.28"
+nucleo-matcher = "0.3"
+ratatui = "0.29"
 regex = "1"
 unicode-width = "0.2"
 

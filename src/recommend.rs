@@ -1,20 +1,31 @@
 // src/recommend.rs
-//! 智能目录推荐（融合 `history_raw` + `history_uniq` 的最优实现）
+//! 智能目录推荐（融合多信号排序）
 //!
-//! 设计要点：
-//! - 以 raw 的 Frecency 分数为主、uniq 的“最近唯一”几何衰减分为辅，线性融合（可调权重）。
-//! - 流式读取 raw，低内存；一次性 lower tokens；可选校验目录存在性（WSL/网络盘可关）。
-//! - 归一化到 [0,1] 再融合；支持阈值、关键词/正则过滤；对连续相同 (ts,path) 去重防抖。
+//! 评分由四个归一化到 [0,1] 的分量线性融合（权重可配，默认 0.40/0.30/0.20/0.10）：
+//! - **频次（frecency）**：raw 日志的时间衰减访问分，经 `ln(1+s)` 对数压缩，
+//!   避免 $HOME 之类“巨鲸”目录把中部排序压扁；
+//! - **最近性（recency）**：独立的短半衰期信号（默认 24h），让“刚去过”的目录浮上来；
+//! - **上下文（context）**：从当前 `pwd` 出发的历史一阶转移权重 + 直接子目录小加成；
+//! - **最近唯一（uniq）**：uniq 文件的几何衰减名次。
+//!
+//! 另有两处关键处理：
+//! - **防抖**：同一目录在 `debounce_secs` 窗口内的重复访问只计一次频次，
+//!   抵消“每开一个 shell / 标签就记一条 $HOME”导致的分数虚高；
+//! - **排除 pwd**：当前目录不出现在结果里（跳到自己无意义）。
+//!
+//! 实现上流式读取 raw、低内存；一次性 lower tokens；可选校验目录存在性（WSL/网络盘可关）。
+//! 支持阈值、关键词/正则过滤。
 //!
 //! 对外接口：
 //! - `RecommendOpt`：融合推荐所有配置
 //! - `Recommendation{ path, score }`：推荐结果
-//! - `recommend(&RecommendOpt) -> Vec<Recommendation>`：路径+融合分
+//! - `recommend(&RecommendOpt) -> Vec<Recommendation>`：路径+融合分（无关键词时按融合分排序；带关键词时优先按路径匹配质量排序）
 //! - `recommend_paths(&RecommendOpt) -> Vec<String>`：仅路径
 //! - `recommend_with_now(&RecommendOpt, now_secs)`：可注入“当前时间”的变体（便于测试）
 //!
 //! 依赖：本 crate 需已提供 `Frecency` / `FrecencyIndex`（见 src/frecency.rs）。
 use crate::frecency::{Frecency, FrecencyIndex};
+use crate::history;
 use regex::Regex;
 use std::{
     collections::{HashMap, HashSet},
@@ -46,8 +57,8 @@ pub struct RecommendOpt {
     pub raw: String,
     /// 最近唯一列表：一行一个 path（由 controller 注入 XDG history_uniq 路径）
     pub uniq: String,
-    /// 返回最大条数（默认 20）
-    pub limit: usize,
+    /// 返回最大条数；None 表示不截断，让 TUI 搜索覆盖完整候选集
+    pub limit: Option<usize>,
     /// Frecency 半衰期（秒），默认 7 天
     pub half_life: f64,
     /// 最终融合分阈值（< threshold 的条目会被丢弃；0 表示不启用）
@@ -60,9 +71,22 @@ pub struct RecommendOpt {
     pub check_dir: bool,
     /// uniq 的几何衰减系数（最新=1.0，次新=decay，…；默认 0.85）
     pub uniq_decay: f64,
-    /// 融合权重：frecency 与 uniq（建议和为 1.0；默认 0.7 / 0.3）
+    /// 当前工作目录：本身会从结果中排除，并作为“转移加成”的锚点。
+    pub pwd: Option<String>,
+    /// 最近性半衰期（秒）：独立于频次的“刚访问过”信号，默认 24 小时。
+    pub recency_half_life: f64,
+    /// 防抖窗口（秒）：同一目录在窗口内的重复访问只计一次频次，默认 600。
+    /// 抑制“每开一个 shell 就给 $HOME 记一条”造成的分数虚高。
+    pub debounce_secs: i64,
+    /// 融合权重（建议总和为 1.0）：
+    /// 频次（对数压缩），默认 0.40
     pub w_frecency: f64,
+    /// uniq 最近唯一名次，默认 0.10
     pub w_uniq: f64,
+    /// 最近性（短半衰期），默认 0.30
+    pub w_recency: f64,
+    /// 上下文（从 pwd 出发的历史转移 + 子目录加成），默认 0.20
+    pub w_context: f64,
 }
 
 impl Default for RecommendOpt {
@@ -72,20 +96,34 @@ impl Default for RecommendOpt {
         Self {
             raw: String::new(),             // 稍后由 controller 用 ctx.paths 覆盖
             uniq: String::new(),            // 同上
-            limit: 20,                      // 默认 20；可被 config/CLI 覆盖
+            limit: None,                    // 默认不截断；可被 config/CLI 覆盖
             half_life: 7.0 * 24.0 * 3600.0, // 默认 7 天；可被 config/CLI 覆盖
             threshold: 0.0,                 // 默认不开启阈值
             ignore_re: None,                // 默认不忽略任何路径；可由 config/CLI 覆盖
             tokens: Vec::new(),
-            check_dir: true,  // 默认检查目录存在性；可被 config 覆盖
-            uniq_decay: 0.85, // 默认几何衰减
-            w_frecency: 0.7,  // 默认权重
-            w_uniq: 0.3,
+            check_dir: true, // 默认检查目录存在性；可被 config 覆盖
+            uniq_decay: 0.85,
+            pwd: None,
+            recency_half_life: 24.0 * 3600.0,
+            debounce_secs: 600,
+            w_frecency: 0.40,
+            w_uniq: 0.10,
+            w_recency: 0.30,
+            w_context: 0.20,
         }
     }
 }
 
-/// 外部主接口：融合 RAW+UNIQ，返回路径+分数（按最终分降序）
+#[derive(Debug)]
+struct RankedItem {
+    path: String,
+    final_score: f64,
+    frecency_score: f64,
+    match_quality: f64,
+}
+
+/// 外部主接口：融合 RAW+UNIQ，返回路径+融合分。
+/// 无关键词时按融合分降序；带关键词时优先按路径匹配质量排序。
 pub fn recommend(opt: &RecommendOpt) -> Vec<Recommendation> {
     recommend_with_now(opt, now_secs())
 }
@@ -93,9 +131,14 @@ pub fn recommend(opt: &RecommendOpt) -> Vec<Recommendation> {
 /// 变体：可注入“当前时间”，便于测试
 pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
     // 预处理 tokens（一次性 lower）
-    let tokens_lc: Vec<String> = opt.tokens.iter().map(|t| t.to_lowercase()).collect();
+    let tokens_lc: Vec<String> = opt
+        .tokens
+        .iter()
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
 
-    // 1) uniq -> 生成 “最近唯一”几何衰减分
+    // 1) uniq -> 生成 “最近唯一”几何衰减分（本身已在 (0,1]，无需再归一化）
     let uniq_scores = load_uniq_scores(
         &opt.uniq,
         &opt.ignore_re,
@@ -104,57 +147,105 @@ pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
         opt.uniq_decay,
     );
 
-    // 2) raw -> 建 Frecency 索引（流式），并记录出现过的路径
-    let (idx, seen_raw) = build_frecency_from_raw(
-        &opt.raw,
-        &opt.ignore_re,
-        &tokens_lc,
-        opt.check_dir,
-        opt.half_life,
-    );
+    // 2) raw -> 流式提取信号：频次索引 + 每目录最近访问时刻 + 从 pwd 出发的转移权重
+    let signals = build_raw_signals(opt, &tokens_lc, now);
 
-    // 3) 候选集 = raw ∪ uniq
-    let mut candidates: HashSet<String> = seen_raw;
+    // 3) 候选集 = raw ∪ uniq，排除当前目录（跳到自己所在目录没有意义）
+    let mut candidates: HashSet<String> = signals.seen;
     candidates.extend(uniq_scores.keys().cloned());
+    if let Some(pwd) = &opt.pwd {
+        candidates.remove(pwd);
+    }
 
-    // 4) 计算 frecency 分（未归一）
-    let mut fre_scores: HashMap<String, f64> = HashMap::with_capacity(candidates.len());
+    // 4) 频次分（对数压缩）：ln(1+s)/ln(1+s_max)。
+    //    线性 min-max 会被“巨鲸”目录（分数是他人几十倍）压扁中部排序，对数压缩保留区分度。
+    let mut fre_max = 0.0f64;
     for dir in &candidates {
-        let s = idx.score_at(dir, now);
-        if s > 0.0 {
-            fre_scores.insert(dir.clone(), s);
-        }
+        fre_max = fre_max.max(signals.idx.score_at(dir, now));
     }
+    let fre_log_max = (1.0 + fre_max).ln();
 
-    // 5) 归一化到 [0,1]
-    let fre_norm = normalize01(&fre_scores);
-    let uniq_norm = normalize01(&uniq_scores);
+    // 5) 上下文分归一化基准
+    let ctx_max = signals
+        .transitions
+        .values()
+        .fold(0.0f64, |acc, &v| acc.max(v));
 
-    // 6) 融合 + 阈值过滤 + 排序
-    let mut items: Vec<(String, f64, f64, f64)> = Vec::with_capacity(candidates.len());
-    let (wf, wu) = (opt.w_frecency, opt.w_uniq);
+    // 6) 四分量融合 + 阈值过滤 + 排序
+    let mut items: Vec<RankedItem> = Vec::with_capacity(candidates.len());
     for dir in candidates {
-        let fz = *fre_norm.get(&dir).unwrap_or(&0.0);
-        let uz = *uniq_norm.get(&dir).unwrap_or(&0.0);
-        let final_score = wf * fz + wu * uz;
+        // 频次（对数压缩后 0~1）
+        let fz = {
+            let s = signals.idx.score_at(&dir, now);
+            if s > 0.0 && fre_log_max > 0.0 {
+                (1.0 + s).ln() / fre_log_max
+            } else {
+                0.0
+            }
+        };
+        // 最近性：短半衰期的“刚访问过”信号（0~1）
+        let rz = signals
+            .last_visit
+            .get(&dir)
+            .map(|&t| decay_weight(now - t, opt.recency_half_life))
+            .unwrap_or(0.0);
+        // 上下文：从 pwd 出发的历史转移 + 子目录小加成（0~1）
+        let cz = {
+            let trans = match signals.transitions.get(&dir) {
+                Some(&v) if ctx_max > 0.0 => v / ctx_max,
+                _ => 0.0,
+            };
+            let subdir_bonus = match &opt.pwd {
+                Some(pwd) if is_direct_child(&dir, pwd) => 0.25,
+                _ => 0.0,
+            };
+            (trans + subdir_bonus).min(1.0)
+        };
+        // 最近唯一名次（0~1）
+        let uz = *uniq_scores.get(&dir).unwrap_or(&0.0);
+
+        let final_score =
+            opt.w_frecency * fz + opt.w_recency * rz + opt.w_context * cz + opt.w_uniq * uz;
         if opt.threshold <= 0.0 || final_score >= opt.threshold {
-            items.push((dir, final_score, fz, uz));
+            let match_quality = if tokens_lc.is_empty() {
+                0.0
+            } else {
+                keyword_match_quality_lc(&dir.to_lowercase(), &tokens_lc)
+            };
+            items.push(RankedItem {
+                path: dir,
+                final_score,
+                frecency_score: fz,
+                match_quality,
+            });
         }
     }
 
-    // 主排序：final desc；次排序：frecency desc；再次：路径字典序
-    items.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-            .then(a.0.cmp(&b.0))
-    });
+    if tokens_lc.is_empty() {
+        // 主排序：final desc；次排序：frecency desc；再次：路径字典序
+        items.sort_by(|a, b| {
+            cmp_f64_desc(b.final_score, a.final_score)
+                .then_with(|| cmp_f64_desc(b.frecency_score, a.frecency_score))
+                .then(a.path.cmp(&b.path))
+        });
+    } else {
+        // 带关键词时，先按路径匹配质量排序，再回退到历史推荐分。
+        items.sort_by(|a, b| {
+            cmp_f64_desc(b.match_quality, a.match_quality)
+                .then_with(|| cmp_f64_desc(b.final_score, a.final_score))
+                .then_with(|| cmp_f64_desc(b.frecency_score, a.frecency_score))
+                .then(a.path.cmp(&b.path))
+        });
+    }
 
-    items
-        .into_iter()
-        .take(opt.limit)
-        .map(|(path, score, ..)| Recommendation { path, score })
-        .collect()
+    let iter = items.into_iter().map(|item| Recommendation {
+        path: item.path,
+        score: item.final_score,
+    });
+    match opt.limit {
+        Some(limit) => iter.take(limit).collect(),
+        None => iter.collect(),
+    }
 }
 
 /// 仅返回路径（同排序/同截断）
@@ -178,12 +269,7 @@ fn load_uniq_scores(
         Ok(f) => f,
         Err(_) => return HashMap::new(),
     };
-    let mut lines: Vec<String> = BufReader::new(f)
-        .lines()
-        .flatten()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut lines = read_trimmed_lines(BufReader::new(f));
 
     if lines.is_empty() {
         return HashMap::new();
@@ -199,7 +285,7 @@ fn load_uniq_scores(
         }
         if !tokens_lc.is_empty() {
             let lp = p.to_lowercase();
-            if !tokens_lc.iter().any(|tk| lp.contains(tk)) {
+            if !path_matches_tokens_lc(&lp, tokens_lc) {
                 continue;
             }
         }
@@ -221,81 +307,247 @@ fn load_uniq_scores(
     scores
 }
 
-/// 从 raw 流式构建 Frecency 索引，并记录出现过的路径
-/// - 连续重复 (ts,path) 去重（防抖）
-/// - 支持 ignore_re / tokens / check_dir 过滤
-fn build_frecency_from_raw(
-    raw_file: &str,
-    ignore_re: &Option<Regex>,
-    tokens_lc: &[String],
-    check_dir: bool,
-    half_life: f64,
-) -> (FrecencyIndex, HashSet<String>) {
-    let model = Frecency::new(half_life);
-    let mut idx = FrecencyIndex::new(model);
-    let mut seen: HashSet<String> = HashSet::new();
+/// 从 raw 流式提取的全部排序信号。
+struct RawSignals {
+    /// 频次索引（带防抖）
+    idx: FrecencyIndex,
+    /// 出现过的路径（候选集来源）
+    seen: HashSet<String>,
+    /// 每目录最近一次访问时刻（不受防抖影响，反映真实最近性）
+    last_visit: HashMap<String, i64>,
+    /// 从 `opt.pwd` 出发的转移权重：key = 紧跟在 pwd 之后访问的目录，
+    /// value = Σ 0.5^((now-t)/half_life)（越近的转移权重越大）
+    transitions: HashMap<String, f64>,
+}
 
-    let f = match File::open(raw_file) {
-        Ok(f) => f,
-        Err(_) => return (idx, seen),
+/// 流式扫描 raw：
+/// - 防抖：同一目录在 `debounce_secs` 窗口内的重复访问只计一次频次
+///   （新开 shell/多标签会反复记录同一目录，不防抖会把 $HOME 类目录分数灌爆）；
+/// - last_visit：始终更新（防抖只影响频次，不影响“最近去过”事实）；
+/// - transitions：统计紧跟在 pwd 之后访问的目录（一阶转移），带时间衰减。
+fn build_raw_signals(opt: &RecommendOpt, tokens_lc: &[String], now: i64) -> RawSignals {
+    let model = Frecency::new(opt.half_life);
+    let mut signals = RawSignals {
+        idx: FrecencyIndex::new(model),
+        seen: HashSet::new(),
+        last_visit: HashMap::new(),
+        transitions: HashMap::new(),
     };
 
-    let mut last: Option<(i64, String)> = None;
-    for line in BufReader::new(f).lines().flatten() {
-        if let Some((ts, p)) = line.split_once('\t') {
-            if let Ok(t) = ts.parse::<i64>() {
-                let path = p.trim().to_string();
+    let f = match File::open(&opt.raw) {
+        Ok(f) => f,
+        Err(_) => return signals,
+    };
 
-                if let Some(rx) = ignore_re {
-                    if rx.is_match(&path) {
-                        continue;
-                    }
-                }
-                if !tokens_lc.is_empty() {
-                    let lp = path.to_lowercase();
-                    if !tokens_lc.iter().any(|tk| lp.contains(tk)) {
-                        continue;
-                    }
-                }
-                if check_dir && !Path::new(&path).is_dir() {
-                    continue;
-                }
-                if let Some((lts, ref lp)) = last {
-                    if lts == t && lp == &path {
-                        continue;
-                    }
-                }
-                last = Some((t, path.clone()));
-                idx.record_visit(path.clone(), t);
-                seen.insert(path);
+    // 每目录“上次计入频次”的时刻（防抖窗口判断用）
+    let mut last_counted: HashMap<String, i64> = HashMap::new();
+    // 上一条计入的访问（转移统计的前驱）
+    let mut prev: Option<(i64, String)> = None;
+
+    for line in read_trimmed_lines(BufReader::new(f)) {
+        let Some((ts, p)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(t) = history::parse_history_ts_secs(ts) else {
+            continue;
+        };
+        let path = p.trim().to_string();
+
+        if let Some(rx) = &opt.ignore_re {
+            if rx.is_match(&path) {
+                continue;
+            }
+        }
+        if !tokens_lc.is_empty() {
+            let lp = path.to_lowercase();
+            if !path_matches_tokens_lc(&lp, tokens_lc) {
+                continue;
+            }
+        }
+        if opt.check_dir && !Path::new(&path).is_dir() {
+            continue;
+        }
+
+        // 最近访问时刻始终更新
+        signals
+            .last_visit
+            .entry(path.clone())
+            .and_modify(|old| *old = (*old).max(t))
+            .or_insert(t);
+        signals.seen.insert(path.clone());
+
+        // 防抖：窗口内的重复访问不再计入频次/转移
+        if let Some(&last) = last_counted.get(&path) {
+            let dt = t - last;
+            if dt >= 0 && dt < opt.debounce_secs {
+                continue;
+            }
+        }
+        last_counted.insert(path.clone(), t);
+
+        // 转移统计：前驱是 pwd 且目标不同，则给目标加衰减权重
+        if let (Some(pwd), Some((_, prev_path))) = (&opt.pwd, &prev) {
+            if prev_path == pwd && path != *pwd {
+                *signals.transitions.entry(path.clone()).or_insert(0.0) +=
+                    decay_weight(now - t, opt.half_life);
+            }
+        }
+
+        signals.idx.record_visit(path.clone(), t);
+        prev = Some((t, path));
+    }
+    signals
+}
+
+/// 指数衰减权重：0.5^(dt/half_life)，dt<=0 时为 1.0。
+fn decay_weight(dt_secs: i64, half_life: f64) -> f64 {
+    if dt_secs <= 0 {
+        1.0
+    } else {
+        0.5f64.powf(dt_secs as f64 / half_life)
+    }
+}
+
+/// `dir` 是否是 `parent` 的直接子目录（如 /a/b 之于 /a；/a/b/c 不算）。
+fn is_direct_child(dir: &str, parent: &str) -> bool {
+    match dir.strip_prefix(parent) {
+        Some(rest) => {
+            let rest = rest.strip_prefix('/').unwrap_or(rest);
+            let rest = rest.strip_suffix('/').unwrap_or(rest); // 容忍末尾斜杠
+            !rest.is_empty() && !rest.contains('/')
+        }
+        None => false,
+    }
+}
+
+fn cmp_f64_desc(left: f64, right: f64) -> std::cmp::Ordering {
+    left.partial_cmp(&right)
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+fn read_trimmed_lines(reader: impl BufRead) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line_res in reader.lines() {
+        let line = match line_res {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let line = line.trim();
+        if !line.is_empty() {
+            lines.push(line.to_string());
+        }
+    }
+    lines
+}
+
+fn path_matches_tokens_lc(path_lc: &str, tokens_lc: &[String]) -> bool {
+    tokens_lc.iter().any(|token| path_lc.contains(token))
+}
+
+fn keyword_match_quality_lc(path_lc: &str, tokens_lc: &[String]) -> f64 {
+    if tokens_lc.is_empty() {
+        return 0.0;
+    }
+
+    let mut matched = 0usize;
+    let mut sum = 0.0f64;
+    let mut best = 0.0f64;
+
+    for token in tokens_lc {
+        let quality = token_match_quality_lc(path_lc, token);
+        if quality > 0.0 {
+            matched += 1;
+            sum += quality;
+            if quality > best {
+                best = quality;
             }
         }
     }
-    (idx, seen)
+
+    if matched == 0 {
+        return 0.0;
+    }
+
+    let coverage = matched as f64 / tokens_lc.len() as f64;
+    let average_quality = sum / matched as f64;
+    coverage * 1000.0 + average_quality + best / 1000.0
 }
 
-/// 把 map 的值线性归一化到 [0,1]
-fn normalize01(map: &HashMap<String, f64>) -> HashMap<String, f64> {
-    if map.is_empty() {
-        return HashMap::new();
+fn token_match_quality_lc(path_lc: &str, token_lc: &str) -> f64 {
+    if token_lc.is_empty() {
+        return 0.0;
     }
-    let (mut vmin, mut vmax) = (f64::INFINITY, f64::NEG_INFINITY);
-    for &v in map.values() {
-        if v < vmin {
-            vmin = v
+
+    let bytes = path_lc.as_bytes();
+    let token_len = token_lc.len();
+    let mut best = 0.0;
+
+    for (start, _) in path_lc.match_indices(token_lc) {
+        let end = start + token_len;
+        let segment_start_idx = path_lc[..start]
+            .rfind(['/', '\\'])
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let segment_end_idx = path_lc[end..]
+            .find(['/', '\\'])
+            .map(|idx| end + idx)
+            .unwrap_or(path_lc.len());
+        let distance_from_basename = path_lc[segment_end_idx..]
+            .bytes()
+            .filter(|&byte| matches!(byte, b'/' | b'\\'))
+            .count();
+
+        // Avoid letting broad ancestors such as `github.com` make every repository
+        // look like a strong match for `git`. A token must match the basename or
+        // its direct parent segment; broader ancestors are too generic for ranking.
+        if distance_from_basename >= 2 {
+            continue;
         }
-        if v > vmax {
-            vmax = v
+
+        let segment_start = start == segment_start_idx;
+        let segment_end = end == segment_end_idx;
+        let before_boundary = start == 0 || is_match_boundary(bytes.get(start - 1).copied());
+        let after_boundary = end == path_lc.len() || is_match_boundary(bytes.get(end).copied());
+        let in_basename = distance_from_basename == 0;
+
+        let quality = if segment_start && segment_end {
+            if in_basename {
+                120.0
+            } else {
+                100.0
+            }
+        } else if before_boundary && after_boundary {
+            if in_basename {
+                110.0
+            } else {
+                90.0
+            }
+        } else if !in_basename {
+            // Parent directory matches are only useful when they match a clear token
+            // boundary. Prefixes like `git` in `github_parent` are too broad and
+            // would keep unrelated children such as `github_parent/plain-project`.
+            0.0
+        } else if segment_start {
+            100.0
+        } else if before_boundary {
+            90.0
+        } else {
+            35.0
+        };
+
+        if quality > best {
+            best = quality;
         }
     }
-    if !vmin.is_finite() || !vmax.is_finite() || (vmax - vmin).abs() < f64::EPSILON {
-        // 退化：全部给 1.0（单元素或全相等），避免除零
-        return map.iter().map(|(k, _)| (k.clone(), 1.0)).collect();
-    }
-    let span = vmax - vmin;
-    map.iter()
-        .map(|(k, &v)| (k.clone(), (v - vmin) / span))
-        .collect()
+
+    best
+}
+
+fn is_match_boundary(byte: Option<u8>) -> bool {
+    matches!(
+        byte,
+        None | Some(b'/') | Some(b'\\') | Some(b'-') | Some(b'_') | Some(b'.') | Some(b' ')
+    )
 }
 
 /* ---------------------------------- 测试 ---------------------------------- */
@@ -342,7 +594,7 @@ mod tests {
         let opt = RecommendOpt {
             raw: raw_fixed,
             uniq: uniq_fixed,
-            limit: 2,
+            limit: Some(2),
             half_life: 24.0 * 3600.0,
             threshold: 0.0,
             ignore_re: None,
@@ -351,6 +603,7 @@ mod tests {
             uniq_decay: 0.85,
             w_frecency: 0.7,
             w_uniq: 0.3,
+            ..RecommendOpt::default()
         };
 
         let out = recommend_with_now(&opt, 3000);
@@ -378,7 +631,7 @@ mod tests {
         let opt = RecommendOpt {
             raw,
             uniq,
-            limit: 10,
+            limit: Some(10),
             half_life: 3600.0,
             threshold: 0.0,
             ignore_re,
@@ -387,8 +640,535 @@ mod tests {
             uniq_decay: 0.85,
             w_frecency: 0.7,
             w_uniq: 0.3,
+            ..RecommendOpt::default()
         };
         let paths = recommend_paths(&opt);
         assert_eq!(paths, vec!["/tmp/keep_alpha"]);
+    }
+
+    #[test]
+    fn default_limit_does_not_truncate_candidates() {
+        let raw = tmp_file("raw_unlimited.tsv");
+        let uniq = tmp_file("uniq_unlimited.txt");
+        let base = env::temp_dir().join(format!("cdh_test_unlimited_{}", now_secs()));
+        fs::create_dir_all(&base).unwrap();
+
+        let mut raw_file = File::create(&raw).unwrap();
+        let mut uniq_body = String::new();
+        for i in 0..25 {
+            let dir = base.join(format!("dir_{i:02}"));
+            fs::create_dir_all(&dir).unwrap();
+            writeln!(raw_file, "{}\t{}", 1_000 + i, dir.display()).unwrap();
+            uniq_body.push_str(&format!("{}\n", dir.display()));
+        }
+        fs::write(&uniq, uniq_body).unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            limit: None,
+            half_life: 24.0 * 3600.0,
+            threshold: 0.0,
+            ignore_re: None,
+            tokens: vec![],
+            check_dir: true,
+            uniq_decay: 0.85,
+            w_frecency: 0.7,
+            w_uniq: 0.3,
+            ..RecommendOpt::default()
+        };
+
+        let out = recommend_with_now(&opt, 2_000);
+        assert_eq!(out.len(), 25);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn recommend_normalizes_millisecond_timestamps() {
+        let raw = tmp_file("raw_millis.tsv");
+        let uniq = tmp_file("uniq_millis.txt");
+        let base = env::temp_dir().join(format!("cdh_test_millis_{}", now_secs()));
+        let older = base.join("older");
+        let newer = base.join("newer");
+        fs::create_dir_all(&older).unwrap();
+        fs::create_dir_all(&newer).unwrap();
+
+        let mut raw_file = File::create(&raw).unwrap();
+        writeln!(raw_file, "1000000000000\t{}", older.display()).unwrap();
+        writeln!(raw_file, "1000000100\t{}", newer.display()).unwrap();
+        fs::write(&uniq, "").unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            limit: None,
+            half_life: 10_000.0,
+            threshold: 0.0,
+            ignore_re: None,
+            tokens: vec![],
+            check_dir: true,
+            uniq_decay: 0.85,
+            w_frecency: 1.0,
+            w_uniq: 0.0,
+            w_recency: 0.0,
+            w_context: 0.0,
+            ..RecommendOpt::default()
+        };
+
+        let out = recommend_with_now(&opt, 1_000_000_200);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].path, newer.to_string_lossy());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn keyword_quality_prefers_segment_exact_over_plain_substring() {
+        let raw = tmp_file("raw_keyword_exact.tsv");
+        let uniq = tmp_file("uniq_keyword_exact.txt");
+        let base = env::temp_dir().join(format!("cdh_test_keyword_exact_{}", now_secs()));
+        let exact = base.join("git");
+        let weak = base.join("digital-archive");
+        fs::create_dir_all(&exact).unwrap();
+        fs::create_dir_all(&weak).unwrap();
+
+        let mut raw_file = File::create(&raw).unwrap();
+        writeln!(raw_file, "1000\t{}", exact.display()).unwrap();
+        for ts in 2000..2005 {
+            writeln!(raw_file, "{}\t{}", ts, weak.display()).unwrap();
+        }
+        fs::write(&uniq, format!("{}\n{}\n", exact.display(), weak.display())).unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            limit: None,
+            half_life: 24.0 * 3600.0,
+            threshold: 0.0,
+            ignore_re: None,
+            tokens: vec!["git".into()],
+            check_dir: true,
+            uniq_decay: 0.85,
+            w_frecency: 0.7,
+            w_uniq: 0.3,
+            ..RecommendOpt::default()
+        };
+
+        let out = recommend_with_now(&opt, 3000);
+        assert_eq!(out[0].path, exact.to_string_lossy());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn keyword_quality_prefers_paths_matching_more_tokens() {
+        let raw = tmp_file("raw_keyword_multi.tsv");
+        let uniq = tmp_file("uniq_keyword_multi.txt");
+        let base = env::temp_dir().join(format!("rank_multi_{}", now_secs()));
+        let one_token = base.join("git-only");
+        let two_tokens = base.join("cdh-git");
+        fs::create_dir_all(&one_token).unwrap();
+        fs::create_dir_all(&two_tokens).unwrap();
+
+        let mut raw_file = File::create(&raw).unwrap();
+        for ts in 1000..1005 {
+            writeln!(raw_file, "{}\t{}", ts, one_token.display()).unwrap();
+        }
+        writeln!(raw_file, "2000\t{}", two_tokens.display()).unwrap();
+        fs::write(
+            &uniq,
+            format!("{}\n{}\n", two_tokens.display(), one_token.display()),
+        )
+        .unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            limit: None,
+            half_life: 24.0 * 3600.0,
+            threshold: 0.0,
+            ignore_re: None,
+            tokens: vec!["git".into(), "cdh".into()],
+            check_dir: true,
+            uniq_decay: 0.85,
+            w_frecency: 0.7,
+            w_uniq: 0.3,
+            ..RecommendOpt::default()
+        };
+
+        let out = recommend_with_now(&opt, 3000);
+        assert_eq!(out[0].path, two_tokens.to_string_lossy());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn keyword_filter_keeps_parent_substring_but_ranks_path_match_first() {
+        let raw = tmp_file("raw_keyword_parent.tsv");
+        let uniq = tmp_file("uniq_keyword_parent.txt");
+        let base = env::temp_dir().join(format!("github_parent_{}", now_secs()));
+        let unrelated = base.join("plain-project");
+        let target = base.join("git-tools");
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::create_dir_all(&target).unwrap();
+
+        let mut raw_file = File::create(&raw).unwrap();
+        writeln!(raw_file, "1000\t{}", unrelated.display()).unwrap();
+        writeln!(raw_file, "1001\t{}", target.display()).unwrap();
+        fs::write(
+            &uniq,
+            format!("{}\n{}\n", unrelated.display(), target.display()),
+        )
+        .unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            limit: None,
+            half_life: 24.0 * 3600.0,
+            threshold: 0.0,
+            ignore_re: None,
+            tokens: vec!["git".into()],
+            check_dir: true,
+            uniq_decay: 0.85,
+            w_frecency: 0.7,
+            w_uniq: 0.3,
+            ..RecommendOpt::default()
+        };
+
+        let paths = recommend_paths(&opt);
+        assert_eq!(paths[0], target.to_string_lossy().to_string());
+        assert!(paths.contains(&unrelated.to_string_lossy().to_string()));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn keyword_filter_keeps_grandparent_substring_matches() {
+        let raw = tmp_file("raw_keyword_grandparent.tsv");
+        let uniq = tmp_file("uniq_keyword_grandparent.txt");
+        let base = env::temp_dir().join(format!("workspace_parent_{}", now_secs()));
+        let target = base.join("repos").join("cdh");
+        fs::create_dir_all(&target).unwrap();
+
+        let mut raw_file = File::create(&raw).unwrap();
+        writeln!(raw_file, "1000\t{}", target.display()).unwrap();
+        fs::write(&uniq, format!("{}\n", target.display())).unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            limit: None,
+            half_life: 24.0 * 3600.0,
+            threshold: 0.0,
+            ignore_re: None,
+            tokens: vec!["workspace".into()],
+            check_dir: true,
+            uniq_decay: 0.85,
+            w_frecency: 0.7,
+            w_uniq: 0.3,
+            ..RecommendOpt::default()
+        };
+
+        let paths = recommend_paths(&opt);
+        assert_eq!(paths, vec![target.to_string_lossy().to_string()]);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn token_filtering_keeps_or_semantics() {
+        let raw = tmp_file("raw_keyword_or.tsv");
+        let uniq = tmp_file("uniq_keyword_or.txt");
+        let base = env::temp_dir().join(format!("cdh_test_keyword_or_{}", now_secs()));
+        let alpha = base.join("alpha-project");
+        let beta = base.join("beta-project");
+        let gamma = base.join("gamma-project");
+        fs::create_dir_all(&alpha).unwrap();
+        fs::create_dir_all(&beta).unwrap();
+        fs::create_dir_all(&gamma).unwrap();
+
+        let mut raw_file = File::create(&raw).unwrap();
+        writeln!(raw_file, "1000\t{}", alpha.display()).unwrap();
+        writeln!(raw_file, "1001\t{}", beta.display()).unwrap();
+        writeln!(raw_file, "1002\t{}", gamma.display()).unwrap();
+        fs::write(
+            &uniq,
+            format!(
+                "{}\n{}\n{}\n",
+                alpha.display(),
+                beta.display(),
+                gamma.display()
+            ),
+        )
+        .unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            limit: None,
+            half_life: 24.0 * 3600.0,
+            threshold: 0.0,
+            ignore_re: None,
+            tokens: vec!["alpha".into(), "beta".into()],
+            check_dir: true,
+            uniq_decay: 0.85,
+            w_frecency: 0.7,
+            w_uniq: 0.3,
+            ..RecommendOpt::default()
+        };
+
+        let paths = recommend_paths(&opt);
+        assert!(paths.contains(&alpha.to_string_lossy().to_string()));
+        assert!(paths.contains(&beta.to_string_lossy().to_string()));
+        assert!(!paths.contains(&gamma.to_string_lossy().to_string()));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// 辅助：写 raw/uniq 并构造仅设置必要字段的 opt。
+    fn setup(name: &str) -> (String, String, std::path::PathBuf) {
+        let raw = tmp_file(&format!("{name}_raw"));
+        let uniq = tmp_file(&format!("{name}_uniq"));
+        let base = env::temp_dir().join(format!("cdh_{name}_{}", now_secs()));
+        fs::create_dir_all(&base).unwrap();
+        (raw, uniq, base)
+    }
+
+    #[test]
+    fn recency_lets_fresh_dir_beat_stale_high_frequency() {
+        // frequent：很久以前被访问过很多次；fresh：刚刚访问过一次。
+        // 旧算法（纯 frecency）frequent 会赢；新算法有 recency 分量，fresh 应更靠前或接近。
+        let (raw, uniq, base) = setup("recency");
+        let frequent = base.join("old-but-frequent");
+        let fresh = base.join("just-now");
+        fs::create_dir_all(&frequent).unwrap();
+        fs::create_dir_all(&fresh).unwrap();
+
+        let now = 1_000_000i64;
+        let mut rf = File::create(&raw).unwrap();
+        // frequent：30 天前访问 20 次（半衰期 7 天，已衰减很多）
+        for i in 0..20 {
+            writeln!(
+                rf,
+                "{}\t{}",
+                now - 30 * 86400 + i * 1000,
+                frequent.display()
+            )
+            .unwrap();
+        }
+        // fresh：1 分钟前访问 1 次
+        writeln!(rf, "{}\t{}", now - 60, fresh.display()).unwrap();
+        fs::write(
+            &uniq,
+            format!("{}\n{}\n", frequent.display(), fresh.display()),
+        )
+        .unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            check_dir: true,
+            ..RecommendOpt::default()
+        };
+        let out = recommend_with_now(&opt, now);
+        assert_eq!(
+            out[0].path,
+            fresh.to_string_lossy(),
+            "fresh 应排第一, got {out:?}"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn debounce_folds_burst_visits() {
+        // 同一目录在防抖窗口内被记录很多次（新开 shell/多标签），
+        // 不应因此在频次上碾压一个真正被多次“独立”访问的目录。
+        let (raw, uniq, base) = setup("debounce");
+        let bursty = base.join("home-like");
+        let genuine = base.join("real-work");
+        fs::create_dir_all(&bursty).unwrap();
+        fs::create_dir_all(&genuine).unwrap();
+
+        let now = 1_000_000i64;
+        let mut rf = File::create(&raw).unwrap();
+        // bursty：同一秒附近记录 50 次（窗口内），防抖后只算 1 次
+        for i in 0..50 {
+            writeln!(rf, "{}\t{}", now - 300 + i, bursty.display()).unwrap();
+        }
+        // genuine：10 次真正间隔开的访问（每次间隔 > 防抖窗口）
+        for i in 0..10 {
+            writeln!(rf, "{}\t{}", now - i * 1800, genuine.display()).unwrap();
+        }
+        fs::write(
+            &uniq,
+            format!("{}\n{}\n", bursty.display(), genuine.display()),
+        )
+        .unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            check_dir: true,
+            // 仅看频次，隔离防抖效果
+            w_frecency: 1.0,
+            w_uniq: 0.0,
+            w_recency: 0.0,
+            w_context: 0.0,
+            ..RecommendOpt::default()
+        };
+        let out = recommend_with_now(&opt, now);
+        // 防抖生效：genuine（10 次独立访问）应压过 bursty（50 次被折叠成 1）
+        assert_eq!(
+            out[0].path,
+            genuine.to_string_lossy(),
+            "genuine 应排第一, got {out:?}"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn pwd_is_excluded_from_results() {
+        let (raw, uniq, base) = setup("exclude_pwd");
+        let here = base.join("current");
+        let other = base.join("other");
+        fs::create_dir_all(&here).unwrap();
+        fs::create_dir_all(&other).unwrap();
+
+        let mut rf = File::create(&raw).unwrap();
+        writeln!(rf, "1000\t{}", here.display()).unwrap();
+        writeln!(rf, "1001\t{}", other.display()).unwrap();
+        fs::write(&uniq, format!("{}\n{}\n", here.display(), other.display())).unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            check_dir: true,
+            pwd: Some(here.to_string_lossy().into_owned()),
+            ..RecommendOpt::default()
+        };
+        let paths = recommend_paths(&opt);
+        assert!(
+            !paths.contains(&here.to_string_lossy().to_string()),
+            "pwd 应被排除"
+        );
+        assert!(paths.contains(&other.to_string_lossy().to_string()));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn context_boosts_transition_target() {
+        // 历史里从 pwd 出发常去 target；另一个 rival 频次相同但与 pwd 无转移关系。
+        // context 分量应把 target 顶到前面。
+        let (raw, uniq, base) = setup("context");
+        let pwd = base.join("project-root");
+        let target = base.join("frequent-next");
+        let rival = base.join("unrelated");
+        fs::create_dir_all(&pwd).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&rival).unwrap();
+
+        let now = 1_000_000i64;
+        let mut rf = File::create(&raw).unwrap();
+        // 交替 pwd -> target 五轮（建立转移），rival 独立访问同样次数
+        for i in 0..5 {
+            let t = now - (10 - i) * 5000;
+            writeln!(rf, "{}\t{}", t, pwd.display()).unwrap();
+            writeln!(rf, "{}\t{}", t + 100, target.display()).unwrap();
+            writeln!(rf, "{}\t{}", t + 200, rival.display()).unwrap();
+        }
+        fs::write(
+            &uniq,
+            format!(
+                "{}\n{}\n{}\n",
+                pwd.display(),
+                target.display(),
+                rival.display()
+            ),
+        )
+        .unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            check_dir: true,
+            pwd: Some(pwd.to_string_lossy().into_owned()),
+            ..RecommendOpt::default()
+        };
+        let out = recommend_with_now(&opt, now);
+        assert_eq!(
+            out[0].path,
+            target.to_string_lossy(),
+            "转移目标应排第一, got {out:?}"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn log_compression_keeps_mid_tier_distinguishable() {
+        // whale：频次是他人几十倍。线性 min-max 会把中部三项压到几乎并列 0，
+        // 对数压缩后中部仍应按频次拉开且严格降序。
+        let (raw, uniq, base) = setup("logcomp");
+        let whale = base.join("whale");
+        let mid_hi = base.join("mid-hi");
+        let mid_lo = base.join("mid-lo");
+        for d in [&whale, &mid_hi, &mid_lo] {
+            fs::create_dir_all(d).unwrap();
+        }
+
+        let now = 1_000_000i64;
+        let mut rf = File::create(&raw).unwrap();
+        // 每次访问间隔 > 防抖窗口，确保都计入频次
+        for i in 0..100 {
+            writeln!(rf, "{}\t{}", now - i * 1000, whale.display()).unwrap();
+        }
+        for i in 0..8 {
+            writeln!(rf, "{}\t{}", now - i * 1000, mid_hi.display()).unwrap();
+        }
+        for i in 0..3 {
+            writeln!(rf, "{}\t{}", now - i * 1000, mid_lo.display()).unwrap();
+        }
+        fs::write(
+            &uniq,
+            format!(
+                "{}\n{}\n{}\n",
+                whale.display(),
+                mid_hi.display(),
+                mid_lo.display()
+            ),
+        )
+        .unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            check_dir: true,
+            w_frecency: 1.0,
+            w_uniq: 0.0,
+            w_recency: 0.0,
+            w_context: 0.0,
+            ..RecommendOpt::default()
+        };
+        let out = recommend_with_now(&opt, now);
+        let score_of = |p: &std::path::Path| {
+            out.iter()
+                .find(|r| r.path == p.to_string_lossy())
+                .map(|r| r.score)
+                .unwrap()
+        };
+        // 中部两项分数应明显区分（差值 > 0.05），而非被 whale 压成并列。
+        let gap = score_of(&mid_hi) - score_of(&mid_lo);
+        assert!(gap > 0.05, "中部区分度不足: mid_hi-mid_lo={gap}");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn is_direct_child_semantics() {
+        assert!(is_direct_child("/a/b", "/a"));
+        assert!(is_direct_child("/a/b/", "/a")); // 末尾斜杠边界
+        assert!(!is_direct_child("/a/b/c", "/a")); // 孙目录不算
+        assert!(!is_direct_child("/a", "/a")); // 自身不算
+        assert!(!is_direct_child("/x/y", "/a")); // 无关
     }
 }
