@@ -2,6 +2,7 @@
 //! - 批量评分：从事件时间戳向量计算分数
 //! - 在线增量：常数时间更新 score
 //! - 索引聚合：多目录 Top-N / 清理 / 容量上限
+//!
 //! 约定：时间戳单位为秒；半衰期 > 0；未来事件按 1.0 处理（不放大）
 
 use std::cmp::Ordering;
@@ -56,6 +57,12 @@ pub struct FrecencyState {
     pub score: f64,
     pub last_ts: i64,
     initialized: bool,
+}
+
+impl Default for FrecencyState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FrecencyState {
@@ -116,10 +123,7 @@ impl FrecencyIndex {
 
     /// 记录某目录一次访问
     pub fn record_visit<S: Into<String>>(&mut self, dir: S, ts: i64) {
-        let entry = self
-            .map
-            .entry(dir.into())
-            .or_insert_with(FrecencyState::new);
+        let entry = self.map.entry(dir.into()).or_default();
         entry.observe(ts, &self.model);
     }
 

@@ -5,6 +5,7 @@ use crate::config::EffectiveConfig;
 use crate::paths::Paths;
 use std::fs;
 use std::path::Path;
+use std::process;
 
 /// 程序运行时的全局上下文。
 /// - paths: 所有用到的路径（历史文件 / XDG 目录等）
@@ -23,7 +24,13 @@ impl AppContext {
         // 确保 XDG 目录和历史文件存在（失败时只打印 warning，不直接 panic）
         ensure_dirs_and_files(&paths);
 
-        let config = EffectiveConfig::from_env();
+        let config = match EffectiveConfig::from_env() {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("cdh: {e}");
+                process::exit(1);
+            }
+        };
 
         AppContext { paths, config }
     }

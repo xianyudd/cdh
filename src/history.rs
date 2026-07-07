@@ -24,6 +24,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const HISTORY_LOCK_RETRY_MS: u64 = 50;
 const HISTORY_LOCK_RETRIES: usize = 20;
 const HISTORY_LOCK_STALE_SECS: u64 = 30;
+const MILLIS_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
+const MICROS_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000_000;
+const NANOS_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000_000_000;
 
 /// 一条历史记录（来自 history_raw）
 #[derive(Debug, Clone)]
@@ -198,6 +201,19 @@ pub fn load_raw(ctx: &AppContext) -> io::Result<Vec<HistoryEntry>> {
     parse_history_file(&ctx.paths.history_raw)
 }
 
+pub(crate) fn parse_history_ts_secs(ts: &str) -> Option<i64> {
+    let ts = ts.parse::<i64>().ok()?;
+    if ts >= NANOS_TIMESTAMP_THRESHOLD {
+        Some(ts / 1_000_000_000)
+    } else if ts >= MICROS_TIMESTAMP_THRESHOLD {
+        Some(ts / 1_000_000)
+    } else if ts >= MILLIS_TIMESTAMP_THRESHOLD {
+        Some(ts / 1000)
+    } else {
+        Some(ts)
+    }
+}
+
 /// 从指定路径解析历史文件。
 /// 文件格式：每行 `<ts_secs>\t<path>`
 fn parse_history_file(path: &Path) -> io::Result<Vec<HistoryEntry>> {
@@ -233,7 +249,7 @@ fn parse_history_file(path: &Path) -> io::Result<Vec<HistoryEntry>> {
             None => continue,
         };
 
-        if let Ok(ts) = ts_str.parse::<i64>() {
+        if let Some(ts) = parse_history_ts_secs(ts_str) {
             res.push(HistoryEntry {
                 ts_secs: ts,
                 path: PathBuf::from(path_str),
@@ -285,10 +301,10 @@ impl FileLock {
         }
 
         Err(last_err.unwrap_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to acquire history lock: {}", path.display()),
-            )
+            io::Error::other(format!(
+                "failed to acquire history lock: {}",
+                path.display()
+            ))
         }))
     }
 }
@@ -353,14 +369,18 @@ mod tests {
 
     fn test_config() -> EffectiveConfig {
         EffectiveConfig {
-            limit: 20,
+            limit: None,
             half_life: 7.0 * 24.0 * 3600.0,
             threshold: 0.0,
             ignore_re: None,
             check_dir: true,
             uniq_decay: 0.85,
-            w_frecency: 0.7,
-            w_uniq: 0.3,
+            recency_half_life: 24.0 * 3600.0,
+            debounce_secs: 600,
+            w_frecency: 0.40,
+            w_uniq: 0.10,
+            w_recency: 0.30,
+            w_context: 0.20,
         }
     }
 
@@ -411,6 +431,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_history_ts_secs_normalizes_subsecond_timestamps() {
+        assert_eq!(
+            parse_history_ts_secs("1763331934955000000"),
+            Some(1_763_331_934)
+        );
+        assert_eq!(
+            parse_history_ts_secs("1763331934955000"),
+            Some(1_763_331_934)
+        );
+        assert_eq!(parse_history_ts_secs("1763331934955"), Some(1_763_331_934));
+        assert_eq!(parse_history_ts_secs("1763331934"), Some(1_763_331_934));
+        assert_eq!(parse_history_ts_secs("not-a-timestamp"), None);
+    }
+
+    #[test]
+    fn load_raw_normalizes_millisecond_timestamps() {
+        let (root, ctx) = make_test_ctx("load_raw_millis");
+        fs::write(
+            &ctx.paths.history_raw,
+            format!("1763331934955\t{}\n", root.display()),
+        )
+        .unwrap();
+
+        let entries = load_raw(&ctx).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ts_secs, 1_763_331_934);
+        assert_eq!(entries[0].path, root);
+    }
+
+    #[test]
     fn log_visit_writes_raw_and_uniq() {
         let (root, ctx) = make_test_ctx("writes_raw_and_uniq");
         let dir = root.join("visited_dir");
@@ -420,9 +470,7 @@ mod tests {
 
         let raw = fs::read_to_string(&ctx.paths.history_raw).unwrap();
         let raw_line = raw.trim();
-        let mut parts = raw_line.splitn(2, '\t');
-        let ts = parts.next().unwrap();
-        let path = parts.next().unwrap();
+        let (ts, path) = raw_line.split_once('\t').unwrap();
 
         assert!(ts.parse::<i64>().is_ok());
         assert_eq!(path, dir.to_string_lossy());
@@ -497,7 +545,7 @@ mod tests {
             .to_string();
 
         let raw = fs::read_to_string(&ctx.paths.history_raw).unwrap();
-        let raw_path = raw.trim().splitn(2, '\t').nth(1).unwrap();
+        let raw_path = raw.trim().split_once('\t').unwrap().1;
 
         assert_eq!(raw_path, expected);
         assert_eq!(read_lines(&ctx.paths.history_uniq), vec![expected]);
