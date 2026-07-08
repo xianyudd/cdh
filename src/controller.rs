@@ -5,7 +5,7 @@ use crate::{recommend, RecommendOpt};
 
 use regex::Regex;
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 /// 运行控制器：
 /// - 默认模式：推荐 + 选择（交互选目录）
@@ -33,6 +33,7 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
 
     // 1) 默认模式：构造 RecommendOpt
     let cfg = &ctx.config;
+    let interactive = io::stderr().is_terminal() && io::stdin().is_terminal();
     let mut opt = RecommendOpt {
         raw: ctx.paths.history_raw.to_string_lossy().into_owned(),
         uniq: ctx.paths.history_uniq.to_string_lossy().into_owned(),
@@ -42,6 +43,7 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
         ignore_re: cfg.ignore_re.clone(),
         tokens: Vec::new(),
         check_dir: cfg.check_dir,
+        include_missing: interactive && cfg.check_dir,
         uniq_decay: cfg.uniq_decay,
         // 当前目录：自身从候选中排除，并作为“上下文转移”的锚点
         pwd: env::current_dir()
@@ -152,7 +154,7 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
     }
 
     // 4) 打开 TUI 选择（非交互环境时 picker 会直接返回第一项）
-    match picker::pick(&items) {
+    match picker::pick_with_history(ctx, &items) {
         Ok(Some(sel)) => {
             // 与 Fish 集成友好：不换行，避免命令替换多出 \n
             print!("{sel}");

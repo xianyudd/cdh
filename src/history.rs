@@ -87,6 +87,21 @@ pub fn log_visit(ctx: &AppContext, dir: &str) -> io::Result<()> {
     })
 }
 
+/// 从 history_raw 和 history_uniq 中移除指定目录的所有记录。
+pub fn remove_path(ctx: &AppContext, dir: &str) -> io::Result<()> {
+    let dir = dir.trim();
+    if dir.is_empty() {
+        return Ok(());
+    }
+
+    let dir = normalize_history_path(dir)?;
+    with_history_lock(ctx, || {
+        rewrite_raw_without_path(ctx, &dir)?;
+        rewrite_uniq_without_path(ctx, &dir)?;
+        Ok(())
+    })
+}
+
 /// 规范化用于写入历史文件的路径，保证尽量写入绝对路径。
 ///
 /// 规则：
@@ -190,6 +205,80 @@ fn update_uniq_after_visit(ctx: &AppContext, dir: &str) -> io::Result<()> {
     // 4) 原子替换
     fs::rename(&tmp_path, uniq_path)?;
 
+    Ok(())
+}
+
+fn rewrite_raw_without_path(ctx: &AppContext, dir: &str) -> io::Result<()> {
+    let raw_path = &ctx.paths.history_raw;
+    let tmp_path = raw_path.with_extension("tmp");
+
+    let mut lines: Vec<String> = Vec::new();
+    match File::open(raw_path) {
+        Ok(file) => {
+            let reader = BufReader::new(file);
+            for line_res in reader.lines() {
+                let line = line_res?;
+                let keep = line
+                    .split_once('\t')
+                    .map(|(_, path)| path.trim() != dir)
+                    .unwrap_or(true);
+                if keep {
+                    lines.push(line);
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+
+    if let Some(parent) = raw_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    {
+        let file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        for line in &lines {
+            writeln!(writer, "{line}")?;
+        }
+        writer.flush()?;
+    }
+    fs::rename(&tmp_path, raw_path)?;
+    Ok(())
+}
+
+fn rewrite_uniq_without_path(ctx: &AppContext, dir: &str) -> io::Result<()> {
+    let uniq_path = &ctx.paths.history_uniq;
+    let tmp_path = uniq_path.with_extension("tmp");
+
+    let mut paths: Vec<String> = Vec::new();
+    match File::open(uniq_path) {
+        Ok(file) => {
+            let reader = BufReader::new(file);
+            for line_res in reader.lines() {
+                let line = line_res?;
+                let line = line.trim();
+                if line.is_empty() || line == dir {
+                    continue;
+                }
+                paths.push(line.to_string());
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+
+    if let Some(parent) = uniq_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    {
+        let file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        for p in &paths {
+            writeln!(writer, "{p}")?;
+        }
+        writer.flush()?;
+    }
+    fs::rename(&tmp_path, uniq_path)?;
     Ok(())
 }
 
@@ -500,6 +589,43 @@ mod tests {
                 dir_b.to_string_lossy().to_string(),
                 dir_a.to_string_lossy().to_string(),
             ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remove_path_deletes_from_raw_and_uniq() {
+        let (root, ctx) = make_test_ctx("remove_path");
+        let stale = root.join("stale");
+        let keep = root.join("keep");
+        fs::create_dir_all(&keep).unwrap();
+
+        fs::write(
+            &ctx.paths.history_raw,
+            format!(
+                "100\t{}\n101\t{}\n102\t{}\nmalformed\n",
+                stale.display(),
+                keep.display(),
+                stale.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &ctx.paths.history_uniq,
+            format!("{}\n{}\n", stale.display(), keep.display()),
+        )
+        .unwrap();
+
+        remove_path(&ctx, stale.to_str().unwrap()).unwrap();
+
+        let raw = fs::read_to_string(&ctx.paths.history_raw).unwrap();
+        assert!(!raw.contains(stale.to_str().unwrap()));
+        assert!(raw.contains(keep.to_str().unwrap()));
+        assert!(raw.contains("malformed"));
+        assert_eq!(
+            read_lines(&ctx.paths.history_uniq),
+            vec![keep.to_string_lossy().to_string()]
         );
 
         let _ = fs::remove_dir_all(root);

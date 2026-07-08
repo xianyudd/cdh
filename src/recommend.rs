@@ -58,6 +58,7 @@ pub struct Recommendation {
     pub path: String,
     pub score: f64, // 融合后的最终分（0~1）
     pub breakdown: ScoreBreakdown,
+    pub exists: bool,
 }
 
 /// 融合推荐的配置
@@ -79,6 +80,8 @@ pub struct RecommendOpt {
     pub tokens: Vec<String>,
     /// 是否校验目录存在性（WSL/远程盘建议置 false 提速；默认 true）
     pub check_dir: bool,
+    /// 内部 TUI 开关：保留失效路径并用 `Recommendation::exists` 标记。
+    pub include_missing: bool,
     /// uniq 的几何衰减系数（最新=1.0，次新=decay，…；默认 0.85）
     pub uniq_decay: f64,
     /// 当前工作目录：本身会从结果中排除，并作为“转移加成”的锚点。
@@ -112,6 +115,7 @@ impl Default for RecommendOpt {
             ignore_re: None,                // 默认不忽略任何路径；可由 config/CLI 覆盖
             tokens: Vec::new(),
             check_dir: true, // 默认检查目录存在性；可被 config 覆盖
+            include_missing: false,
             uniq_decay: 0.85,
             pwd: None,
             recency_half_life: 24.0 * 3600.0,
@@ -129,6 +133,7 @@ struct RankedItem {
     path: String,
     final_score: f64,
     breakdown: ScoreBreakdown,
+    exists: bool,
     frecency_score: f64,
     match_quality: f64,
 }
@@ -155,6 +160,7 @@ pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
         &opt.ignore_re,
         &tokens_lc,
         opt.check_dir,
+        opt.include_missing,
         opt.uniq_decay,
     );
 
@@ -185,6 +191,7 @@ pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
     // 6) 四分量融合 + 阈值过滤 + 排序
     let mut items: Vec<RankedItem> = Vec::with_capacity(candidates.len());
     for dir in candidates {
+        let exists = !opt.check_dir || Path::new(&dir).is_dir();
         // 频次（对数压缩后 0~1）
         let fz = {
             let s = signals.idx.score_at(&dir, now);
@@ -232,6 +239,7 @@ pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
                     context_norm: cz,
                     uniq_norm: uz,
                 },
+                exists,
                 frecency_score: fz,
                 match_quality,
             });
@@ -241,14 +249,18 @@ pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
     if tokens_lc.is_empty() {
         // 主排序：final desc；次排序：frecency desc；再次：路径字典序
         items.sort_by(|a, b| {
-            cmp_f64_desc(b.final_score, a.final_score)
+            b.exists
+                .cmp(&a.exists)
+                .then_with(|| cmp_f64_desc(b.final_score, a.final_score))
                 .then_with(|| cmp_f64_desc(b.frecency_score, a.frecency_score))
                 .then(a.path.cmp(&b.path))
         });
     } else {
         // 带关键词时，先按路径匹配质量排序，再回退到历史推荐分。
         items.sort_by(|a, b| {
-            cmp_f64_desc(b.match_quality, a.match_quality)
+            b.exists
+                .cmp(&a.exists)
+                .then_with(|| cmp_f64_desc(b.match_quality, a.match_quality))
                 .then_with(|| cmp_f64_desc(b.final_score, a.final_score))
                 .then_with(|| cmp_f64_desc(b.frecency_score, a.frecency_score))
                 .then(a.path.cmp(&b.path))
@@ -259,6 +271,7 @@ pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
         path: item.path,
         score: item.final_score,
         breakdown: item.breakdown,
+        exists: item.exists,
     });
     match opt.limit {
         Some(limit) => iter.take(limit).collect(),
@@ -281,6 +294,7 @@ fn load_uniq_scores(
     ignore_re: &Option<Regex>,
     tokens_lc: &[String],
     check_dir: bool,
+    include_missing: bool,
     decay: f64,
 ) -> HashMap<String, f64> {
     let f = match File::open(uniq_file) {
@@ -307,7 +321,7 @@ fn load_uniq_scores(
                 continue;
             }
         }
-        if check_dir && !Path::new(&p).is_dir() {
+        if check_dir && !include_missing && !Path::new(&p).is_dir() {
             continue;
         }
         let s = decay.powi(k as i32);
@@ -382,7 +396,7 @@ fn build_raw_signals(opt: &RecommendOpt, tokens_lc: &[String], now: i64) -> RawS
                 continue;
             }
         }
-        if opt.check_dir && !Path::new(&path).is_dir() {
+        if opt.check_dir && !opt.include_missing && !Path::new(&path).is_dir() {
             continue;
         }
 
@@ -1247,6 +1261,51 @@ mod tests {
                 item.path
             );
         }
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn include_missing_keeps_stale_paths_after_existing_dirs() {
+        let (raw, uniq, base) = setup("include_missing");
+        let exists = base.join("exists");
+        let missing = base.join("missing");
+        fs::create_dir_all(&exists).unwrap();
+
+        let mut rf = File::create(&raw).unwrap();
+        writeln!(rf, "1000\t{}", missing.display()).unwrap();
+        writeln!(rf, "1001\t{}", exists.display()).unwrap();
+        fs::write(&uniq, format!("{}\n{}\n", missing.display(), exists.display())).unwrap();
+
+        let filtered = recommend_with_now(
+            &RecommendOpt {
+                raw: raw.clone(),
+                uniq: uniq.clone(),
+                check_dir: true,
+                include_missing: false,
+                ..RecommendOpt::default()
+            },
+            2000,
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].path, exists.to_string_lossy());
+        assert!(filtered[0].exists);
+
+        let unfiltered = recommend_with_now(
+            &RecommendOpt {
+                raw,
+                uniq,
+                check_dir: true,
+                include_missing: true,
+                ..RecommendOpt::default()
+            },
+            2000,
+        );
+        assert_eq!(unfiltered.len(), 2);
+        assert_eq!(unfiltered[0].path, exists.to_string_lossy());
+        assert!(unfiltered[0].exists);
+        assert_eq!(unfiltered[1].path, missing.to_string_lossy());
+        assert!(!unfiltered[1].exists);
 
         let _ = fs::remove_dir_all(base);
     }

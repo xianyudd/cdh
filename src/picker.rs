@@ -36,6 +36,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
+use crate::{history, AppContext};
 use crate::recommend::Recommendation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -147,7 +148,17 @@ pub fn pick(items: &[Recommendation]) -> io::Result<Option<String>> {
     if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
         return Ok(items.first().map(|r| r.path.clone()));
     }
-    run_ui(items)
+    run_ui(items, None)
+}
+
+pub fn pick_with_history(ctx: &AppContext, items: &[Recommendation]) -> io::Result<Option<String>> {
+    if items.is_empty() {
+        return Ok(None);
+    }
+    if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
+        return Ok(items.first().map(|r| r.path.clone()));
+    }
+    run_ui(items, Some(ctx))
 }
 
 // ---------------- 终端守卫 ----------------
@@ -187,6 +198,8 @@ struct Candidate {
     score: f32,
     /// 归一化子信号：frecency / recency / context / uniq。
     breakdown: [f32; 4],
+    /// 目录当前是否存在。
+    exists: bool,
 }
 
 fn build_candidates(items: &[Recommendation]) -> Vec<Candidate> {
@@ -211,6 +224,7 @@ fn build_candidates(items: &[Recommendation]) -> Vec<Candidate> {
                     r.breakdown.context_norm.clamp(0.0, 1.0) as f32,
                     r.breakdown.uniq_norm.clamp(0.0, 1.0) as f32,
                 ],
+                exists: r.exists,
             }
         })
         .collect()
@@ -249,7 +263,8 @@ impl Filter {
                 .collect();
         }
         let pattern = Pattern::parse(q, CaseMatching::Ignore, Normalization::Smart);
-        let mut scored: Vec<(u32, usize, Vec<u32>)> = Vec::new();
+        let mut scored_existing: Vec<(u32, usize, Vec<u32>)> = Vec::new();
+        let mut stale_matches: Vec<(usize, Vec<u32>)> = Vec::new();
         for (idx, c) in cands.iter().enumerate() {
             let mut hbuf = Vec::new();
             let haystack = Utf32Str::new(&c.display, &mut self.buf);
@@ -265,11 +280,15 @@ impl Filter {
                 );
                 indices.sort_unstable();
                 indices.dedup();
-                scored.push((score, idx, indices));
+                if c.exists {
+                    scored_existing.push((score, idx, indices));
+                } else {
+                    stale_matches.push((idx, indices));
+                }
             }
         }
         // 匹配分降序；同分时按候选自身分数降序，保证 frecency 高的靠前。
-        scored.sort_by(|a, b| {
+        scored_existing.sort_by(|a, b| {
             b.0.cmp(&a.0).then_with(|| {
                 cands[b.1]
                     .score
@@ -277,9 +296,10 @@ impl Filter {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
         });
-        scored
+        scored_existing
             .into_iter()
             .map(|(_, idx, hl)| Match { idx, hl })
+            .chain(stale_matches.into_iter().map(|(idx, hl)| Match { idx, hl }))
             .collect()
     }
 }
@@ -297,6 +317,7 @@ struct App {
     anim_scores: Vec<[f32; 4]>, // 每个原始候选当前子信号填充（0~1）
     fade: f32,                  // 打开淡入（0→1）
     show_help: bool,
+    confirm_delete: Option<usize>,
     last_click: Option<(usize, Instant)>,
     /// 上一帧实际渲染的列表区域（供鼠标命中测试对齐真实布局）。
     last_list_area: std::cell::Cell<Rect>,
@@ -317,6 +338,7 @@ impl App {
             anim_scores: vec![[0.0; 4]; n],
             fade: if anim_enabled() { 0.0 } else { 1.0 },
             show_help: false,
+            confirm_delete: None,
             last_click: None,
             last_list_area: std::cell::Cell::new(Rect::new(0, 0, 0, 0)),
         }
@@ -348,6 +370,26 @@ impl App {
         self.matches
             .get(self.selected)
             .map(|m| self.cands[m.idx].raw.clone())
+    }
+
+    fn selected_candidate_idx(&self) -> Option<usize> {
+        self.matches.get(self.selected).map(|m| m.idx)
+    }
+
+    fn selected_candidate(&self) -> Option<&Candidate> {
+        self.selected_candidate_idx().map(|idx| &self.cands[idx])
+    }
+
+    fn remove_candidate(&mut self, idx: usize) {
+        if idx >= self.cands.len() {
+            return;
+        }
+        self.cands.remove(idx);
+        self.anim_scores.remove(idx);
+        self.recompute();
+        if !self.matches.is_empty() {
+            self.selected = self.selected.min(self.matches.len() - 1);
+        }
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -411,7 +453,7 @@ impl App {
 }
 
 // ---------------- 主循环 ----------------
-fn run_ui(items: &[Recommendation]) -> io::Result<Option<String>> {
+fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Option<String>> {
     let mouse = mouse_enabled();
     let _guard = TermGuard::enter(mouse)?;
     let backend = CrosstermBackend::new(io::stderr());
@@ -449,14 +491,14 @@ fn run_ui(items: &[Recommendation]) -> io::Result<Option<String>> {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 seen_key = true;
                 idle_since = Instant::now();
-                if let Some(result) = handle_key(&mut app, key.code, key.modifiers) {
+                if let Some(result) = handle_key(&mut app, key.code, key.modifiers, ctx) {
                     return Ok(result);
                 }
             }
             Event::Mouse(me) if mouse => {
                 seen_key = true;
                 idle_since = Instant::now();
-                if app.show_help {
+                if app.show_help || app.confirm_delete.is_some() {
                     continue;
                 }
                 if let Some(result) = handle_mouse(&mut app, me)? {
@@ -469,18 +511,62 @@ fn run_ui(items: &[Recommendation]) -> io::Result<Option<String>> {
 }
 
 /// 处理按键。返回 `Some(_)` 表示应当退出主循环并返回该值。
-fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<Option<String>> {
+fn handle_key(
+    app: &mut App,
+    code: KeyCode,
+    mods: KeyModifiers,
+    ctx: Option<&AppContext>,
+) -> Option<Option<String>> {
     // 帮助浮层：任意键关闭。
     if app.show_help {
         app.show_help = false;
         return None;
     }
     let ctrl = mods.contains(KeyModifiers::CONTROL);
+    if let Some(candidate_idx) = app.confirm_delete {
+        app.confirm_delete = None;
+        if matches!(code, KeyCode::Char('d')) && ctrl {
+            match ctx {
+                Some(ctx) => {
+                    let Some(raw) = app.cands.get(candidate_idx).map(|cand| cand.raw.clone())
+                    else {
+                        beep();
+                        return None;
+                    };
+                    match history::remove_path(ctx, &raw) {
+                        Ok(()) => app.remove_candidate(candidate_idx),
+                        Err(_) => beep(),
+                    }
+                }
+                None => beep(),
+            }
+        }
+        return None;
+    }
     match code {
         KeyCode::Char('c') if ctrl => return Some(None),
         KeyCode::Char('g') if ctrl => return Some(None),
+        KeyCode::Char('d') if ctrl => {
+            let Some(idx) = app.selected_candidate_idx() else {
+                beep();
+                return None;
+            };
+            if app.cands[idx].exists {
+                beep();
+            } else {
+                app.confirm_delete = Some(idx);
+            }
+        }
         KeyCode::Enter | KeyCode::Tab => {
             if app.matches.is_empty() {
+                beep();
+                return None;
+            }
+            if app
+                .selected_candidate()
+                .map(|cand| !cand.exists)
+                .unwrap_or(false)
+            {
                 beep();
                 return None;
             }
@@ -589,6 +675,8 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme) {
 
     if app.show_help {
         render_help(f, theme, full);
+    } else if let Some(idx) = app.confirm_delete {
+        render_confirm_delete(f, app, theme, full, idx);
     }
 }
 
@@ -652,21 +740,27 @@ fn render_list(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
         // 指示符（用确定 1 显示列的 Narrow 字符，避免 Ambiguous 宽度在 CJK 终端占 2 列导致溢出）
         let marker = if is_sel { "❯ " } else { "  " };
-        spans.push(Span::styled(
-            marker,
+        let marker_style = if cand.exists {
             Style::default()
                 .fg(theme.accent())
-                .add_modifier(Modifier::BOLD),
-        ));
+                .add_modifier(Modifier::BOLD)
+        } else {
+            theme.dim()
+        };
+        spans.push(Span::styled(marker, marker_style));
 
         // 路径列（~ 着色 + 命中高亮 + 中截省略 + 右填充到 path_w）
         spans.extend(path_spans(cand, &m.hl, path_w, theme, is_sel));
 
         // 右侧分数条
         if show_score {
-            let filled = app.anim_scores[m.idx];
             spans.push(Span::raw(" "));
-            spans.extend(score_bar_spans(filled, cand.score, theme));
+            if cand.exists {
+                let filled = app.anim_scores[m.idx];
+                spans.extend(score_bar_spans(filled, cand.score, theme));
+            } else {
+                spans.extend(stale_badge_spans(theme));
+            }
         }
 
         let mut line = Line::from(spans);
@@ -707,6 +801,11 @@ fn path_spans<'a>(
     is_sel: bool,
 ) -> Vec<Span<'a>> {
     let base = if is_sel { theme.sel_fg() } else { theme.path() };
+    let base = if cand.exists {
+        base
+    } else {
+        theme.dim().add_modifier(Modifier::CROSSED_OUT)
+    };
     let disp = trim_middle(&cand.display, col_w);
     let disp_w = UnicodeWidthStr::width(disp.as_str());
     let pad = col_w.saturating_sub(disp_w);
@@ -718,7 +817,9 @@ fn path_spans<'a>(
     if !hl.is_empty() && !truncated {
         let hl_set: std::collections::HashSet<u32> = hl.iter().copied().collect();
         for (i, ch) in cand.display.chars().enumerate() {
-            let style = if hl_set.contains(&(i as u32)) {
+            let style = if !cand.exists {
+                base
+            } else if hl_set.contains(&(i as u32)) {
                 theme.match_hl()
             } else if i == 0 && ch == '~' {
                 theme.home_tilde()
@@ -728,7 +829,8 @@ fn path_spans<'a>(
             spans.push(Span::styled(ch.to_string(), style));
         }
     } else if let Some(rest) = disp.strip_prefix('~') {
-        spans.push(Span::styled("~", theme.home_tilde()));
+        let tilde_style = if cand.exists { theme.home_tilde() } else { base };
+        spans.push(Span::styled("~", tilde_style));
         spans.push(Span::styled(rest.to_string(), base));
     } else {
         spans.push(Span::styled(disp, base));
@@ -739,6 +841,13 @@ fn path_spans<'a>(
         spans.push(Span::styled(" ".repeat(pad), base));
     }
     spans
+}
+
+fn stale_badge_spans(theme: &Theme) -> Vec<Span<'static>> {
+    const BADGE_W: usize = SCORE_BAR_CELLS + 3;
+    let label = "已失效";
+    let pad = BADGE_W.saturating_sub(UnicodeWidthStr::width(label));
+    vec![Span::styled(format!("{label}{}", " ".repeat(pad)), theme.dim())]
 }
 
 /// 分数条：`filled` 是动画中的当前子信号，`score` 是融合目标分（右侧数字）。
@@ -847,6 +956,7 @@ fn render_help(f: &mut Frame, theme: &Theme, full: Rect) {
         help_row("Home / End", "首 / 末项", theme),
         help_row("任意字符", "模糊搜索过滤", theme),
         help_row("Enter / Tab", "跳转到选中目录", theme),
+        help_row("Ctrl+D", "删除选中的失效目录记录", theme),
         help_row("Esc", "清空搜索 / 退出", theme),
         help_row("Ctrl+C / Ctrl+G", "退出", theme),
         help_row("鼠标", "单击选中 · 双击跳转 · 滚轮滚动", theme),
@@ -855,6 +965,36 @@ fn render_help(f: &mut Frame, theme: &Theme, full: Rect) {
         Line::from(Span::styled(" 按任意键关闭", theme.dim())),
     ];
     let w = 46u16.min(full.width.saturating_sub(4));
+    let h = (lines.len() as u16 + 2).min(full.height.saturating_sub(2));
+    let area = centered(full, w, h);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent()))
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_confirm_delete(f: &mut Frame, app: &App, theme: &Theme, full: Rect, idx: usize) {
+    let path = app
+        .cands
+        .get(idx)
+        .map(|cand| trim_middle(&cand.display, 34))
+        .unwrap_or_else(|| "未知目录".to_string());
+    let lines = vec![
+        Line::from(Span::styled(" 删除失效记录", theme.title())),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  ", theme.dim()),
+            Span::styled(path, theme.dim().add_modifier(Modifier::CROSSED_OUT)),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(" 再按 Ctrl+D 删除，按其他键取消", theme.dim())),
+    ];
+    let w = 44u16.min(full.width.saturating_sub(4));
     let h = (lines.len() as u16 + 2).min(full.height.saturating_sub(2));
     let area = centered(full, w, h);
     f.render_widget(Clear, area);
@@ -949,6 +1089,10 @@ fn beep() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{EffectiveConfig, Paths};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn recs(paths: &[(&str, f64)]) -> Vec<Recommendation> {
         paths
@@ -962,8 +1106,63 @@ mod tests {
                     context_norm: *s,
                     uniq_norm: *s,
                 },
+                exists: true,
             })
             .collect()
+    }
+
+    fn recs_with_exists(paths: &[(&str, f64, bool)]) -> Vec<Recommendation> {
+        paths
+            .iter()
+            .map(|(p, s, exists)| Recommendation {
+                path: p.to_string(),
+                score: *s,
+                breakdown: crate::recommend::ScoreBreakdown {
+                    frecency_norm: *s,
+                    recency_norm: *s,
+                    context_norm: *s,
+                    uniq_norm: *s,
+                },
+                exists: *exists,
+            })
+            .collect()
+    }
+
+    fn test_ctx(name: &str) -> (PathBuf, AppContext) {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cdh_picker_test_{name}_{uniq}"));
+        let paths = Paths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            history_raw: root.join("data").join("history").join("history_raw"),
+            history_uniq: root.join("data").join("history").join("history_uniq"),
+        };
+        fs::create_dir_all(paths.history_raw.parent().unwrap()).unwrap();
+        (
+            root,
+            AppContext {
+                paths,
+                config: EffectiveConfig {
+                    limit: None,
+                    half_life: 7.0 * 24.0 * 3600.0,
+                    threshold: 0.0,
+                    ignore_re: None,
+                    check_dir: true,
+                    uniq_decay: 0.85,
+                    recency_half_life: 24.0 * 3600.0,
+                    debounce_secs: 600,
+                    w_frecency: 0.40,
+                    w_uniq: 0.10,
+                    w_recency: 0.30,
+                    w_context: 0.20,
+                },
+            },
+        )
     }
 
     #[test]
@@ -999,6 +1198,19 @@ mod tests {
         assert_eq!(m.len(), 3);
         assert_eq!(m[0].idx, 0);
         assert_eq!(m[2].idx, 2);
+    }
+
+    #[test]
+    fn filter_places_stale_matches_after_existing_matches() {
+        let cands = build_candidates(&recs_with_exists(&[
+            ("/work/missing-cdh", 0.99, false),
+            ("/work/live-cdh", 0.10, true),
+        ]));
+        let mut filter = Filter::new();
+        let m = filter.run(&cands, "cdh");
+        assert_eq!(m.len(), 2);
+        assert_eq!(cands[m[0].idx].raw, "/work/live-cdh");
+        assert_eq!(cands[m[1].idx].raw, "/work/missing-cdh");
     }
 
     #[test]
@@ -1044,10 +1256,74 @@ mod tests {
                 context_norm: 2.0,
                 uniq_norm: 0.75,
             },
+            exists: true,
         }];
 
         let cands = build_candidates(&items);
         assert_eq!(cands[0].score, 1.0);
         assert_eq!(cands[0].breakdown, [0.0, 0.25, 1.0, 0.75]);
+    }
+
+    #[test]
+    fn ctrl_d_confirmation_removes_stale_candidate_and_history() {
+        let (root, ctx) = test_ctx("ctrl_d_delete");
+        let stale = root.join("stale");
+        let keep = root.join("keep");
+        fs::create_dir_all(&keep).unwrap();
+        fs::write(
+            &ctx.paths.history_raw,
+            format!(
+                "100\t{}\n101\t{}\n102\t{}\n",
+                stale.display(),
+                keep.display(),
+                stale.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &ctx.paths.history_uniq,
+            format!("{}\n{}\n", stale.display(), keep.display()),
+        )
+        .unwrap();
+
+        let items = recs_with_exists(&[
+            (keep.to_str().unwrap(), 0.5, true),
+            (stale.to_str().unwrap(), 0.9, false),
+        ]);
+        let mut app = App::new(build_candidates(&items));
+        app.selected = 1;
+
+        assert_eq!(
+            handle_key(
+                &mut app,
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                Some(&ctx)
+            ),
+            None
+        );
+        assert_eq!(app.confirm_delete, Some(1));
+
+        assert_eq!(
+            handle_key(
+                &mut app,
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                Some(&ctx)
+            ),
+            None
+        );
+
+        assert_eq!(app.cands.len(), 1);
+        assert_eq!(app.cands[0].raw, keep.to_string_lossy());
+        let raw = fs::read_to_string(&ctx.paths.history_raw).unwrap();
+        assert!(!raw.contains(stale.to_str().unwrap()));
+        assert!(raw.contains(keep.to_str().unwrap()));
+        assert_eq!(
+            fs::read_to_string(&ctx.paths.history_uniq).unwrap(),
+            format!("{}\n", keep.display())
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }
