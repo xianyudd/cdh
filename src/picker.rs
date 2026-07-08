@@ -305,6 +305,13 @@ impl Filter {
 }
 
 // ---------------- 应用状态 ----------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    Help,
+    ConfirmDelete { candidate_idx: usize },
+}
+
 struct App {
     cands: Vec<Candidate>,
     filter: Filter,
@@ -316,8 +323,7 @@ struct App {
     anim_cursor: f32,           // 平滑高亮行（浮点）
     anim_scores: Vec<[f32; 4]>, // 每个原始候选当前子信号填充（0~1）
     fade: f32,                  // 打开淡入（0→1）
-    show_help: bool,
-    confirm_delete: Option<usize>,
+    mode: Mode,
     last_click: Option<(usize, Instant)>,
     /// 上一帧实际渲染的列表区域（供鼠标命中测试对齐真实布局）。
     last_list_area: std::cell::Cell<Rect>,
@@ -337,8 +343,7 @@ impl App {
             anim_cursor: 0.0,
             anim_scores: vec![[0.0; 4]; n],
             fade: if anim_enabled() { 0.0 } else { 1.0 },
-            show_help: false,
-            confirm_delete: None,
+            mode: Mode::Normal,
             last_click: None,
             last_list_area: std::cell::Cell::new(Rect::new(0, 0, 0, 0)),
         }
@@ -498,7 +503,7 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
             Event::Mouse(me) if mouse => {
                 seen_key = true;
                 idle_since = Instant::now();
-                if app.show_help || app.confirm_delete.is_some() {
+                if app.mode != Mode::Normal {
                     continue;
                 }
                 if let Some(result) = handle_mouse(&mut app, me)? {
@@ -517,32 +522,49 @@ fn handle_key(
     mods: KeyModifiers,
     ctx: Option<&AppContext>,
 ) -> Option<Option<String>> {
-    // 帮助浮层：任意键关闭。
-    if app.show_help {
-        app.show_help = false;
-        return None;
-    }
-    let ctrl = mods.contains(KeyModifiers::CONTROL);
-    if let Some(candidate_idx) = app.confirm_delete {
-        app.confirm_delete = None;
-        if matches!(code, KeyCode::Char('d')) && ctrl {
-            match ctx {
-                Some(ctx) => {
-                    let Some(raw) = app.cands.get(candidate_idx).map(|cand| cand.raw.clone())
-                    else {
-                        beep();
-                        return None;
-                    };
-                    match history::remove_path(ctx, &raw) {
-                        Ok(()) => app.remove_candidate(candidate_idx),
-                        Err(_) => beep(),
-                    }
-                }
-                None => beep(),
-            }
+    match app.mode {
+        Mode::Normal => handle_key_normal(app, code, mods),
+        Mode::Help => handle_key_help(app),
+        Mode::ConfirmDelete { candidate_idx } => {
+            handle_key_confirm_delete(app, code, mods, ctx, candidate_idx)
         }
-        return None;
     }
+}
+
+fn handle_key_help(app: &mut App) -> Option<Option<String>> {
+    app.mode = Mode::Normal;
+    None
+}
+
+fn handle_key_confirm_delete(
+    app: &mut App,
+    code: KeyCode,
+    mods: KeyModifiers,
+    ctx: Option<&AppContext>,
+    candidate_idx: usize,
+) -> Option<Option<String>> {
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+    app.mode = Mode::Normal;
+    if matches!(code, KeyCode::Char('d')) && ctrl {
+        match ctx {
+            Some(ctx) => {
+                let Some(raw) = app.cands.get(candidate_idx).map(|cand| cand.raw.clone()) else {
+                    beep();
+                    return None;
+                };
+                match history::remove_path(ctx, &raw) {
+                    Ok(()) => app.remove_candidate(candidate_idx),
+                    Err(_) => beep(),
+                }
+            }
+            None => beep(),
+        }
+    }
+    None
+}
+
+fn handle_key_normal(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<Option<String>> {
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
     match code {
         KeyCode::Char('c') if ctrl => return Some(None),
         KeyCode::Char('g') if ctrl => return Some(None),
@@ -554,7 +576,7 @@ fn handle_key(
             if app.cands[idx].exists {
                 beep();
             } else {
-                app.confirm_delete = Some(idx);
+                app.mode = Mode::ConfirmDelete { candidate_idx: idx };
             }
         }
         KeyCode::Enter | KeyCode::Tab => {
@@ -591,7 +613,7 @@ fn handle_key(
             app.query.pop();
             app.recompute();
         }
-        KeyCode::F(1) => app.show_help = true,
+        KeyCode::F(1) => app.mode = Mode::Help,
         KeyCode::Char(c) if !ctrl && !c.is_control() => {
             app.query.push(c);
             app.recompute();
@@ -673,10 +695,12 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     render_list(f, app, theme, list_area);
     render_input(f, app, theme, input_area);
 
-    if app.show_help {
-        render_help(f, theme, full);
-    } else if let Some(idx) = app.confirm_delete {
-        render_confirm_delete(f, app, theme, full, idx);
+    match app.mode {
+        Mode::Normal => {}
+        Mode::Help => render_help(f, theme, full),
+        Mode::ConfirmDelete { candidate_idx } => {
+            render_confirm_delete(f, app, theme, full, candidate_idx);
+        }
     }
 }
 
@@ -1302,7 +1326,7 @@ mod tests {
             ),
             None
         );
-        assert_eq!(app.confirm_delete, Some(1));
+        assert_eq!(app.mode, Mode::ConfirmDelete { candidate_idx: 1 });
 
         assert_eq!(
             handle_key(
