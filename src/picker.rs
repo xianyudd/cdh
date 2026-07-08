@@ -41,8 +41,8 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::{history, AppContext};
 use crate::recommend::Recommendation;
+use crate::{history, AppContext};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ---------------- 常量 ----------------
@@ -663,7 +663,9 @@ impl App {
     }
 
     fn track_preview_selection(&mut self, now: Instant) {
-        let selected = self.selected_candidate().map(|cand| (cand.raw.clone(), cand.exists));
+        let selected = self
+            .selected_candidate()
+            .map(|cand| (cand.raw.clone(), cand.exists));
         let selected_path = selected.as_ref().map(|(path, _)| path.clone());
         if self.preview_selected_path == selected_path {
             return;
@@ -702,7 +704,8 @@ impl App {
             return;
         }
         let Some(worker) = &self.preview_worker else {
-            self.preview_current = Some((path, PreviewOutcome::Error("预览功能不可用".to_string())));
+            self.preview_current =
+                Some((path, PreviewOutcome::Error("预览功能不可用".to_string())));
             return;
         };
 
@@ -1178,7 +1181,11 @@ fn path_spans<'a>(
             spans.push(Span::styled(ch.to_string(), style));
         }
     } else if let Some(rest) = disp.strip_prefix('~') {
-        let tilde_style = if cand.exists { theme.home_tilde() } else { base };
+        let tilde_style = if cand.exists {
+            theme.home_tilde()
+        } else {
+            base
+        };
         spans.push(Span::styled("~", tilde_style));
         spans.push(Span::styled(rest.to_string(), base));
     } else {
@@ -1196,7 +1203,10 @@ fn stale_badge_spans(theme: &Theme) -> Vec<Span<'static>> {
     const BADGE_W: usize = SCORE_BAR_CELLS + 3;
     let label = "已失效";
     let pad = BADGE_W.saturating_sub(UnicodeWidthStr::width(label));
-    vec![Span::styled(format!("{label}{}", " ".repeat(pad)), theme.dim())]
+    vec![Span::styled(
+        format!("{label}{}", " ".repeat(pad)),
+        theme.dim(),
+    )]
 }
 
 /// 分数条：`filled` 是动画中的当前子信号，`score` 是融合目标分（右侧数字）。
@@ -1303,7 +1313,10 @@ fn render_preview(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 };
                 lines.push(Line::from(vec![
                     Span::styled("● ", dot_style),
-                    Span::styled(trim_middle(&git.branch, col_w.saturating_sub(2)), theme.path()),
+                    Span::styled(
+                        trim_middle(&git.branch, col_w.saturating_sub(2)),
+                        theme.path(),
+                    ),
                 ]));
                 lines.push(Line::raw(""));
             }
@@ -1815,7 +1828,10 @@ mod tests {
         assert!(app.matches.is_empty());
         assert_eq!(app.selected, 0);
         assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, Some(&ctx)), None);
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, Some(&ctx)),
+            None
+        );
         assert_eq!(fs::read_to_string(&ctx.paths.history_raw).unwrap(), "");
         assert_eq!(fs::read_to_string(&ctx.paths.history_uniq).unwrap(), "");
 
@@ -1838,8 +1854,7 @@ mod tests {
 
     #[test]
     fn stale_preview_generation_is_ignored() {
-        let mut app =
-            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, true);
+        let mut app = App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, true);
         app.preview_selected_path = Some("/a".to_string());
         app.preview_generation = 2;
 
@@ -1856,8 +1871,7 @@ mod tests {
     #[test]
     fn preview_cache_hit_avoids_worker_request() {
         let now = Instant::now();
-        let mut app =
-            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, true);
+        let mut app = App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, true);
         app.insert_preview_cache("/a".to_string(), preview_data(&["cached"]));
 
         app.update_preview(now + PREVIEW_DEBOUNCE + Duration::from_millis(1));
@@ -1899,20 +1913,24 @@ mod tests {
 
     #[test]
     fn f2_toggles_preview_visibility() {
-        let mut app =
-            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, true);
+        let mut app = App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, true);
 
         assert!(app.preview_visible);
-        assert_eq!(handle_key(&mut app, KeyCode::F(2), KeyModifiers::NONE, None), None);
+        assert_eq!(
+            handle_key(&mut app, KeyCode::F(2), KeyModifiers::NONE, None),
+            None
+        );
         assert!(!app.preview_visible);
-        assert_eq!(handle_key(&mut app, KeyCode::F(2), KeyModifiers::NONE, None), None);
+        assert_eq!(
+            handle_key(&mut app, KeyCode::F(2), KeyModifiers::NONE, None),
+            None
+        );
         assert!(app.preview_visible);
     }
 
     #[test]
     fn preview_layout_respects_width_and_visibility() {
-        let mut app =
-            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, true);
+        let mut app = App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, true);
 
         assert!(!preview_layout_enabled(&app, PREVIEW_MIN_WIDTH - 1));
         assert!(preview_layout_enabled(&app, PREVIEW_MIN_WIDTH));

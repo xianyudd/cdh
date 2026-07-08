@@ -1221,7 +1221,12 @@ mod tests {
         writeln!(rf, "{}\t{}", now - 1000, other.display()).unwrap();
         fs::write(
             &uniq,
-            format!("{}\n{}\n{}\n", pwd.display(), other.display(), target.display()),
+            format!(
+                "{}\n{}\n{}\n",
+                pwd.display(),
+                other.display(),
+                target.display()
+            ),
         )
         .unwrap();
 
@@ -1241,13 +1246,11 @@ mod tests {
         assert!(!out.is_empty());
         for item in &out {
             let b = &item.breakdown;
-            for value in [
-                b.frecency_norm,
-                b.recency_norm,
-                b.context_norm,
-                b.uniq_norm,
-            ] {
-                assert!((0.0..=1.0).contains(&value), "breakdown out of range: {value}");
+            for value in [b.frecency_norm, b.recency_norm, b.context_norm, b.uniq_norm] {
+                assert!(
+                    (0.0..=1.0).contains(&value),
+                    "breakdown out of range: {value}"
+                );
             }
             let expected = opt.w_frecency * b.frecency_norm
                 + opt.w_recency * b.recency_norm
@@ -1275,7 +1278,11 @@ mod tests {
         let mut rf = File::create(&raw).unwrap();
         writeln!(rf, "1000\t{}", missing.display()).unwrap();
         writeln!(rf, "1001\t{}", exists.display()).unwrap();
-        fs::write(&uniq, format!("{}\n{}\n", missing.display(), exists.display())).unwrap();
+        fs::write(
+            &uniq,
+            format!("{}\n{}\n", missing.display(), exists.display()),
+        )
+        .unwrap();
 
         let filtered = recommend_with_now(
             &RecommendOpt {
