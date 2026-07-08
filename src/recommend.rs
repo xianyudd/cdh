@@ -43,11 +43,21 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
+/// 归一化到 [0,1] 的评分子信号。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoreBreakdown {
+    pub frecency_norm: f64,
+    pub recency_norm: f64,
+    pub context_norm: f64,
+    pub uniq_norm: f64,
+}
+
 /// 推荐结果
 #[derive(Debug, Clone)]
 pub struct Recommendation {
     pub path: String,
     pub score: f64, // 融合后的最终分（0~1）
+    pub breakdown: ScoreBreakdown,
 }
 
 /// 融合推荐的配置
@@ -118,6 +128,7 @@ impl Default for RecommendOpt {
 struct RankedItem {
     path: String,
     final_score: f64,
+    breakdown: ScoreBreakdown,
     frecency_score: f64,
     match_quality: f64,
 }
@@ -215,6 +226,12 @@ pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
             items.push(RankedItem {
                 path: dir,
                 final_score,
+                breakdown: ScoreBreakdown {
+                    frecency_norm: fz,
+                    recency_norm: rz,
+                    context_norm: cz,
+                    uniq_norm: uz,
+                },
                 frecency_score: fz,
                 match_quality,
             });
@@ -241,6 +258,7 @@ pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
     let iter = items.into_iter().map(|item| Recommendation {
         path: item.path,
         score: item.final_score,
+        breakdown: item.breakdown,
     });
     match opt.limit {
         Some(limit) => iter.take(limit).collect(),
@@ -1170,5 +1188,66 @@ mod tests {
         assert!(!is_direct_child("/a/b/c", "/a")); // 孙目录不算
         assert!(!is_direct_child("/a", "/a")); // 自身不算
         assert!(!is_direct_child("/x/y", "/a")); // 无关
+    }
+
+    #[test]
+    fn recommendation_score_matches_weighted_breakdown() {
+        let (raw, uniq, base) = setup("breakdown_fusion");
+        let pwd = base.join("pwd");
+        let target = base.join("target");
+        let other = base.join("other");
+        for dir in [&pwd, &target, &other] {
+            fs::create_dir_all(dir).unwrap();
+        }
+
+        let now = 1_000_000i64;
+        let mut rf = File::create(&raw).unwrap();
+        writeln!(rf, "{}\t{}", now - 4000, pwd.display()).unwrap();
+        writeln!(rf, "{}\t{}", now - 3900, target.display()).unwrap();
+        writeln!(rf, "{}\t{}", now - 1000, other.display()).unwrap();
+        fs::write(
+            &uniq,
+            format!("{}\n{}\n{}\n", pwd.display(), other.display(), target.display()),
+        )
+        .unwrap();
+
+        let opt = RecommendOpt {
+            raw,
+            uniq,
+            check_dir: true,
+            pwd: Some(pwd.to_string_lossy().into_owned()),
+            w_frecency: 0.25,
+            w_recency: 0.35,
+            w_context: 0.30,
+            w_uniq: 0.10,
+            ..RecommendOpt::default()
+        };
+
+        let out = recommend_with_now(&opt, now);
+        assert!(!out.is_empty());
+        for item in &out {
+            let b = &item.breakdown;
+            for value in [
+                b.frecency_norm,
+                b.recency_norm,
+                b.context_norm,
+                b.uniq_norm,
+            ] {
+                assert!((0.0..=1.0).contains(&value), "breakdown out of range: {value}");
+            }
+            let expected = opt.w_frecency * b.frecency_norm
+                + opt.w_recency * b.recency_norm
+                + opt.w_context * b.context_norm
+                + opt.w_uniq * b.uniq_norm;
+            assert!(
+                (item.score - expected).abs() < 1e-12,
+                "score changed: got {}, expected {} for {}",
+                item.score,
+                expected,
+                item.path
+            );
+        }
+
+        let _ = fs::remove_dir_all(base);
     }
 }

@@ -13,4 +13,4 @@ pub use app::AppContext;
 pub use config::EffectiveConfig;
 pub use frecency::{Frecency, FrecencyIndex, FrecencyState};
 pub use paths::Paths;
-pub use recommend::{recommend, recommend_paths, RecommendOpt, Recommendation};
+pub use recommend::{recommend, recommend_paths, RecommendOpt, Recommendation, ScoreBreakdown};

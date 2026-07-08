@@ -118,22 +118,21 @@ impl Theme {
             .fg(self.c(0x50, 0xfa, 0x7b))
             .add_modifier(Modifier::BOLD)
     }
-    /// 根据分数在青(低)→紫(高)之间取渐变色。
-    fn score_color(&self, t: f32) -> Color {
-        let t = t.clamp(0.0, 1.0);
-        // 青 (80,250,220) → 紫 (189,147,249)
-        let r = lerp(0x50 as f32, 0xbd as f32, t) as u8;
-        let g = lerp(0xfa as f32, 0x93 as f32, t) as u8;
-        let b = lerp(0xdc as f32, 0xf9 as f32, t) as u8;
-        self.c(r, g, b)
-    }
     fn accent(&self) -> Color {
         self.c(0xbd, 0x93, 0xf9)
     }
-}
-
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
+    fn score_frecency(&self) -> Color {
+        self.c(0x50, 0xfa, 0xdc)
+    }
+    fn score_recency(&self) -> Color {
+        self.c(0x66, 0x99, 0xff)
+    }
+    fn score_context(&self) -> Color {
+        self.c(0xbd, 0x93, 0xf9)
+    }
+    fn score_uniq(&self) -> Color {
+        self.c(0x4a, 0x55, 0x78)
+    }
 }
 
 // ---------------- 对外 API ----------------
@@ -186,6 +185,8 @@ struct Candidate {
     display: String,
     /// 归一化分数（0~1）。
     score: f32,
+    /// 归一化子信号：frecency / recency / context / uniq。
+    breakdown: [f32; 4],
 }
 
 fn build_candidates(items: &[Recommendation]) -> Vec<Candidate> {
@@ -204,6 +205,12 @@ fn build_candidates(items: &[Recommendation]) -> Vec<Candidate> {
                 raw: r.path.clone(),
                 display,
                 score: r.score.clamp(0.0, 1.0) as f32,
+                breakdown: [
+                    r.breakdown.frecency_norm.clamp(0.0, 1.0) as f32,
+                    r.breakdown.recency_norm.clamp(0.0, 1.0) as f32,
+                    r.breakdown.context_norm.clamp(0.0, 1.0) as f32,
+                    r.breakdown.uniq_norm.clamp(0.0, 1.0) as f32,
+                ],
             }
         })
         .collect()
@@ -286,9 +293,9 @@ struct App {
     selected: usize, // matches 内下标
     offset: usize,   // 列表滚动偏移
     // 动画状态
-    anim_cursor: f32,      // 平滑高亮行（浮点）
-    anim_scores: Vec<f32>, // 每个原始候选当前分数条填充（0~1）
-    fade: f32,             // 打开淡入（0→1）
+    anim_cursor: f32,           // 平滑高亮行（浮点）
+    anim_scores: Vec<[f32; 4]>, // 每个原始候选当前子信号填充（0~1）
+    fade: f32,                  // 打开淡入（0→1）
     show_help: bool,
     last_click: Option<(usize, Instant)>,
     /// 上一帧实际渲染的列表区域（供鼠标命中测试对齐真实布局）。
@@ -307,7 +314,7 @@ impl App {
             selected: 0,
             offset: 0,
             anim_cursor: 0.0,
-            anim_scores: vec![0.0; n],
+            anim_scores: vec![[0.0; 4]; n],
             fade: if anim_enabled() { 0.0 } else { 1.0 },
             show_help: false,
             last_click: None,
@@ -362,7 +369,7 @@ impl App {
         if !anim_enabled() {
             // 无动画：分数条直接到位、无淡入。
             for m in &self.matches {
-                self.anim_scores[m.idx] = self.cands[m.idx].score;
+                self.anim_scores[m.idx] = self.cands[m.idx].breakdown;
             }
             self.anim_cursor = self.selected as f32;
             return false;
@@ -388,13 +395,15 @@ impl App {
 
         // 分数条增长（仅当前可见匹配项参与，避免整表抖动）
         for m in &self.matches {
-            let tgt = self.cands[m.idx].score * self.fade;
+            let tgt = self.cands[m.idx].breakdown.map(|value| value * self.fade);
             let cur = &mut self.anim_scores[m.idx];
-            if (*cur - tgt).abs() > ANIM_EPS {
-                *cur += (tgt - *cur) * ANIM_SPEED;
-                busy = true;
-            } else {
-                *cur = tgt;
+            for (current, target) in cur.iter_mut().zip(tgt) {
+                if (*current - target).abs() > ANIM_EPS {
+                    *current += (target - *current) * ANIM_SPEED;
+                    busy = true;
+                } else {
+                    *current = target;
+                }
             }
         }
         busy
@@ -732,22 +741,60 @@ fn path_spans<'a>(
     spans
 }
 
-/// 分数条：`filled` 是动画中的当前填充（0~1），`score` 是目标分（决定颜色深浅）。
-fn score_bar_spans(filled: f32, score: f32, theme: &Theme) -> Vec<Span<'static>> {
+/// 分数条：`filled` 是动画中的当前子信号，`score` 是融合目标分（右侧数字）。
+fn score_bar_spans(filled: [f32; 4], score: f32, theme: &Theme) -> Vec<Span<'static>> {
     let cells = SCORE_BAR_CELLS;
-    let filled_cells = (filled * cells as f32).round() as usize;
+    let segment_cells = score_segment_cells(filled, cells);
+    let colors = [
+        theme.score_frecency(),
+        theme.score_recency(),
+        theme.score_context(),
+        theme.score_uniq(),
+    ];
     let mut spans = Vec::with_capacity(cells + 1);
-    for i in 0..cells {
-        let t = (i as f32 + 0.5) / cells as f32;
-        if i < filled_cells {
-            spans.push(Span::styled("▰", Style::default().fg(theme.score_color(t))));
-        } else {
-            spans.push(Span::styled("▱", theme.dim()));
+    for (idx, &count) in segment_cells.iter().enumerate() {
+        for _ in 0..count {
+            spans.push(Span::styled("▰", Style::default().fg(colors[idx])));
         }
+    }
+    while spans.len() < cells {
+        spans.push(Span::styled("▱", theme.dim()));
     }
     let pct = (score * 100.0).round() as u32;
     spans.push(Span::styled(format!(" {pct:>2}"), theme.dim()));
     spans
+}
+
+fn score_segment_cells(values: [f32; 4], cells: usize) -> [usize; 4] {
+    let values = values.map(|value| value.clamp(0.0, 1.0));
+    let total: f32 = values.iter().sum();
+    if total <= f32::EPSILON || cells == 0 {
+        return [0; 4];
+    }
+
+    let filled = ((total / values.len() as f32) * cells as f32).round() as usize;
+    let filled = filled.min(cells);
+    if filled == 0 {
+        return [0; 4];
+    }
+
+    let mut counts = [0usize; 4];
+    let mut remainders = [(0.0f32, 0usize); 4];
+    let mut used = 0usize;
+    for (idx, value) in values.iter().enumerate() {
+        let raw = *value / total * filled as f32;
+        let whole = raw.floor() as usize;
+        counts[idx] = whole;
+        remainders[idx] = (raw - whole as f32, idx);
+        used += whole;
+    }
+
+    remainders.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    for &(_, idx) in remainders.iter().take(filled.saturating_sub(used)) {
+        counts[idx] += 1;
+    }
+
+    counts
 }
 
 fn render_input(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
@@ -803,6 +850,7 @@ fn render_help(f: &mut Frame, theme: &Theme, full: Rect) {
         help_row("Esc", "清空搜索 / 退出", theme),
         help_row("Ctrl+C / Ctrl+G", "退出", theme),
         help_row("鼠标", "单击选中 · 双击跳转 · 滚轮滚动", theme),
+        help_row("分数条", "■青=常去 ■蓝=最近 ■紫=当前目录相关 ■灰=去重排名", theme),
         Line::raw(""),
         Line::from(Span::styled(" 按任意键关闭", theme.dim())),
     ];
@@ -908,6 +956,12 @@ mod tests {
             .map(|(p, s)| Recommendation {
                 path: p.to_string(),
                 score: *s,
+                breakdown: crate::recommend::ScoreBreakdown {
+                    frecency_norm: *s,
+                    recency_norm: *s,
+                    context_norm: *s,
+                    uniq_norm: *s,
+                },
             })
             .collect()
     }
@@ -977,5 +1031,23 @@ mod tests {
         assert_eq!(app.selected, 1); // 环绕到末尾
         app.move_by(1);
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn build_candidates_clamps_score_breakdown() {
+        let items = vec![Recommendation {
+            path: "/wide".to_string(),
+            score: 1.5,
+            breakdown: crate::recommend::ScoreBreakdown {
+                frecency_norm: -1.0,
+                recency_norm: 0.25,
+                context_norm: 2.0,
+                uniq_norm: 0.75,
+            },
+        }];
+
+        let cands = build_candidates(&items);
+        assert_eq!(cands[0].score, 1.0);
+        assert_eq!(cands[0].breakdown, [0.0, 0.25, 1.0, 0.75]);
     }
 }
