@@ -8,8 +8,13 @@
 //!
 //! 兼容：非交互（无 TTY）直接返回第一项；`CDH_COLOR=0` 关色，`CDH_MOUSE=0` 关鼠标，`CDH_ANIM=0` 关动画。
 
+use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -48,6 +53,9 @@ const ANIM_EPS: f32 = 0.004; // 动画收敛阈值
 const SCORE_BAR_CELLS: usize = 8; // 分数条格子数
 const DOUBLE_CLICK_MS: u128 = 300;
 const MIN_HEIGHT: u16 = 6;
+const PREVIEW_ENTRY_LIMIT: usize = 24;
+const PREVIEW_CACHE_LIMIT: usize = 50;
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(100);
 
 // ---------------- 环境开关 ----------------
 fn env_flag(key: &str, default: bool) -> bool {
@@ -64,6 +72,150 @@ fn mouse_enabled() -> bool {
 }
 fn anim_enabled() -> bool {
     color_enabled() && env_flag("CDH_ANIM", true)
+}
+fn preview_enabled() -> bool {
+    env_flag("CDH_PREVIEW", true)
+}
+
+// ---------------- 预览数据 ----------------
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitInfo {
+    branch: String,
+    dirty: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewEntry {
+    name: String,
+    is_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewData {
+    git: Option<GitInfo>,
+    entries: Vec<PreviewEntry>,
+    has_more_entries: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreviewOutcome {
+    Data(PreviewData),
+    Error(String),
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewRequest {
+    path: String,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewResponse {
+    path: String,
+    generation: u64,
+    outcome: PreviewOutcome,
+}
+
+struct PreviewWorker {
+    requests: mpsc::Sender<PreviewRequest>,
+    responses: mpsc::Receiver<PreviewResponse>,
+}
+
+fn start_preview_worker() -> PreviewWorker {
+    let (request_tx, request_rx) = mpsc::channel::<PreviewRequest>();
+    let (response_tx, response_rx) = mpsc::channel::<PreviewResponse>();
+    thread::spawn(move || {
+        while let Ok(req) = request_rx.recv() {
+            let outcome = load_preview(&req.path);
+            let response = PreviewResponse {
+                path: req.path,
+                generation: req.generation,
+                outcome,
+            };
+            if response_tx.send(response).is_err() {
+                break;
+            }
+        }
+    });
+    PreviewWorker {
+        requests: request_tx,
+        responses: response_rx,
+    }
+}
+
+fn load_preview(path: &str) -> PreviewOutcome {
+    let path_ref = Path::new(path);
+    if !path_ref.is_dir() {
+        return PreviewOutcome::Missing;
+    }
+
+    match read_preview_entries(path_ref) {
+        Ok((entries, has_more_entries)) => PreviewOutcome::Data(PreviewData {
+            git: read_git_info(path_ref),
+            entries,
+            has_more_entries,
+        }),
+        Err(err) => PreviewOutcome::Error(preview_error_message(&err)),
+    }
+}
+
+fn read_preview_entries(path: &Path) -> io::Result<(Vec<PreviewEntry>, bool)> {
+    let mut entries = Vec::with_capacity(PREVIEW_ENTRY_LIMIT);
+    let mut has_more_entries = false;
+    for entry_result in fs::read_dir(path)?.take(PREVIEW_ENTRY_LIMIT + 1) {
+        let entry = entry_result?;
+        if entries.len() == PREVIEW_ENTRY_LIMIT {
+            has_more_entries = true;
+            break;
+        }
+        let file_type = entry.file_type()?;
+        entries.push(PreviewEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir: file_type.is_dir(),
+        });
+    }
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok((entries, has_more_entries))
+}
+
+fn read_git_info(path: &Path) -> Option<GitInfo> {
+    let git_dir = find_git_dir(path)?;
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let branch = parse_git_head_branch(&head)?;
+    Some(GitInfo {
+        branch,
+        dirty: None,
+    })
+}
+
+fn find_git_dir(start: &Path) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        let git = ancestor.join(".git");
+        if git.is_dir() {
+            return Some(git);
+        }
+    }
+    None
+}
+
+fn parse_git_head_branch(head: &str) -> Option<String> {
+    let head = head.trim();
+    head.strip_prefix("ref: refs/heads/")
+        .map(|branch| branch.to_string())
+}
+
+fn preview_error_message(err: &io::Error) -> String {
+    match err.kind() {
+        io::ErrorKind::PermissionDenied => "权限不足".to_string(),
+        io::ErrorKind::NotFound => "目录已不存在".to_string(),
+        _ => err.to_string(),
+    }
 }
 
 // ---------------- 霓虹主题 ----------------
@@ -324,12 +476,29 @@ struct App {
     anim_scores: Vec<[f32; 4]>, // 每个原始候选当前子信号填充（0~1）
     fade: f32,                  // 打开淡入（0→1）
     mode: Mode,
+    preview_worker: Option<PreviewWorker>,
+    preview_cache: HashMap<String, PreviewOutcome>,
+    preview_cache_order: VecDeque<String>,
+    preview_generation: u64,
+    preview_pending: Option<(String, Instant)>,
+    preview_loading: Option<String>,
+    preview_current: Option<(String, PreviewOutcome)>,
+    preview_selected_path: Option<String>,
     last_click: Option<(usize, Instant)>,
     /// 上一帧实际渲染的列表区域（供鼠标命中测试对齐真实布局）。
     last_list_area: std::cell::Cell<Rect>,
 }
 impl App {
     fn new(cands: Vec<Candidate>) -> Self {
+        let preview_worker = if preview_enabled() {
+            Some(start_preview_worker())
+        } else {
+            None
+        };
+        Self::with_preview_worker(cands, preview_worker)
+    }
+
+    fn with_preview_worker(cands: Vec<Candidate>, preview_worker: Option<PreviewWorker>) -> Self {
         let mut filter = Filter::new();
         let matches = filter.run(&cands, "");
         let n = cands.len();
@@ -344,6 +513,14 @@ impl App {
             anim_scores: vec![[0.0; 4]; n],
             fade: if anim_enabled() { 0.0 } else { 1.0 },
             mode: Mode::Normal,
+            preview_worker,
+            preview_cache: HashMap::new(),
+            preview_cache_order: VecDeque::new(),
+            preview_generation: 0,
+            preview_pending: None,
+            preview_loading: None,
+            preview_current: None,
+            preview_selected_path: None,
             last_click: None,
             last_list_area: std::cell::Cell::new(Rect::new(0, 0, 0, 0)),
         }
@@ -395,6 +572,7 @@ impl App {
         if !self.matches.is_empty() {
             self.selected = self.selected.min(self.matches.len() - 1);
         }
+        self.preview_selected_path = None;
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -455,6 +633,117 @@ impl App {
         }
         busy
     }
+
+    fn update_preview(&mut self, now: Instant) {
+        self.poll_preview_results();
+        self.track_preview_selection(now);
+        self.maybe_send_preview_request(now);
+    }
+
+    fn track_preview_selection(&mut self, now: Instant) {
+        let selected = self.selected_candidate().map(|cand| (cand.raw.clone(), cand.exists));
+        let selected_path = selected.as_ref().map(|(path, _)| path.clone());
+        if self.preview_selected_path == selected_path {
+            return;
+        }
+        self.preview_selected_path = selected_path.clone();
+        self.preview_pending = None;
+        self.preview_loading = None;
+
+        let Some((path, exists)) = selected else {
+            self.preview_current = None;
+            return;
+        };
+
+        if !exists {
+            self.preview_current = Some((path, PreviewOutcome::Missing));
+            return;
+        }
+
+        if let Some(cached) = self.preview_cache.get(&path).cloned() {
+            self.preview_current = Some((path, cached));
+        } else {
+            self.preview_current = None;
+            self.preview_pending = Some((path, now));
+        }
+    }
+
+    fn maybe_send_preview_request(&mut self, now: Instant) {
+        let Some((path, changed_at)) = self.preview_pending.clone() else {
+            return;
+        };
+        if now.duration_since(changed_at) < PREVIEW_DEBOUNCE {
+            return;
+        }
+        self.preview_pending = None;
+        if self.preview_cache.contains_key(&path) {
+            return;
+        }
+        let Some(worker) = &self.preview_worker else {
+            self.preview_current = Some((path, PreviewOutcome::Error("预览功能不可用".to_string())));
+            return;
+        };
+
+        self.preview_generation = self.preview_generation.saturating_add(1);
+        let generation = self.preview_generation;
+        let request = PreviewRequest {
+            path: path.clone(),
+            generation,
+        };
+        match worker.requests.send(request) {
+            Ok(()) => self.preview_loading = Some(path),
+            Err(_) => {
+                self.preview_worker = None;
+                self.preview_loading = None;
+                self.preview_current =
+                    Some((path, PreviewOutcome::Error("预览功能不可用".to_string())));
+            }
+        }
+    }
+
+    fn poll_preview_results(&mut self) {
+        let mut responses = Vec::new();
+        if let Some(worker) = &self.preview_worker {
+            loop {
+                match worker.responses.try_recv() {
+                    Ok(response) => responses.push(response),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.preview_worker = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for response in responses {
+            self.accept_preview_response(response);
+        }
+    }
+
+    fn accept_preview_response(&mut self, response: PreviewResponse) {
+        if response.generation != self.preview_generation {
+            return;
+        }
+        if self.preview_selected_path.as_deref() != Some(response.path.as_str()) {
+            return;
+        }
+        self.insert_preview_cache(response.path.clone(), response.outcome.clone());
+        self.preview_loading = None;
+        self.preview_current = Some((response.path, response.outcome));
+    }
+
+    fn insert_preview_cache(&mut self, path: String, outcome: PreviewOutcome) {
+        if !self.preview_cache.contains_key(&path) {
+            self.preview_cache_order.push_back(path.clone());
+        }
+        self.preview_cache.insert(path, outcome);
+        while self.preview_cache_order.len() > PREVIEW_CACHE_LIMIT {
+            if let Some(old) = self.preview_cache_order.pop_front() {
+                self.preview_cache.remove(&old);
+            }
+        }
+    }
 }
 
 // ---------------- 主循环 ----------------
@@ -477,6 +766,7 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
         }
 
         let busy = app.tick_anim();
+        app.update_preview(Instant::now());
         terminal.draw(|f| draw(f, &app, &theme))?;
         // draw 记录了真实列表高度；据此收敛滚动偏移，供下一帧与鼠标命中共用。
         app.sync_scroll(app.last_list_area.get().height as usize);
@@ -1394,5 +1684,78 @@ mod tests {
         assert_eq!(fs::read_to_string(&ctx.paths.history_uniq).unwrap(), "");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn preview_data(names: &[&str]) -> PreviewOutcome {
+        PreviewOutcome::Data(PreviewData {
+            git: None,
+            entries: names
+                .iter()
+                .map(|name| PreviewEntry {
+                    name: (*name).to_string(),
+                    is_dir: false,
+                })
+                .collect(),
+            has_more_entries: false,
+        })
+    }
+
+    #[test]
+    fn stale_preview_generation_is_ignored() {
+        let mut app = App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None);
+        app.preview_selected_path = Some("/a".to_string());
+        app.preview_generation = 2;
+
+        app.accept_preview_response(PreviewResponse {
+            path: "/a".to_string(),
+            generation: 1,
+            outcome: preview_data(&["old"]),
+        });
+
+        assert!(app.preview_current.is_none());
+        assert!(app.preview_cache.is_empty());
+    }
+
+    #[test]
+    fn preview_cache_hit_avoids_worker_request() {
+        let now = Instant::now();
+        let mut app = App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None);
+        app.insert_preview_cache("/a".to_string(), preview_data(&["cached"]));
+
+        app.update_preview(now + PREVIEW_DEBOUNCE + Duration::from_millis(1));
+
+        assert_eq!(app.preview_generation, 0);
+        assert!(app.preview_pending.is_none());
+        assert!(app.preview_loading.is_none());
+        assert_eq!(
+            app.preview_current,
+            Some(("/a".to_string(), preview_data(&["cached"])))
+        );
+    }
+
+    #[test]
+    fn preview_worker_disconnect_is_reported_without_panic() {
+        let (request_tx, request_rx) = mpsc::channel::<PreviewRequest>();
+        drop(request_rx);
+        let (_response_tx, response_rx) = mpsc::channel::<PreviewResponse>();
+        let worker = PreviewWorker {
+            requests: request_tx,
+            responses: response_rx,
+        };
+        let now = Instant::now();
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), Some(worker));
+
+        app.update_preview(now);
+        app.update_preview(now + PREVIEW_DEBOUNCE + Duration::from_millis(1));
+
+        assert!(app.preview_worker.is_none());
+        assert_eq!(
+            app.preview_current,
+            Some((
+                "/a".to_string(),
+                PreviewOutcome::Error("预览功能不可用".to_string())
+            ))
+        );
     }
 }
