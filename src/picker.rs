@@ -56,6 +56,7 @@ const MIN_HEIGHT: u16 = 6;
 const PREVIEW_ENTRY_LIMIT: usize = 24;
 const PREVIEW_CACHE_LIMIT: usize = 50;
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(100);
+const PREVIEW_MIN_WIDTH: u16 = 70;
 
 // ---------------- 环境开关 ----------------
 fn env_flag(key: &str, default: bool) -> bool {
@@ -476,6 +477,7 @@ struct App {
     anim_scores: Vec<[f32; 4]>, // 每个原始候选当前子信号填充（0~1）
     fade: f32,                  // 打开淡入（0→1）
     mode: Mode,
+    preview_visible: bool,
     preview_worker: Option<PreviewWorker>,
     preview_cache: HashMap<String, PreviewOutcome>,
     preview_cache_order: VecDeque<String>,
@@ -490,15 +492,20 @@ struct App {
 }
 impl App {
     fn new(cands: Vec<Candidate>) -> Self {
-        let preview_worker = if preview_enabled() {
+        let preview_visible = preview_enabled();
+        let preview_worker = if preview_visible {
             Some(start_preview_worker())
         } else {
             None
         };
-        Self::with_preview_worker(cands, preview_worker)
+        Self::with_preview_worker(cands, preview_worker, preview_visible)
     }
 
-    fn with_preview_worker(cands: Vec<Candidate>, preview_worker: Option<PreviewWorker>) -> Self {
+    fn with_preview_worker(
+        cands: Vec<Candidate>,
+        preview_worker: Option<PreviewWorker>,
+        preview_visible: bool,
+    ) -> Self {
         let mut filter = Filter::new();
         let matches = filter.run(&cands, "");
         let n = cands.len();
@@ -513,6 +520,7 @@ impl App {
             anim_scores: vec![[0.0; 4]; n],
             fade: if anim_enabled() { 0.0 } else { 1.0 },
             mode: Mode::Normal,
+            preview_visible,
             preview_worker,
             preview_cache: HashMap::new(),
             preview_cache_order: VecDeque::new(),
@@ -635,9 +643,23 @@ impl App {
     }
 
     fn update_preview(&mut self, now: Instant) {
+        if !self.preview_visible {
+            return;
+        }
         self.poll_preview_results();
         self.track_preview_selection(now);
         self.maybe_send_preview_request(now);
+    }
+
+    fn toggle_preview(&mut self) {
+        self.preview_visible = !self.preview_visible;
+        if self.preview_visible && self.preview_worker.is_none() {
+            self.preview_worker = Some(start_preview_worker());
+        }
+        self.preview_selected_path = None;
+        self.preview_pending = None;
+        self.preview_loading = None;
+        self.preview_current = None;
     }
 
     fn track_preview_selection(&mut self, now: Instant) {
@@ -904,6 +926,7 @@ fn handle_key_normal(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option
             app.recompute();
         }
         KeyCode::F(1) => app.mode = Mode::Help,
+        KeyCode::F(2) => app.toggle_preview(),
         KeyCode::Char(c) if !ctrl && !c.is_control() => {
             app.query.push(c);
             app.recompute();
@@ -977,12 +1000,20 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     let inner = block.inner(full);
     f.render_widget(block, full);
 
-    // 内容区再切成 列表 + 输入行
+    // 内容区再切成 列表/预览 + 输入行
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
-    let list_area = chunks[0];
+    let content_area = chunks[0];
     let input_area = chunks[1];
 
-    render_list(f, app, theme, list_area);
+    f.render_widget(Clear, content_area);
+    if preview_layout_enabled(app, full.width) {
+        let columns = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(content_area);
+        render_list(f, app, theme, columns[0]);
+        render_preview(f, app, theme, columns[1]);
+    } else {
+        render_list(f, app, theme, content_area);
+    }
     render_input(f, app, theme, input_area);
 
     match app.mode {
@@ -992,6 +1023,10 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             render_confirm_delete(f, app, theme, full, candidate_idx);
         }
     }
+}
+
+fn preview_layout_enabled(app: &App, width: u16) -> bool {
+    app.preview_visible && width >= PREVIEW_MIN_WIDTH
 }
 
 fn render_list(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
@@ -1220,6 +1255,106 @@ fn score_segment_cells(values: [f32; 4], cells: usize) -> [usize; 4] {
     counts
 }
 
+fn render_preview(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(theme.border())
+        .padding(Padding::new(1, 0, 0, 0));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = Vec::new();
+    let col_w = inner.width.saturating_sub(1) as usize;
+    let Some(cand) = app.selected_candidate() else {
+        lines.push(Line::from(Span::styled("无选中项", theme.dim())));
+        f.render_widget(Paragraph::new(lines), inner);
+        return;
+    };
+
+    lines.push(Line::from(Span::styled(
+        trim_middle(&cand.raw, col_w),
+        theme.path().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::raw(""));
+
+    let outcome = preview_outcome_for_selected(app, cand);
+    match outcome {
+        PreviewPanelOutcome::Loading => {
+            lines.push(Line::from(Span::styled("加载中…", theme.dim())));
+        }
+        PreviewPanelOutcome::Missing => {
+            lines.push(Line::from(Span::styled("目录已不存在", theme.dim())));
+        }
+        PreviewPanelOutcome::Outcome(PreviewOutcome::Missing) => {
+            lines.push(Line::from(Span::styled("目录已不存在", theme.dim())));
+        }
+        PreviewPanelOutcome::Outcome(PreviewOutcome::Error(message)) => {
+            lines.push(Line::from(vec![
+                Span::styled("无法读取: ", theme.dim()),
+                Span::styled(trim_middle(message, col_w.saturating_sub(10)), theme.path()),
+            ]));
+        }
+        PreviewPanelOutcome::Outcome(PreviewOutcome::Data(data)) => {
+            if let Some(git) = &data.git {
+                let dot_style = if git.dirty == Some(true) {
+                    Style::default().fg(theme.accent())
+                } else {
+                    theme.match_hl()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("● ", dot_style),
+                    Span::styled(trim_middle(&git.branch, col_w.saturating_sub(2)), theme.path()),
+                ]));
+                lines.push(Line::raw(""));
+            }
+            if data.entries.is_empty() {
+                lines.push(Line::from(Span::styled("空目录", theme.dim())));
+            } else {
+                for entry in &data.entries {
+                    let icon = if entry.is_dir { "▸ " } else { "· " };
+                    let name_w = col_w.saturating_sub(2);
+                    lines.push(Line::from(vec![
+                        Span::styled(icon, theme.dim()),
+                        Span::styled(trim_middle(&entry.name, name_w), theme.path()),
+                    ]));
+                }
+                if data.has_more_entries {
+                    lines.push(Line::from(Span::styled("… 还有更多项", theme.dim())));
+                }
+            }
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+enum PreviewPanelOutcome<'a> {
+    Loading,
+    Missing,
+    Outcome(&'a PreviewOutcome),
+}
+
+fn preview_outcome_for_selected<'a>(app: &'a App, cand: &Candidate) -> PreviewPanelOutcome<'a> {
+    if !cand.exists {
+        return PreviewPanelOutcome::Missing;
+    }
+    if app.preview_loading.as_deref() == Some(cand.raw.as_str())
+        || app
+            .preview_pending
+            .as_ref()
+            .map(|(path, _)| path == &cand.raw)
+            .unwrap_or(false)
+    {
+        return PreviewPanelOutcome::Loading;
+    }
+    if let Some((path, outcome)) = &app.preview_current {
+        if path == &cand.raw {
+            return PreviewPanelOutcome::Outcome(outcome);
+        }
+    }
+    PreviewPanelOutcome::Loading
+}
+
 fn render_input(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let caret = "▌";
     let prompt_style = Style::default()
@@ -1241,7 +1376,7 @@ fn render_input(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
-    let full_hint = "↑↓ 选择 · ⏎ 跳转 · esc 退出 · F1 帮助";
+    let full_hint = "↑↓ 选择 · ⏎ 跳转 · F2 预览 · F1 帮助";
     let short_hint = "⏎ 跳转 · esc 退出";
     let avail = (area.width as usize).saturating_sub(used).saturating_sub(1);
     let hint = if UnicodeWidthStr::width(full_hint) <= avail {
@@ -1271,6 +1406,7 @@ fn render_help(f: &mut Frame, theme: &Theme, full: Rect) {
         help_row("任意字符", "模糊搜索过滤", theme),
         help_row("Enter / Tab", "跳转到选中目录", theme),
         help_row("Ctrl+D", "删除选中的失效目录记录", theme),
+        help_row("F2", "显示 / 隐藏预览面板", theme),
         help_row("Esc", "清空搜索 / 退出", theme),
         help_row("Ctrl+C / Ctrl+G", "退出", theme),
         help_row("鼠标", "单击选中 · 双击跳转 · 滚轮滚动", theme),
@@ -1702,7 +1838,8 @@ mod tests {
 
     #[test]
     fn stale_preview_generation_is_ignored() {
-        let mut app = App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None);
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, true);
         app.preview_selected_path = Some("/a".to_string());
         app.preview_generation = 2;
 
@@ -1719,7 +1856,8 @@ mod tests {
     #[test]
     fn preview_cache_hit_avoids_worker_request() {
         let now = Instant::now();
-        let mut app = App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None);
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, true);
         app.insert_preview_cache("/a".to_string(), preview_data(&["cached"]));
 
         app.update_preview(now + PREVIEW_DEBOUNCE + Duration::from_millis(1));
@@ -1744,7 +1882,7 @@ mod tests {
         };
         let now = Instant::now();
         let mut app =
-            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), Some(worker));
+            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), Some(worker), true);
 
         app.update_preview(now);
         app.update_preview(now + PREVIEW_DEBOUNCE + Duration::from_millis(1));
@@ -1757,5 +1895,28 @@ mod tests {
                 PreviewOutcome::Error("预览功能不可用".to_string())
             ))
         );
+    }
+
+    #[test]
+    fn f2_toggles_preview_visibility() {
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, true);
+
+        assert!(app.preview_visible);
+        assert_eq!(handle_key(&mut app, KeyCode::F(2), KeyModifiers::NONE, None), None);
+        assert!(!app.preview_visible);
+        assert_eq!(handle_key(&mut app, KeyCode::F(2), KeyModifiers::NONE, None), None);
+        assert!(app.preview_visible);
+    }
+
+    #[test]
+    fn preview_layout_respects_width_and_visibility() {
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, true);
+
+        assert!(!preview_layout_enabled(&app, PREVIEW_MIN_WIDTH - 1));
+        assert!(preview_layout_enabled(&app, PREVIEW_MIN_WIDTH));
+        app.preview_visible = false;
+        assert!(!preview_layout_enabled(&app, PREVIEW_MIN_WIDTH));
     }
 }
