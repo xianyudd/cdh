@@ -455,6 +455,7 @@ mod tests {
     use crate::{AppContext, EffectiveConfig, Paths};
     use std::env;
     use std::process;
+    use std::sync::{Arc, Barrier};
 
     fn test_config() -> EffectiveConfig {
         EffectiveConfig {
@@ -627,6 +628,52 @@ mod tests {
             read_lines(&ctx.paths.history_uniq),
             vec![keep.to_string_lossy().to_string()]
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remove_path_and_log_visit_do_not_overwrite_each_other() {
+        let (root, ctx) = make_test_ctx("remove_log_race");
+        let stale = root.join("stale");
+        let keep = root.join("keep");
+        fs::create_dir_all(&keep).unwrap();
+
+        fs::write(
+            &ctx.paths.history_raw,
+            format!("100\t{}\n", stale.display()),
+        )
+        .unwrap();
+        fs::write(&ctx.paths.history_uniq, format!("{}\n", stale.display())).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let remove_ctx = ctx.clone();
+        let remove_barrier = Arc::clone(&barrier);
+        let stale_for_remove = stale.clone();
+        let remove_thread = thread::spawn(move || {
+            remove_barrier.wait();
+            remove_path(&remove_ctx, stale_for_remove.to_str().unwrap())
+        });
+
+        let log_ctx = ctx.clone();
+        let log_barrier = Arc::clone(&barrier);
+        let keep_for_log = keep.clone();
+        let log_thread = thread::spawn(move || {
+            log_barrier.wait();
+            log_visit(&log_ctx, keep_for_log.to_str().unwrap())
+        });
+
+        remove_thread.join().unwrap().unwrap();
+        log_thread.join().unwrap().unwrap();
+
+        let keep_canon = fs::canonicalize(&keep)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let raw = fs::read_to_string(&ctx.paths.history_raw).unwrap();
+        assert!(!raw.contains(stale.to_str().unwrap()));
+        assert!(raw.contains(&keep_canon));
+        assert_eq!(read_lines(&ctx.paths.history_uniq), vec![keep_canon]);
 
         let _ = fs::remove_dir_all(root);
     }

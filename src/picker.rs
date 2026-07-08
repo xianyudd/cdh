@@ -45,7 +45,7 @@ const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(15);
 const FRAME_MS: u64 = 16; // ~60fps 动画帧
 const ANIM_SPEED: f32 = 0.28; // 缓动系数（每帧向目标靠拢的比例）
 const ANIM_EPS: f32 = 0.004; // 动画收敛阈值
-const SCORE_BAR_CELLS: usize = 5; // 分数条格子数
+const SCORE_BAR_CELLS: usize = 8; // 分数条格子数
 const DOUBLE_CLICK_MS: u128 = 300;
 const MIN_HEIGHT: u16 = 6;
 
@@ -1347,6 +1347,51 @@ mod tests {
             fs::read_to_string(&ctx.paths.history_uniq).unwrap(),
             format!("{}\n", keep.display())
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ctrl_d_can_remove_last_stale_candidate_without_invalid_selection() {
+        let (root, ctx) = test_ctx("ctrl_d_delete_last");
+        let stale = root.join("stale");
+        fs::write(
+            &ctx.paths.history_raw,
+            format!("100\t{}\n", stale.display()),
+        )
+        .unwrap();
+        fs::write(&ctx.paths.history_uniq, format!("{}\n", stale.display())).unwrap();
+
+        let items = recs_with_exists(&[(stale.to_str().unwrap(), 0.9, false)]);
+        let mut app = App::new(build_candidates(&items));
+
+        assert_eq!(
+            handle_key(
+                &mut app,
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                Some(&ctx)
+            ),
+            None
+        );
+        assert_eq!(app.mode, Mode::ConfirmDelete { candidate_idx: 0 });
+        assert_eq!(
+            handle_key(
+                &mut app,
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                Some(&ctx)
+            ),
+            None
+        );
+
+        assert!(app.cands.is_empty());
+        assert!(app.matches.is_empty());
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, Some(&ctx)), None);
+        assert_eq!(fs::read_to_string(&ctx.paths.history_raw).unwrap(), "");
+        assert_eq!(fs::read_to_string(&ctx.paths.history_uniq).unwrap(), "");
 
         let _ = fs::remove_dir_all(root);
     }
