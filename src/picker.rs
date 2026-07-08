@@ -1405,16 +1405,16 @@ fn render_help(f: &mut Frame, theme: &Theme, full: Rect) {
         help_row("Home / End", "首 / 末项", theme),
         help_row("任意字符", "模糊搜索过滤", theme),
         help_row("Enter / Tab", "跳转到选中目录", theme),
-        help_row("Ctrl+D", "删除选中的失效目录记录", theme),
-        help_row("F2", "显示 / 隐藏预览面板", theme),
+        help_row("Ctrl+D", "删除失效目录记录", theme),
+        help_row("F2", "切换预览面板", theme),
         help_row("Esc", "清空搜索 / 退出", theme),
         help_row("Ctrl+C / Ctrl+G", "退出", theme),
         help_row("鼠标", "单击选中 · 双击跳转 · 滚轮滚动", theme),
-        help_row("分数条", "■青=常去 ■蓝=最近 ■紫=当前目录相关 ■灰=去重排名", theme),
+        help_row("分数条", "青=常去 蓝=最近 紫=相关 灰=去重", theme),
         Line::raw(""),
         Line::from(Span::styled(" 按任意键关闭", theme.dim())),
     ];
-    let w = 46u16.min(full.width.saturating_sub(4));
+    let w = 64u16.min(full.width.saturating_sub(4));
     let h = (lines.len() as u16 + 2).min(full.height.saturating_sub(2));
     let area = centered(full, w, h);
     f.render_widget(Clear, area);
