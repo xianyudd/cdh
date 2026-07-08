@@ -601,8 +601,7 @@ fn render_list(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // offset 已由主循环 sync_scroll 统一维护；这里只做防御性夹取。
     let offset = app
         .offset
-        .min(app.matches.len().saturating_sub(1))
-        .min(app.matches.len().saturating_sub(height.max(1)).max(0));
+        .min(app.matches.len().saturating_sub(height.max(1)));
 
     // 三段固定布局，避免长路径把分数条挤出行外触发换行：
     //   marker(2) + 空格 + 路径列(path_w，填充/截断) + 空格 + 分数列(8)
