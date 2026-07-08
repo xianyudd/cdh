@@ -5,6 +5,8 @@ repo_root="$(git rev-parse --show-toplevel)"
 hooks_dir="$repo_root/.git/hooks"
 mkdir -p "$hooks_dir"
 
+git config --local core.hooksPath .git/hooks
+
 cat > "$hooks_dir/pre-commit" << 'EOF'
 #!/usr/bin/env bash
 repo_root="$(git rev-parse --show-toplevel)"
@@ -20,3 +22,4 @@ EOF
 chmod +x "$hooks_dir/commit-msg"
 
 echo "Installed pre-commit and commit-msg hooks."
+echo "Configured local core.hooksPath=.git/hooks."
