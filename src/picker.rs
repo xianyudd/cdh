@@ -13,6 +13,7 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -57,6 +58,7 @@ const PREVIEW_ENTRY_LIMIT: usize = 24;
 const PREVIEW_CACHE_LIMIT: usize = 50;
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(100);
 const PREVIEW_MIN_WIDTH: u16 = 70;
+const GIT_DIRTY_TIMEOUT: Duration = Duration::from_millis(300);
 
 // ---------------- 环境开关 ----------------
 fn env_flag(key: &str, default: bool) -> bool {
@@ -189,10 +191,31 @@ fn read_git_info(path: &Path) -> Option<GitInfo> {
     let git_dir = find_git_dir(path)?;
     let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let branch = parse_git_head_branch(&head)?;
-    Some(GitInfo {
-        branch,
-        dirty: None,
-    })
+    let dirty = git_dir
+        .parent()
+        .and_then(|repo_root| read_git_dirty(repo_root, GIT_DIRTY_TIMEOUT));
+    Some(GitInfo { branch, dirty })
+}
+
+fn read_git_dirty(repo_root: &Path, timeout: Duration) -> Option<bool> {
+    let repo_root = repo_root.to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let dirty = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(repo_root)
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    Some(!output.stdout.is_empty())
+                } else {
+                    None
+                }
+            });
+        let _ = tx.send(dirty);
+    });
+    rx.recv_timeout(timeout).ok().flatten()
 }
 
 fn find_git_dir(start: &Path) -> Option<PathBuf> {
@@ -1555,6 +1578,7 @@ mod tests {
     use crate::{EffectiveConfig, Paths};
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn recs(paths: &[(&str, f64)]) -> Vec<Recommendation> {
@@ -1936,5 +1960,31 @@ mod tests {
         assert!(preview_layout_enabled(&app, PREVIEW_MIN_WIDTH));
         app.preview_visible = false;
         assert!(!preview_layout_enabled(&app, PREVIEW_MIN_WIDTH));
+    }
+
+    #[test]
+    fn read_git_info_reports_clean_and_dirty_status() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let (root, _) = test_ctx("git_dirty");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(init.success());
+
+        let clean = read_git_info(&repo).unwrap();
+        assert_eq!(clean.dirty, Some(false));
+
+        fs::write(repo.join("note.txt"), "dirty").unwrap();
+        let dirty = read_git_info(&repo).unwrap();
+        assert_eq!(dirty.dirty, Some(true));
+
+        let _ = fs::remove_dir_all(root);
     }
 }
