@@ -13,9 +13,9 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -217,18 +217,43 @@ fn parse_git_head_branch(head: &str) -> Option<String> {
 }
 
 fn read_git_dirty(repo_root: &Path, timeout: Duration) -> Option<bool> {
-    let repo_root = repo_root.to_path_buf();
+    // Spawn `git status` with a piped stdout so a slow filesystem (WSL2, network
+    // mounts) can't stall the picker. On timeout we kill the child and return,
+    // and the reader thread drains the pipe so neither the process nor the
+    // thread lingers after `git` finally exits.
+    let mut child = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let mut stdout = child.stdout.take()?;
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let dirty = Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(repo_root)
-            .output()
-            .ok()
-            .and_then(|output| output.status.success().then_some(!output.stdout.is_empty()));
-        let _ = tx.send(dirty);
+    let reader = thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let read = stdout.read_to_end(&mut buffer);
+        let _ = tx.send(read.map(|_| !buffer.is_empty()));
     });
-    rx.recv_timeout(timeout).ok().flatten()
+
+    let dirty = match rx.recv_timeout(timeout) {
+        Ok(read_result) => child
+            .wait()
+            .ok()
+            .and_then(|status| status.success().then_some(()).and(read_result.ok())),
+        Err(_) => {
+            // Timed out: kill the child so `read_to_end` returns and the reader
+            // thread unblocks; joining keeps the pipe alive until then.
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    };
+
+    let _ = reader.join();
+    dirty
 }
 
 fn preview_error_message(error: &io::Error, language: Language) -> String {
