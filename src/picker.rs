@@ -38,7 +38,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Clear, Paragraph},
     Frame, Terminal,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -264,15 +264,261 @@ fn preview_error_message(error: &io::Error, language: Language) -> String {
     }
 }
 
+/// An RGB triple used to seed a palette. Kept separate from `Color` so palettes
+/// stay plain data and the color-disabled path can ignore them uniformly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rgb(u8, u8, u8);
+
+/// A named set of colors that drives every themed style. Adding a theme is a
+/// matter of defining one `Palette`; the rendering code keeps calling the same
+/// `Theme` methods regardless of which palette is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Palette {
+    /// Full-screen canvas background. Makes theme switches visible even when
+    /// the terminal default bg would otherwise swallow fg-only changes.
+    surface: Rgb,
+    /// Elevated background for help/settings/confirm panels.
+    panel: Rgb,
+    border: Rgb,
+    title: Rgb,
+    primary: Rgb,
+    dim: Rgb,
+    accent: Rgb,
+    match_hit: Rgb,
+    warning: Rgb,
+    success: Rgb,
+    selected_fg: Rgb,
+    selected_bg: Rgb,
+}
+
+/// Default calm blue-graphite scheme. Surface is a deep navy so the flat UI
+/// still reads as a solid canvas without a boxed border.
+const PALETTE_GRAPHITE: Palette = Palette {
+    surface: Rgb(0x14, 0x18, 0x22),
+    panel: Rgb(0x1b, 0x22, 0x30),
+    border: Rgb(0x51, 0x5f, 0x7d),
+    title: Rgb(0xe8, 0xee, 0xff),
+    primary: Rgb(0xd8, 0xe1, 0xf5),
+    dim: Rgb(0x7d, 0x89, 0xa6),
+    accent: Rgb(0xa8, 0xb8, 0xff),
+    match_hit: Rgb(0xc3, 0xe8, 0x8d),
+    warning: Rgb(0xff, 0xcb, 0x6b),
+    success: Rgb(0x98, 0xc3, 0x79),
+    selected_fg: Rgb(0xf7, 0xf9, 0xff),
+    selected_bg: Rgb(0x35, 0x45, 0x6a),
+};
+
+/// Nord: cooler polar-night surface with teal accents.
+const PALETTE_NORD: Palette = Palette {
+    surface: Rgb(0x2e, 0x34, 0x40),
+    panel: Rgb(0x3b, 0x42, 0x52),
+    border: Rgb(0x4c, 0x56, 0x6a),
+    title: Rgb(0xec, 0xef, 0xf4),
+    primary: Rgb(0xd8, 0xde, 0xe9),
+    dim: Rgb(0x7b, 0x88, 0xa1),
+    accent: Rgb(0x88, 0xc0, 0xd0),
+    match_hit: Rgb(0xa3, 0xbe, 0x8c),
+    warning: Rgb(0xeb, 0xcb, 0x8b),
+    success: Rgb(0xa3, 0xbe, 0x8c),
+    selected_fg: Rgb(0xec, 0xef, 0xf4),
+    selected_bg: Rgb(0x43, 0x4c, 0x5e),
+};
+
+/// Daylight: inverted light canvas for bright terminals.
+const PALETTE_DAYLIGHT: Palette = Palette {
+    surface: Rgb(0xf4, 0xf6, 0xfa),
+    panel: Rgb(0xff, 0xff, 0xff),
+    border: Rgb(0xc4, 0xc9, 0xd4),
+    title: Rgb(0x1c, 0x22, 0x2b),
+    primary: Rgb(0x2e, 0x35, 0x40),
+    dim: Rgb(0x8a, 0x91, 0x9e),
+    accent: Rgb(0x2f, 0x6f, 0xd0),
+    match_hit: Rgb(0x2f, 0x8a, 0x4e),
+    warning: Rgb(0xb0, 0x6a, 0x00),
+    success: Rgb(0x2f, 0x8a, 0x4e),
+    selected_fg: Rgb(0x1c, 0x22, 0x2b),
+    selected_bg: Rgb(0xd5, 0xe2, 0xf7),
+};
+
+/// Mono: near-monochrome grays with a single cool accent.
+const PALETTE_MONO: Palette = Palette {
+    surface: Rgb(0x12, 0x12, 0x12),
+    panel: Rgb(0x1c, 0x1c, 0x1c),
+    border: Rgb(0x44, 0x44, 0x44),
+    title: Rgb(0xf0, 0xf0, 0xf0),
+    primary: Rgb(0xd0, 0xd0, 0xd0),
+    dim: Rgb(0x80, 0x80, 0x80),
+    accent: Rgb(0x9a, 0xb8, 0xe0),
+    match_hit: Rgb(0x9a, 0xb8, 0xe0),
+    warning: Rgb(0xc8, 0xc8, 0xc8),
+    success: Rgb(0x9a, 0xb8, 0xe0),
+    selected_fg: Rgb(0xf7, 0xf7, 0xf7),
+    selected_bg: Rgb(0x3a, 0x3a, 0x3a),
+};
+
+/// Dracula: purple/pink high-contrast dark theme, clearly distinct from blue-gray sets.
+const PALETTE_DRACULA: Palette = Palette {
+    surface: Rgb(0x28, 0x2a, 0x36),
+    panel: Rgb(0x31, 0x34, 0x44),
+    border: Rgb(0x62, 0x72, 0xa4),
+    title: Rgb(0xf8, 0xf8, 0xf2),
+    primary: Rgb(0xf8, 0xf8, 0xf2),
+    dim: Rgb(0x62, 0x72, 0xa4),
+    accent: Rgb(0xbd, 0x93, 0xf9),
+    match_hit: Rgb(0x50, 0xfa, 0x7b),
+    warning: Rgb(0xff, 0xb8, 0x6c),
+    success: Rgb(0x50, 0xfa, 0x7b),
+    selected_fg: Rgb(0xf8, 0xf8, 0xf2),
+    selected_bg: Rgb(0x44, 0x47, 0x5a),
+};
+
+/// Amber: warm terminal phosphor on deep brown, high visual distance from cool themes.
+const PALETTE_AMBER: Palette = Palette {
+    surface: Rgb(0x1a, 0x12, 0x08),
+    panel: Rgb(0x24, 0x18, 0x0c),
+    border: Rgb(0x8a, 0x5a, 0x20),
+    title: Rgb(0xff, 0xd2, 0x7a),
+    primary: Rgb(0xf0, 0xc8, 0x78),
+    dim: Rgb(0x9a, 0x74, 0x3c),
+    accent: Rgb(0xff, 0xb0, 0x40),
+    match_hit: Rgb(0xff, 0xe0, 0x8a),
+    warning: Rgb(0xff, 0x8a, 0x4c),
+    success: Rgb(0xc8, 0xe0, 0x6a),
+    selected_fg: Rgb(0x1a, 0x12, 0x08),
+    selected_bg: Rgb(0xff, 0xb0, 0x40),
+};
+
+/// Forest: green-moss dark theme for a nature-leaning contrast set.
+const PALETTE_FOREST: Palette = Palette {
+    surface: Rgb(0x10, 0x18, 0x12),
+    panel: Rgb(0x16, 0x22, 0x18),
+    border: Rgb(0x3d, 0x5c, 0x45),
+    title: Rgb(0xe4, 0xf0, 0xe6),
+    primary: Rgb(0xc8, 0xdc, 0xcc),
+    dim: Rgb(0x6f, 0x8a, 0x76),
+    accent: Rgb(0x7d, 0xc4, 0x92),
+    match_hit: Rgb(0xb8, 0xe0, 0x86),
+    warning: Rgb(0xe0, 0xc0, 0x6a),
+    success: Rgb(0x7d, 0xc4, 0x92),
+    selected_fg: Rgb(0xe4, 0xf0, 0xe6),
+    selected_bg: Rgb(0x2a, 0x42, 0x32),
+};
+
+/// The selectable color themes, in the order the settings panel and the
+/// `Ctrl+T` hotkey cycle through them. Graphite is first so it stays the
+/// default when no preference is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemeChoice {
+    Graphite,
+    Nord,
+    Daylight,
+    Mono,
+    Dracula,
+    Amber,
+    Forest,
+}
+
+impl ThemeChoice {
+    /// All themes in cycle order. The single source of truth for iteration,
+    /// wrap-around, and count, so adding a theme only touches this array.
+    const ALL: [ThemeChoice; 7] = [
+        ThemeChoice::Graphite,
+        ThemeChoice::Nord,
+        ThemeChoice::Daylight,
+        ThemeChoice::Mono,
+        ThemeChoice::Dracula,
+        ThemeChoice::Amber,
+        ThemeChoice::Forest,
+    ];
+
+    fn palette(self) -> Palette {
+        match self {
+            ThemeChoice::Graphite => PALETTE_GRAPHITE,
+            ThemeChoice::Nord => PALETTE_NORD,
+            ThemeChoice::Daylight => PALETTE_DAYLIGHT,
+            ThemeChoice::Mono => PALETTE_MONO,
+            ThemeChoice::Dracula => PALETTE_DRACULA,
+            ThemeChoice::Amber => PALETTE_AMBER,
+            ThemeChoice::Forest => PALETTE_FOREST,
+        }
+    }
+
+    /// The stable token persisted to `tui.toml` and accepted from `CDH_THEME`.
+    fn tag(self) -> &'static str {
+        match self {
+            ThemeChoice::Graphite => "graphite",
+            ThemeChoice::Nord => "nord",
+            ThemeChoice::Daylight => "daylight",
+            ThemeChoice::Mono => "mono",
+            ThemeChoice::Dracula => "dracula",
+            ThemeChoice::Amber => "amber",
+            ThemeChoice::Forest => "forest",
+        }
+    }
+
+    fn from_tag(value: &str) -> Option<ThemeChoice> {
+        let normalized = value.trim().to_ascii_lowercase();
+        ThemeChoice::ALL
+            .into_iter()
+            .find(|choice| choice.tag() == normalized)
+    }
+
+    /// Step `direction` positions through `ALL`, wrapping at both ends so the
+    /// settings panel and hotkey cycle without a dead stop.
+    fn cycle(self, direction: isize) -> ThemeChoice {
+        let index = ThemeChoice::ALL
+            .iter()
+            .position(|choice| *choice == self)
+            .unwrap_or(0) as isize;
+        let count = ThemeChoice::ALL.len() as isize;
+        let next = (index + direction).rem_euclid(count) as usize;
+        ThemeChoice::ALL[next]
+    }
+}
+
 struct Theme {
     on: bool,
+    palette: Palette,
 }
 
 impl Theme {
+    #[cfg(test)]
     fn new(on: bool) -> Self {
-        Self { on }
+        Self::with_choice(on, ThemeChoice::Graphite)
     }
 
+    fn with_choice(on: bool, choice: ThemeChoice) -> Self {
+        Self::with_palette(on, choice.palette())
+    }
+
+    fn with_palette(on: bool, palette: Palette) -> Self {
+        Self { on, palette }
+    }
+
+    /// Full-screen canvas fill. Colorless mode leaves the terminal bg alone.
+    fn surface(&self) -> Style {
+        if self.on {
+            Style::default().bg(self.rgb(self.palette.surface))
+        } else {
+            Style::default()
+        }
+    }
+
+    /// Elevated panel fill for help/settings/confirm overlays.
+    fn panel(&self) -> Style {
+        if self.on {
+            Style::default().bg(self.rgb(self.palette.panel))
+        } else {
+            Style::default()
+        }
+    }
+
+    fn rgb(&self, rgb: Rgb) -> Color {
+        self.color(rgb.0, rgb.1, rgb.2)
+    }
+
+    /// Resolve a raw RGB triple, honoring the color-disabled path. Retained so
+    /// the few call sites that still pass literal colors keep working.
     fn color(&self, red: u8, green: u8, blue: u8) -> Color {
         if self.on {
             Color::Rgb(red, green, blue)
@@ -282,17 +528,17 @@ impl Theme {
     }
 
     fn border(&self) -> Style {
-        Style::default().fg(self.color(0x51, 0x5f, 0x7d))
+        Style::default().fg(self.rgb(self.palette.border))
     }
 
     fn title(&self) -> Style {
         Style::default()
-            .fg(self.color(0xe8, 0xee, 0xff))
+            .fg(self.rgb(self.palette.title))
             .add_modifier(Modifier::BOLD)
     }
 
     fn primary(&self) -> Style {
-        Style::default().fg(self.color(0xd8, 0xe1, 0xf5))
+        Style::default().fg(self.rgb(self.palette.primary))
     }
 
     fn dim(&self) -> Style {
@@ -300,11 +546,11 @@ impl Theme {
     }
 
     fn dim_color(&self) -> Color {
-        self.color(0x7d, 0x89, 0xa6)
+        self.rgb(self.palette.dim)
     }
 
     fn accent(&self) -> Style {
-        Style::default().fg(self.color(0xa8, 0xb8, 0xff))
+        Style::default().fg(self.rgb(self.palette.accent))
     }
 
     fn key_hint(&self) -> Style {
@@ -312,11 +558,11 @@ impl Theme {
     }
 
     fn match_color(&self) -> Color {
-        self.color(0xc3, 0xe8, 0x8d)
+        self.rgb(self.palette.match_hit)
     }
 
     fn warning_color(&self) -> Color {
-        self.color(0xff, 0xcb, 0x6b)
+        self.rgb(self.palette.warning)
     }
 
     fn warning(&self) -> Style {
@@ -324,14 +570,14 @@ impl Theme {
     }
 
     fn success_color(&self) -> Color {
-        self.color(0x98, 0xc3, 0x79)
+        self.rgb(self.palette.success)
     }
 
     fn selected(&self) -> Style {
         if self.on {
             Style::default()
-                .fg(self.color(0xf7, 0xf9, 0xff))
-                .bg(self.color(0x35, 0x45, 0x6a))
+                .fg(self.rgb(self.palette.selected_fg))
+                .bg(self.rgb(self.palette.selected_bg))
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
         }
@@ -839,6 +1085,7 @@ struct App {
     language: Language,
     locale_language: Language,
     color_enabled: bool,
+    theme_choice: ThemeChoice,
     pending_mouse_candidate: Option<UiPreferences>,
     candidates: Vec<Candidate>,
     filter: Filter,
@@ -931,6 +1178,7 @@ impl App {
             language,
             locale_language,
             color_enabled: effective.color,
+            theme_choice: effective.theme,
             pending_mouse_candidate: None,
             candidates,
             filter,
@@ -1246,7 +1494,35 @@ impl App {
                 self.invalidate_preview_selection();
             }
             SettingKey::Color => self.color_enabled = effective.color,
+            SettingKey::Theme => self.theme_choice = effective.theme,
             SettingKey::Language | SettingKey::Mouse => {}
+        }
+    }
+
+    fn cycle_theme(&mut self, direction: isize) {
+        if self.settings.is_locked(SettingKey::Theme) {
+            self.notice = Some(self.language.text(TextKey::SettingsLocked).to_string());
+            return;
+        }
+        let Some(candidate) = self.settings.candidate(SettingKey::Theme, direction) else {
+            self.notice = Some(self.language.text(TextKey::SettingsLocked).to_string());
+            return;
+        };
+        match self.settings.persist(candidate) {
+            Ok(()) => {
+                self.theme_choice = candidate.theme;
+                self.notice = Some(format!(
+                    "{}: {}",
+                    self.language.text(TextKey::SettingTheme),
+                    theme_choice_label(self.language, candidate.theme)
+                ));
+            }
+            Err(error) => {
+                self.notice = Some(format!(
+                    "{}{error}",
+                    self.language.text(TextKey::SettingsSaveFailedPrefix)
+                ));
+            }
         }
     }
 
@@ -1502,7 +1778,7 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
         }
         if dirty {
             terminal.draw(|frame| {
-                let theme = Theme::new(app.color_enabled);
+                let theme = Theme::with_choice(app.color_enabled, app.theme_choice);
                 draw(frame, &app, &theme);
             })?;
             dirty = false;
@@ -1572,8 +1848,9 @@ fn handle_key_help(app: &mut App, code: KeyCode) -> Option<Option<String>> {
 }
 
 fn handle_key_settings(app: &mut App, code: KeyCode, selected: usize) -> Option<Option<String>> {
-    const ROWS: [SettingKey; 4] = [
+    const ROWS: [SettingKey; 5] = [
         SettingKey::Language,
+        SettingKey::Theme,
         SettingKey::Preview,
         SettingKey::Color,
         SettingKey::Mouse,
@@ -1664,8 +1941,14 @@ fn handle_key_normal(
             None => app.notice = Some(app.language.text(TextKey::NoJumpTarget).to_string()),
         },
         KeyCode::Tab => app.toggle_preview(),
+        KeyCode::Char('t') | KeyCode::Char('T') if ctrl => {
+            app.cycle_theme(1);
+        }
         KeyCode::F(1) | KeyCode::Char('?') | KeyCode::Char('？') => app.mode = Mode::Help,
         KeyCode::F(2) => app.mode = Mode::Settings { selected: 0 },
+        KeyCode::F(3) => {
+            app.cycle_theme(1);
+        }
         KeyCode::Esc => {
             if app.preview_visible {
                 app.toggle_preview();
@@ -1786,7 +2069,6 @@ struct ScreenLayout {
     header: Rect,
     input: Rect,
     top_divider: Rect,
-    content: Rect,
     bottom_divider: Rect,
     footer: Rect,
     list: Rect,
@@ -1798,11 +2080,13 @@ fn screen_layout(full: Rect, preview_visible: bool) -> Option<ScreenLayout> {
     if full.width < 3 || full.height < MIN_HEIGHT {
         return None;
     }
+    // Flat layout: no outer border inset. Keep a single column of side padding
+    // so text does not hug the terminal edge.
     let inner = Rect::new(
         full.x + 1,
-        full.y + 1,
+        full.y,
         full.width.saturating_sub(2),
-        full.height.saturating_sub(2),
+        full.height,
     );
     let sections = Layout::vertical([
         Constraint::Length(1),
@@ -1844,7 +2128,6 @@ fn screen_layout(full: Rect, preview_visible: bool) -> Option<ScreenLayout> {
         header: sections[0],
         input: sections[1],
         top_divider: sections[2],
-        content,
         bottom_divider: sections[4],
         footer: sections[5],
         list,
@@ -1862,17 +2145,13 @@ fn page_size_for(full: Rect, preview_visible: bool) -> usize {
 fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
     let full = frame.area();
     if let Some(layout) = screen_layout(full, app.preview_visible) {
+        // Flat main chrome: solid surface fill, no outer box border. Hierarchy
+        // comes from dividers, spacing, and the elevated panel overlays.
         frame.render_widget(Clear, full);
-        frame.render_widget(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme.border()),
-            full,
-        );
+        frame.render_widget(Block::default().style(theme.surface()), full);
         render_header(frame, app, theme, layout.header);
         render_input(frame, app, theme, layout.input);
         render_divider(frame, theme, layout.top_divider);
-        frame.render_widget(Clear, layout.content);
         render_list(frame, app, theme, layout.list);
         if let Some((preview_area, placement)) = layout.preview {
             render_preview(frame, app, theme, preview_area, placement);
@@ -1881,6 +2160,7 @@ fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
         render_footer(frame, app, theme, layout.footer, layout.preview_unavailable);
     } else {
         frame.render_widget(Clear, full);
+        frame.render_widget(Block::default().style(theme.surface()), full);
         frame.render_widget(
             Paragraph::new(app.language.text(TextKey::TerminalTooSmall)).style(theme.dim()),
             full,
@@ -2147,10 +2427,10 @@ fn list_row_line(
     let (path_style, terminal_style) = if candidate.exists {
         if selected {
             (
-                theme.selected().fg(theme.color(0xbd, 0xc8, 0xe2)),
+                theme.selected().fg(theme.rgb(theme.palette.dim)),
                 theme
                     .selected()
-                    .fg(theme.color(0xf7, 0xf9, 0xff))
+                    .fg(theme.rgb(theme.palette.selected_fg))
                     .add_modifier(Modifier::BOLD),
             )
         } else {
@@ -2275,15 +2555,49 @@ fn render_preview(
     area: Rect,
     placement: PreviewPlacement,
 ) {
-    let borders = match placement {
-        PreviewPlacement::Side => Borders::LEFT,
-        PreviewPlacement::Bottom => Borders::TOP,
+    // Flat preview separator: a single rule instead of a boxed border.
+    let inner = match placement {
+        PreviewPlacement::Side => {
+            if area.width == 0 {
+                area
+            } else {
+                let rule = Rect::new(area.x, area.y, 1, area.height);
+                let mut lines = Vec::with_capacity(area.height as usize);
+                for _ in 0..area.height {
+                    lines.push(Line::from(Span::styled("│", theme.border())));
+                }
+                frame.render_widget(Paragraph::new(lines), rule);
+                Rect::new(
+                    area.x.saturating_add(1),
+                    area.y,
+                    area.width.saturating_sub(1),
+                    area.height,
+                )
+            }
+        }
+        PreviewPlacement::Bottom => {
+            if area.height == 0 {
+                area
+            } else {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        "─".repeat(area.width as usize),
+                        theme.border(),
+                    )),
+                    Rect::new(area.x, area.y, area.width, 1),
+                );
+                Rect::new(
+                    area.x,
+                    area.y.saturating_add(1),
+                    area.width,
+                    area.height.saturating_sub(1),
+                )
+            }
+        }
     };
-    let block = Block::default()
-        .borders(borders)
-        .border_style(theme.border());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
 
     let Some(candidate) = app.selected_candidate() else {
         frame.render_widget(
@@ -2500,11 +2814,21 @@ fn render_help(frame: &mut Frame, language: Language, theme: &Theme, full: Rect)
     let height = (lines.len() as u16 + 2).min(full.height);
     let area = centered(full, width, height);
     frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme.border());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    frame.render_widget(Block::default().style(theme.panel()), area);
+    // Flat panel: top rule instead of a boxed border.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            theme.border(),
+        ))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -2541,6 +2865,7 @@ fn help_lines(language: Language, theme: &Theme) -> Vec<Line<'static>> {
         help_row("Ctrl+D", language.text(TextKey::DeleteHistoryEntry), theme),
         help_row("F1 / ? / ？", language.text(TextKey::OpenHelp), theme),
         help_row("F2", language.text(TextKey::OpenSettings), theme),
+        help_row("Ctrl+T / F3", language.text(TextKey::SettingTheme), theme),
         help_row(
             "↑↓  ←→  Enter/Space  Esc",
             language.text(TextKey::SettingsControls),
@@ -2552,18 +2877,28 @@ fn help_lines(language: Language, theme: &Theme) -> Vec<Line<'static>> {
 
 fn render_settings(frame: &mut Frame, app: &App, theme: &Theme, full: Rect, selected: usize) {
     let width = 72u16.min(full.width.saturating_sub(2));
-    let height = 9u16.min(full.height);
+    let height = 10u16.min(full.height);
     if width < 2 || height < 2 {
         return;
     }
 
     let area = centered(full, width, height);
     frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme.border());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    frame.render_widget(Block::default().style(theme.panel()), area);
+    // Flat panel: no box border — title + dim rule keep hierarchy without a frame.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            theme.border(),
+        ))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
     if inner.is_empty() {
         return;
     }
@@ -2579,6 +2914,7 @@ fn render_settings(frame: &mut Frame, app: &App, theme: &Theme, full: Rect, sele
     let row_start = u16::from(inner.height >= 7);
     for (index, key) in [
         SettingKey::Language,
+        SettingKey::Theme,
         SettingKey::Preview,
         SettingKey::Color,
         SettingKey::Mouse,
@@ -2590,7 +2926,7 @@ fn render_settings(frame: &mut Frame, app: &App, theme: &Theme, full: Rect, sele
         if offset >= inner.height {
             break;
         }
-        let style = if index == selected.min(3) {
+        let style = if index == selected.min(4) {
             theme.selected()
         } else {
             theme.primary()
@@ -2630,6 +2966,10 @@ fn settings_row_text(app: &App, key: SettingKey, width: usize) -> String {
                 LanguagePreference::En => app.language.text(TextKey::LanguageEnglish),
             },
         ),
+        SettingKey::Theme => (
+            app.language.text(TextKey::SettingTheme),
+            theme_choice_label(app.language, effective.theme),
+        ),
         SettingKey::Preview => (
             app.language.text(TextKey::SettingPreviewStartup),
             setting_boolean_text(app.language, effective.preview),
@@ -2656,6 +2996,18 @@ fn settings_row_text(app: &App, key: SettingKey, width: usize) -> String {
     } else {
         trim_end(&format!("{label}  {right}"), width)
     }
+}
+
+fn theme_choice_label(language: Language, choice: ThemeChoice) -> &'static str {
+    language.text(match choice {
+        ThemeChoice::Graphite => TextKey::ThemeGraphite,
+        ThemeChoice::Nord => TextKey::ThemeNord,
+        ThemeChoice::Daylight => TextKey::ThemeDaylight,
+        ThemeChoice::Mono => TextKey::ThemeMono,
+        ThemeChoice::Dracula => TextKey::ThemeDracula,
+        ThemeChoice::Amber => TextKey::ThemeAmber,
+        ThemeChoice::Forest => TextKey::ThemeForest,
+    })
 }
 
 fn setting_boolean_text(language: Language, value: bool) -> &'static str {
@@ -2700,11 +3052,20 @@ fn render_confirm_delete(
     let height = (lines.len() as u16 + 2).min(full.height.saturating_sub(2));
     let area = centered(full, width, height);
     frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme.border());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    frame.render_widget(Block::default().style(theme.panel()), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            theme.border(),
+        ))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -3124,6 +3485,8 @@ mod tests {
                     "Auto",
                     "Simplified Chinese",
                     "English",
+                    "Theme",
+                    "Graphite",
                     "Preview on startup",
                     "Off",
                     "Color",
@@ -3143,6 +3506,8 @@ mod tests {
                     "自动",
                     "简体中文",
                     "英语",
+                    "主题",
+                    "石墨",
                     "启动时预览",
                     "关",
                     "颜色",
@@ -3196,12 +3561,42 @@ mod tests {
             ..UiEnvironment::default()
         };
         let (root, mut app) = settings_mode_app("panel-lock", None, environment, Language::En);
-        settings_mode_select(&mut app, 1);
+        settings_mode_select(&mut app, 2);
 
         let text = settings_panel_text(&settings_panel_buffer(&app, 80, 24, true));
 
         assert!(text.contains("Preview on startup"));
         assert!(text.contains("Environment controlled/read-only"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn main_screen_is_flat_with_surface_fill_and_no_outer_box_corners() {
+        let (root, app) =
+            settings_mode_app("flat-main", None, UiEnvironment::default(), Language::En);
+        // Leave settings mode so draw paints the main chrome.
+        let mut app = app;
+        app.mode = Mode::Normal;
+        let theme = Theme::with_choice(true, ThemeChoice::Amber);
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let surface = theme.surface().bg.unwrap();
+        // Corners should be surface-colored spaces, not box-drawing characters.
+        for (x, y) in [(0, 0), (59, 0), (0, 15), (59, 15)] {
+            let cell = &buffer[(x, y)];
+            assert_eq!(
+                cell.symbol(),
+                " ",
+                "corner ({x},{y}) should be empty, got {:?}",
+                cell.symbol()
+            );
+            assert_eq!(cell.bg, surface, "corner ({x},{y}) should use surface bg");
+        }
+        // Horizontal dividers still provide hierarchy without a frame.
+        let divider = buffer.content.iter().any(|cell| cell.symbol() == "─");
+        assert!(divider, "expected flat dividers");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3213,7 +3608,7 @@ mod tests {
             UiEnvironment::default(),
             Language::En,
         );
-        settings_mode_select(&mut app, 1);
+        settings_mode_select(&mut app, 2);
         let theme = Theme::new(true);
         let buffer = settings_panel_buffer(&app, 80, 24, true);
         let y = settings_panel_row(&buffer, "Preview on startup");
@@ -3235,7 +3630,7 @@ mod tests {
             UiEnvironment::default(),
             Language::En,
         );
-        settings_mode_select(&mut app, 2);
+        settings_mode_select(&mut app, 3);
         let buffer = settings_panel_buffer(&app, 80, 24, false);
         let y = settings_panel_row(&buffer, "Color");
         let reversed_x = (0..buffer.area.width)
@@ -3330,19 +3725,19 @@ mod tests {
     }
 
     #[test]
-    fn settings_mode_up_down_selects_exactly_four_rows_and_clamps() {
+    fn settings_mode_up_down_selects_exactly_five_rows_and_clamps() {
         let (root, mut app) =
             settings_mode_app("selection", None, UiEnvironment::default(), Language::En);
         settings_mode_select(&mut app, 0);
 
         handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE, None);
         assert_eq!(app.mode, Mode::Settings { selected: 0 });
-        for selected in 1..=3 {
+        for selected in 1..=4 {
             handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE, None);
             assert_eq!(app.mode, Mode::Settings { selected });
         }
         handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE, None);
-        assert_eq!(app.mode, Mode::Settings { selected: 3 });
+        assert_eq!(app.mode, Mode::Settings { selected: 4 });
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3361,11 +3756,22 @@ mod tests {
         handle_key(&mut app, KeyCode::Left, KeyModifiers::NONE, None);
         assert_eq!(app.settings.saved().language, LanguagePreference::En);
 
-        for selected in 1..=3 {
+        // Theme is row 1; booleans are rows 2..=4 (Preview/Color/Mouse).
+        settings_mode_select(&mut app, 1);
+        assert_eq!(app.settings.saved().theme, ThemeChoice::Graphite);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
+        assert_eq!(app.settings.saved().theme, ThemeChoice::Nord);
+        assert_eq!(app.theme_choice, ThemeChoice::Nord);
+        handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE, None);
+        assert_eq!(app.settings.saved().theme, ThemeChoice::Daylight);
+        handle_key(&mut app, KeyCode::Left, KeyModifiers::NONE, None);
+        assert_eq!(app.settings.saved().theme, ThemeChoice::Nord);
+
+        for selected in 2..=4 {
             settings_mode_select(&mut app, selected);
             let before = app.settings.saved();
             handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
-            let after = if selected == 3 {
+            let after = if selected == 4 {
                 app.pending_mouse_candidate.unwrap()
             } else {
                 app.settings.saved()
@@ -3379,7 +3785,7 @@ mod tests {
     fn settings_mode_unlocked_edit_persists_before_updating_runtime() {
         let (root, mut app) =
             settings_mode_app("persist", None, UiEnvironment::default(), Language::En);
-        settings_mode_select(&mut app, 2);
+        settings_mode_select(&mut app, 3);
         assert!(app.settings.effective().color);
 
         handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE, None);
@@ -3393,13 +3799,113 @@ mod tests {
     }
 
     #[test]
+    fn settings_mode_theme_cycles_and_persists_from_settings_and_shortcuts() {
+        let (root, mut app) =
+            settings_mode_app("theme-cycle", None, UiEnvironment::default(), Language::En);
+        assert_eq!(app.theme_choice, ThemeChoice::Graphite);
+
+        // Settings row Theme (index 1): Graphite -> Nord
+        settings_mode_select(&mut app, 1);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
+        assert_eq!(app.theme_choice, ThemeChoice::Nord);
+        assert_eq!(app.settings.saved().theme, ThemeChoice::Nord);
+        assert!(fs::read_to_string(root.join("tui.toml"))
+            .unwrap()
+            .contains("theme = \"nord\""));
+        // Settings-panel edits use the generic saved notice; shortcut cycles name the theme.
+        assert_eq!(app.notice.as_deref(), Some("Settings saved"));
+
+        // Ctrl+T cycles again: Nord -> Daylight
+        app.mode = Mode::Normal;
+        handle_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL, None);
+        assert_eq!(app.theme_choice, ThemeChoice::Daylight);
+        assert_eq!(app.notice.as_deref(), Some("Theme: Daylight"));
+        assert!(fs::read_to_string(root.join("tui.toml"))
+            .unwrap()
+            .contains("theme = \"daylight\""));
+
+        // F3 continues through the expanded palette list.
+        handle_key(&mut app, KeyCode::F(3), KeyModifiers::NONE, None);
+        assert_eq!(app.theme_choice, ThemeChoice::Mono);
+        handle_key(&mut app, KeyCode::F(3), KeyModifiers::NONE, None);
+        assert_eq!(app.theme_choice, ThemeChoice::Dracula);
+        handle_key(&mut app, KeyCode::F(3), KeyModifiers::NONE, None);
+        assert_eq!(app.theme_choice, ThemeChoice::Amber);
+        handle_key(&mut app, KeyCode::F(3), KeyModifiers::NONE, None);
+        assert_eq!(app.theme_choice, ThemeChoice::Forest);
+        handle_key(&mut app, KeyCode::F(3), KeyModifiers::NONE, None);
+        assert_eq!(app.theme_choice, ThemeChoice::Graphite);
+        assert!(fs::read_to_string(root.join("tui.toml"))
+            .unwrap()
+            .contains("theme = \"graphite\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_mode_theme_env_lock_rejects_cycle_without_disk_change() {
+        let environment = UiEnvironment {
+            theme: Some(ThemeChoice::Nord),
+            ..UiEnvironment::default()
+        };
+        let (root, mut app) = settings_mode_app("theme-locked", None, environment, Language::ZhCn);
+        assert_eq!(app.theme_choice, ThemeChoice::Nord);
+
+        settings_mode_select(&mut app, 1);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
+        assert_eq!(app.theme_choice, ThemeChoice::Nord);
+        assert!(!root.join("tui.toml").exists());
+        assert_eq!(app.notice.as_deref(), Some("此设置由环境变量锁定"));
+
+        app.mode = Mode::Normal;
+        app.notice = None;
+        handle_key(&mut app, KeyCode::F(3), KeyModifiers::NONE, None);
+        assert_eq!(app.theme_choice, ThemeChoice::Nord);
+        assert!(!root.join("tui.toml").exists());
+        assert_eq!(app.notice.as_deref(), Some("此设置由环境变量锁定"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_mode_persisted_theme_and_environment_override_seed_runtime() {
+        let (persisted_root, persisted_app) = settings_mode_app(
+            "theme-persisted",
+            Some(
+                "language = \"en\"\ntheme = \"daylight\"\npreview = false\ncolor = true\nmouse = true\n",
+            ),
+            UiEnvironment::default(),
+            Language::ZhCn,
+        );
+        assert_eq!(persisted_app.theme_choice, ThemeChoice::Daylight);
+        assert_eq!(persisted_app.settings.saved().theme, ThemeChoice::Daylight);
+        let _ = fs::remove_dir_all(persisted_root);
+
+        let environment = UiEnvironment {
+            theme: Some(ThemeChoice::Mono),
+            ..UiEnvironment::default()
+        };
+        let (root, app) = settings_mode_app(
+            "theme-env-override",
+            Some(
+                "language = \"en\"\ntheme = \"nord\"\npreview = false\ncolor = true\nmouse = true\n",
+            ),
+            environment,
+            Language::En,
+        );
+        assert_eq!(app.theme_choice, ThemeChoice::Mono);
+        assert_eq!(app.settings.saved().theme, ThemeChoice::Nord);
+        assert_eq!(app.settings.effective().theme, ThemeChoice::Mono);
+        assert!(app.settings.is_locked(SettingKey::Theme));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn settings_mode_locked_edit_is_rejected_without_disk_change() {
         let environment = UiEnvironment {
             preview: Some(true),
             ..UiEnvironment::default()
         };
         let (root, mut app) = settings_mode_app("locked", None, environment, Language::ZhCn);
-        settings_mode_select(&mut app, 1);
+        settings_mode_select(&mut app, 2);
 
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
 
@@ -3422,7 +3928,7 @@ mod tests {
             Language::En,
             None,
         );
-        settings_mode_select(&mut app, 2);
+        settings_mode_select(&mut app, 3);
 
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
 
@@ -3456,6 +3962,7 @@ mod tests {
             preview: Some(false),
             color: Some(true),
             mouse: Some(false),
+            theme: None,
         };
         let (root, app) = settings_mode_app(
             "startup",
@@ -3475,7 +3982,7 @@ mod tests {
     fn settings_mode_preview_edit_persists_but_tab_remains_session_only() {
         let (root, mut app) =
             settings_mode_app("preview", None, UiEnvironment::default(), Language::En);
-        settings_mode_select(&mut app, 1);
+        settings_mode_select(&mut app, 2);
 
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
         assert!(app.preview_visible);
@@ -3517,7 +4024,7 @@ mod tests {
             UiEnvironment::default(),
             Language::En,
         );
-        settings_mode_select(&mut app, 3);
+        settings_mode_select(&mut app, 4);
         let mut control = FakeMouseCaptureControl::succeeding(true);
 
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
@@ -3543,7 +4050,7 @@ mod tests {
             UiEnvironment::default(),
             Language::En,
         );
-        settings_mode_select(&mut app, 3);
+        settings_mode_select(&mut app, 4);
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
         let mut terminal_failure = FakeMouseCaptureControl::with_results(
             true,
@@ -3569,7 +4076,7 @@ mod tests {
             Language::ZhCn,
             None,
         );
-        settings_mode_select(&mut app, 3);
+        settings_mode_select(&mut app, 4);
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
         let mut successful_rollback = FakeMouseCaptureControl::succeeding(true);
         app.apply_pending_mouse_setting(&mut successful_rollback);
@@ -3592,7 +4099,7 @@ mod tests {
             Language::En,
             None,
         );
-        settings_mode_select(&mut app, 3);
+        settings_mode_select(&mut app, 4);
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
         let mut rollback_failure = FakeMouseCaptureControl::with_results(
             true,
@@ -3775,7 +4282,7 @@ mod tests {
 
     #[test]
     fn english_help_contains_no_chinese_copy() {
-        let theme = Theme { on: false };
+        let theme = Theme::new(false);
         let lines = help_lines(Language::En, &theme);
         let text = lines
             .iter()
@@ -3825,7 +4332,7 @@ mod tests {
             line_text(&empty_state_line(
                 &app.query,
                 app.language,
-                &Theme { on: false }
+                &Theme::new(false)
             )),
             "No matching directories · Ctrl+U Clear search"
         );
@@ -3951,7 +4458,7 @@ mod tests {
 
     #[test]
     fn empty_search_state_offers_a_visible_recovery_action() {
-        let theme = Theme { on: true };
+        let theme = Theme::new(true);
         let line = empty_state_line("does-not-match", Language::ZhCn, &theme);
         assert_eq!(line_text(&line), "未找到匹配目录 · Ctrl+U 清空搜索");
         let clear_key = line
@@ -4293,7 +4800,7 @@ mod tests {
 
     #[test]
     fn footer_hint_visually_separates_keys_from_descriptions() {
-        let theme = Theme { on: true };
+        let theme = Theme::new(true);
         let hint = Language::ZhCn.text(TextKey::FooterPrimary);
         let line = footer_hint_line(hint, &theme);
         assert_eq!(line_text(&line), hint);
@@ -4316,7 +4823,7 @@ mod tests {
 
     #[test]
     fn help_lists_both_page_key_sets_and_query_editing_controls() {
-        let theme = Theme { on: false };
+        let theme = Theme::new(false);
         let text = help_lines(Language::ZhCn, &theme)
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -4556,7 +5063,7 @@ mod tests {
             exists: true,
             last_visit: None,
         };
-        let theme = Theme { on: true };
+        let theme = Theme::new(true);
         let line = list_row_line(&candidate, &[], row_options(1, 10, false, 80), &theme);
         let rendered = line_text(&line);
 
@@ -4581,7 +5088,7 @@ mod tests {
             exists: false,
             last_visit: None,
         };
-        let theme = Theme { on: true };
+        let theme = Theme::new(true);
         let line = list_row_line(&candidate, &[], row_options(5, 10, false, 80), &theme);
         let rendered = line_text(&line);
         let status = line
@@ -4606,7 +5113,7 @@ mod tests {
             exists: true,
             last_visit: None,
         };
-        let theme = Theme { on: true };
+        let theme = Theme::new(true);
         let wide = list_row_line(&candidate, &[], row_options(0, 1, false, 80), &theme);
         let narrow = list_row_line(&candidate, &[], row_options(0, 1, false, 24), &theme);
         let wide_text = line_text(&wide);
@@ -4640,7 +5147,7 @@ mod tests {
             exists: true,
             last_visit: None,
         };
-        let theme = Theme { on: true };
+        let theme = Theme::new(true);
         let line = list_row_line(
             &candidate,
             &[10, 11, 12],
@@ -4667,7 +5174,7 @@ mod tests {
             exists: true,
             last_visit: None,
         };
-        let theme = Theme { on: false };
+        let theme = Theme::new(false);
         let line = list_row_line(
             &candidate,
             &[10, 11, 12],
@@ -4691,7 +5198,7 @@ mod tests {
             exists: true,
             last_visit: None,
         };
-        let theme = Theme { on: true };
+        let theme = Theme::new(true);
         let highlights = (raw[..raw.find("api-client").unwrap()].chars().count() as u32
             ..raw.chars().count() as u32)
             .collect::<Vec<_>>();

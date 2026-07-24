@@ -87,6 +87,14 @@ pub(super) enum TextKey {
     MouseTerminalFailedPrefix,
     MousePersistenceFailedPrefix,
     MouseRollbackFailedPrefix,
+    SettingTheme,
+    ThemeGraphite,
+    ThemeNord,
+    ThemeDaylight,
+    ThemeMono,
+    ThemeDracula,
+    ThemeAmber,
+    ThemeForest,
 }
 
 impl Language {
@@ -216,6 +224,14 @@ impl Language {
                 "；恢复终端鼠标状态失败: ",
                 "; failed to restore terminal mouse state: ",
             ),
+            SettingTheme => self.pick("主题", "Theme"),
+            ThemeGraphite => self.pick("石墨", "Graphite"),
+            ThemeNord => self.pick("夜航", "Nord"),
+            ThemeDaylight => self.pick("晨光", "Daylight"),
+            ThemeMono => self.pick("素墨", "Mono"),
+            ThemeDracula => self.pick("紫夜", "Dracula"),
+            ThemeAmber => self.pick("琥珀", "Amber"),
+            ThemeForest => self.pick("林间", "Forest"),
         }
     }
 

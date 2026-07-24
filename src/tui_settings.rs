@@ -19,6 +19,7 @@ pub(super) enum LanguagePreference {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SettingKey {
     Language,
+    Theme,
     Preview,
     Color,
     Mouse,
@@ -30,6 +31,7 @@ pub(super) struct UiPreferences {
     pub(super) preview: bool,
     pub(super) color: bool,
     pub(super) mouse: bool,
+    pub(super) theme: super::ThemeChoice,
 }
 
 impl Default for UiPreferences {
@@ -39,6 +41,7 @@ impl Default for UiPreferences {
             preview: false,
             color: true,
             mouse: true,
+            theme: super::ThemeChoice::Graphite,
         }
     }
 }
@@ -49,6 +52,7 @@ pub(super) struct UiEnvironment {
     pub(super) preview: Option<bool>,
     pub(super) color: Option<bool>,
     pub(super) mouse: Option<bool>,
+    pub(super) theme: Option<super::ThemeChoice>,
 }
 
 impl UiEnvironment {
@@ -57,11 +61,13 @@ impl UiEnvironment {
         let preview = env::var("CDH_PREVIEW").ok();
         let color = env::var("CDH_COLOR").ok();
         let mouse = env::var("CDH_MOUSE").ok();
+        let theme = env::var("CDH_THEME").ok();
         Self::from_values(
             language.as_deref(),
             preview.as_deref(),
             color.as_deref(),
             mouse.as_deref(),
+            theme.as_deref(),
         )
     }
 
@@ -70,12 +76,14 @@ impl UiEnvironment {
         preview: Option<&str>,
         color: Option<&str>,
         mouse: Option<&str>,
+        theme: Option<&str>,
     ) -> Self {
         Self {
             language: language.and_then(parse_environment_language),
             preview: preview.map(parse_boolean_environment),
             color: color.map(parse_boolean_environment),
             mouse: mouse.map(parse_boolean_environment),
+            theme: theme.and_then(super::ThemeChoice::from_tag),
         }
     }
 }
@@ -137,6 +145,16 @@ impl UiSettings {
                 )),
             }
         }
+        if let Some(value) = table.get("theme") {
+            match value.as_str().and_then(super::ThemeChoice::from_tag) {
+                Some(theme) => saved.theme = theme,
+                None => invalid.push(invalid_value_detail(
+                    "theme",
+                    "graphite, nord, daylight, mono, dracula, amber, or forest",
+                    value,
+                )),
+            }
+        }
         parse_boolean_field(&table, "preview", &mut saved.preview, &mut invalid);
         parse_boolean_field(&table, "color", &mut saved.color, &mut invalid);
         parse_boolean_field(&table, "mouse", &mut saved.mouse, &mut invalid);
@@ -177,12 +195,14 @@ impl UiSettings {
             preview: self.environment.preview.unwrap_or(self.saved.preview),
             color: self.environment.color.unwrap_or(self.saved.color),
             mouse: self.environment.mouse.unwrap_or(self.saved.mouse),
+            theme: self.environment.theme.unwrap_or(self.saved.theme),
         }
     }
 
     pub(super) fn is_locked(&self, key: SettingKey) -> bool {
         match key {
             SettingKey::Language => self.environment.language.is_some(),
+            SettingKey::Theme => self.environment.theme.is_some(),
             SettingKey::Preview => self.environment.preview.is_some(),
             SettingKey::Color => self.environment.color.is_some(),
             SettingKey::Mouse => self.environment.mouse.is_some(),
@@ -207,6 +227,7 @@ impl UiSettings {
                     .unwrap_or(0) as isize;
                 candidate.language = languages[(current + direction).rem_euclid(3) as usize];
             }
+            SettingKey::Theme => candidate.theme = candidate.theme.cycle(direction),
             SettingKey::Preview => candidate.preview = !candidate.preview,
             SettingKey::Color => candidate.color = !candidate.color,
             SettingKey::Mouse => candidate.mouse = !candidate.mouse,
@@ -319,8 +340,11 @@ fn serialize_preferences(preferences: UiPreferences) -> String {
         LanguagePreference::En => "en",
     };
     format!(
-        "language = \"{language}\"\npreview = {}\ncolor = {}\nmouse = {}\n",
-        preferences.preview, preferences.color, preferences.mouse
+        "language = \"{language}\"\ntheme = \"{}\"\npreview = {}\ncolor = {}\nmouse = {}\n",
+        preferences.theme.tag(),
+        preferences.preview,
+        preferences.color,
+        preferences.mouse
     )
 }
 
@@ -383,6 +407,7 @@ fn parse_boolean_environment(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ThemeChoice;
     use super::*;
     use std::fs;
     use std::path::PathBuf;
@@ -428,6 +453,7 @@ mod tests {
                 preview: true,
                 color: false,
                 mouse: false,
+                theme: ThemeChoice::Graphite,
             };
             let mut settings = UiSettings::load(path.clone(), UiEnvironment::default()).settings;
 
@@ -435,7 +461,44 @@ mod tests {
 
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
-                format!("language = \"{token}\"\npreview = true\ncolor = false\nmouse = false\n")
+                format!("language = \"{token}\"\ntheme = \"graphite\"\npreview = true\ncolor = false\nmouse = false\n")
+            );
+            let reloaded = UiSettings::load(path.clone(), UiEnvironment::default());
+            assert_eq!(reloaded.settings.saved(), candidate);
+            assert!(reloaded.warning.is_none());
+            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn settings_persistence_round_trips_theme_tokens() {
+        let cases = [
+            ThemeChoice::Graphite,
+            ThemeChoice::Nord,
+            ThemeChoice::Daylight,
+            ThemeChoice::Mono,
+            ThemeChoice::Dracula,
+            ThemeChoice::Amber,
+            ThemeChoice::Forest,
+        ];
+
+        for (index, theme) in cases.into_iter().enumerate() {
+            let path = test_settings_path(&format!("theme-round-trip-{index}"));
+            let candidate = UiPreferences {
+                language: LanguagePreference::En,
+                preview: false,
+                color: true,
+                mouse: true,
+                theme,
+            };
+            let mut settings = UiSettings::load(path.clone(), UiEnvironment::default()).settings;
+            settings.persist(candidate).unwrap();
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                format!(
+                    "language = \"en\"\ntheme = \"{}\"\npreview = false\ncolor = true\nmouse = true\n",
+                    theme.tag()
+                )
             );
             let reloaded = UiSettings::load(path.clone(), UiEnvironment::default());
             assert_eq!(reloaded.settings.saved(), candidate);
@@ -482,6 +545,7 @@ mod tests {
             preview: true,
             color: false,
             mouse: false,
+            theme: ThemeChoice::Graphite,
         };
 
         let result = settings.persist_with_replace(candidate, |_, _| {
@@ -623,7 +687,7 @@ mod tests {
     fn settings_parser_valid_toml_loads_all_preferences() {
         let loaded = load_text(
             "valid",
-            "language = \"zh-CN\"\npreview = true\ncolor = false\nmouse = false\n",
+            "language = \"zh-CN\"\ntheme = \"nord\"\npreview = true\ncolor = false\nmouse = false\n",
             UiEnvironment::default(),
         );
 
@@ -634,6 +698,7 @@ mod tests {
                 preview: true,
                 color: false,
                 mouse: false,
+                theme: ThemeChoice::Nord,
             }
         );
         assert!(loaded.warning.is_none());
@@ -645,6 +710,10 @@ mod tests {
             (
                 "language = \"fr\"\npreview = true\ncolor = false\nmouse = false\n",
                 SettingKey::Language,
+            ),
+            (
+                "language = \"en\"\ntheme = \"solarized\"\npreview = true\ncolor = false\nmouse = false\n",
+                SettingKey::Theme,
             ),
             (
                 "language = \"en\"\npreview = \"yes\"\ncolor = false\nmouse = false\n",
@@ -668,6 +737,7 @@ mod tests {
             assert!(warning.contains(&name));
             assert!(warning.contains(match invalid {
                 SettingKey::Language => "fr",
+                SettingKey::Theme => "solarized",
                 SettingKey::Preview => "yes",
                 SettingKey::Color => "integer",
                 SettingKey::Mouse => "array",
@@ -680,6 +750,8 @@ mod tests {
                     LanguagePreference::En
                 }
             );
+            // invalid theme falls back to default Graphite; other cases never set theme.
+            assert_eq!(saved.theme, ThemeChoice::Graphite);
             assert_eq!(saved.preview, invalid != SettingKey::Preview);
             assert_eq!(saved.color, invalid == SettingKey::Color);
             assert_eq!(saved.mouse, invalid == SettingKey::Mouse);
@@ -732,10 +804,11 @@ mod tests {
             preview: Some(false),
             color: None,
             mouse: Some(true),
+            theme: Some(ThemeChoice::Daylight),
         };
         let loaded = load_text(
             "precedence",
-            "language = \"en\"\npreview = true\ncolor = false\nmouse = false\n",
+            "language = \"en\"\ntheme = \"nord\"\npreview = true\ncolor = false\nmouse = false\n",
             environment,
         );
 
@@ -746,13 +819,17 @@ mod tests {
                 preview: false,
                 color: false,
                 mouse: true,
+                theme: ThemeChoice::Daylight,
             }
         );
+        assert_eq!(loaded.settings.saved().theme, ThemeChoice::Nord);
         assert!(loaded.settings.is_locked(SettingKey::Language));
+        assert!(loaded.settings.is_locked(SettingKey::Theme));
         assert!(loaded.settings.is_locked(SettingKey::Preview));
         assert!(!loaded.settings.is_locked(SettingKey::Color));
         assert!(loaded.settings.is_locked(SettingKey::Mouse));
         assert!(loaded.settings.candidate(SettingKey::Preview, 1).is_none());
+        assert!(loaded.settings.candidate(SettingKey::Theme, 1).is_none());
         assert!(
             loaded
                 .settings
@@ -764,11 +841,28 @@ mod tests {
 
     #[test]
     fn settings_parser_invalid_cdh_lang_is_ignored_and_unlocked() {
-        let environment = UiEnvironment::from_values(Some("fr-FR"), None, None, None);
+        let environment = UiEnvironment::from_values(Some("fr-FR"), None, None, None, None);
         let loaded = load_text("invalid-language-env", "language = \"en\"\n", environment);
 
         assert_eq!(loaded.settings.effective().language, LanguagePreference::En);
         assert!(!loaded.settings.is_locked(SettingKey::Language));
+    }
+
+    #[test]
+    fn settings_parser_invalid_cdh_theme_is_ignored_and_unlocked() {
+        let environment = UiEnvironment::from_values(None, None, None, None, Some("solarized"));
+        assert_eq!(environment.theme, None);
+        let loaded = load_text("invalid-theme-env", "theme = \"nord\"\n", environment);
+        assert_eq!(loaded.settings.effective().theme, ThemeChoice::Nord);
+        assert!(!loaded.settings.is_locked(SettingKey::Theme));
+        assert_eq!(
+            loaded
+                .settings
+                .candidate(SettingKey::Theme, 1)
+                .unwrap()
+                .theme,
+            ThemeChoice::Daylight
+        );
     }
 
     #[test]
@@ -783,7 +877,7 @@ mod tests {
             ("", false),
         ] {
             let environment =
-                UiEnvironment::from_values(None, Some(value), Some(value), Some(value));
+                UiEnvironment::from_values(None, Some(value), Some(value), Some(value), None);
             assert_eq!(environment.preview, Some(expected), "preview: {value:?}");
             assert_eq!(environment.color, Some(expected), "color: {value:?}");
             assert_eq!(environment.mouse, Some(expected), "mouse: {value:?}");
