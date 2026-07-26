@@ -10,9 +10,11 @@ mod i18n;
 mod settings;
 
 use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -43,6 +45,10 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use regex::Regex;
+
+use crate::discover;
+use crate::excludes::{self, Excludes};
 use crate::recommend::Recommendation;
 use crate::{history, AppContext, Paths};
 #[cfg(test)]
@@ -626,12 +632,13 @@ pub fn pick(items: &[Recommendation]) -> io::Result<Option<String>> {
 }
 
 pub fn pick_with_history(ctx: &AppContext, items: &[Recommendation]) -> io::Result<Option<String>> {
-    if items.is_empty() {
-        return Ok(None);
-    }
+    // Non-interactive callers keep the established contract: the top
+    // recommendation, or nothing when history is empty.
     if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
         return Ok(items.first().map(|item| item.path.clone()));
     }
+    // Interactive: open the picker even with an empty history. The directory-tree
+    // discovery layer -- and the $PWD bootstrap -- give it candidates to show.
     run_ui(items, Some(ctx))
 }
 
@@ -908,13 +915,40 @@ fn take_char_indices_back(chars: &[char], max_width: usize) -> Vec<usize> {
     indices
 }
 
+/// 候选来源。发现层的唯一结构改动：用来在同一模糊分档内让历史候选排在目录树
+/// 候选之前（历史是用户真实去过的地方，权重更高），且用来禁用发现行的 Ctrl+D。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateSource {
+    History,
+    Discovered,
+}
+
 struct Candidate {
     raw: String,
-    display: PathDisplay,
-    name: String,
     score: f32,
     exists: bool,
     last_visit: Option<i64>,
+    source: CandidateSource,
+}
+
+impl Candidate {
+    /// Directory name (the last path segment), borrowed from `raw`.
+    ///
+    /// Deliberately not a stored field: it is read only by the preview header,
+    /// i.e. for the single selected row, while storing it would cost a `String`
+    /// per candidate (~55 bytes with header and allocator overhead, ~2.7 MB
+    /// across a full 50k discovery pool). Same reasoning as `PathDisplay` below.
+    fn name(&self) -> &str {
+        directory_name_str(&self.raw)
+    }
+
+    /// Build the abbreviated display form on demand. `PathDisplay` is heavy
+    /// (a `Range` per character for highlight mapping), so it is never stored on
+    /// the candidate -- only the ~20 visible rows and the delete confirmation
+    /// materialize it, which keeps a 50k-candidate pool well under budget.
+    fn display(&self, home: Option<&str>) -> PathDisplay {
+        PathDisplay::from_path(&self.raw, home)
+    }
 }
 
 #[cfg(test)]
@@ -926,26 +960,91 @@ fn build_candidates_with_visits(
     items: &[Recommendation],
     last_visits: &HashMap<String, i64>,
 ) -> Vec<Candidate> {
-    let home = env::var("HOME").ok().filter(|home| !home.is_empty());
     items
         .iter()
         .map(|item| Candidate {
             raw: item.path.clone(),
-            name: directory_name(&item.path),
-            display: PathDisplay::from_path(&item.path, home.as_deref()),
             score: item.score.clamp(0.0, 1.0) as f32,
             exists: item.exists,
             last_visit: last_visits.get(&item.path).copied(),
+            source: CandidateSource::History,
         })
         .collect()
 }
 
-fn directory_name(path: &str) -> String {
+/// Sort weight for the source tiebreak: smaller ranks first, so History (0)
+/// precedes Discovered (1) whenever the fuzzy score ties.
+fn source_rank(source: CandidateSource) -> u8 {
+    match source {
+        CandidateSource::History => 0,
+        CandidateSource::Discovered => 1,
+    }
+}
+
+/// Normalize a path for dedup: drop a trailing slash (but keep root "/").
+fn normalize_path(path: &str) -> String {
+    normalized_path_str(path).to_string()
+}
+
+/// `normalize_path` 的借用版本：只做尾斜杠归一，不分配。
+fn normalized_path_str(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+/// 已入池路径的 64 位指纹，供 `App::known_paths` 去重。
+///
+/// 存指纹而不是路径本身：5 万条候选下，一份完整路径拷贝要 8–10 MB（平均路径 72
+/// 字节，加 `String` 头与哈希表开销约 8–10 倍放大），指纹只要约 0.8 MB。
+///
+/// 碰撞代价很轻：某个「发现来的」目录被误判为已在池中、这一轮不出现在列表里。
+/// 不是数据损坏，也不影响历史记录；该目录一旦被 cd 过就会经由历史进入候选池。
+/// 5 万条下的碰撞概率约 `n²/2^65` ≈ 7e-11，可以忽略。
+fn path_fingerprint(path: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    normalized_path_str(path).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The parent directory of `path`, normalized. Root has no parent.
+fn parent_dir(path: &str) -> Option<String> {
+    Path::new(path)
+        .parent()
+        .map(|parent| normalize_path(&parent.to_string_lossy()))
+        .filter(|parent| !parent.is_empty())
+}
+
+/// Last path segment, borrowed from `path`. `path` is already UTF-8, so the
+/// segment is too and `to_str` cannot fail; paths without one (`/`) yield the
+/// whole input, matching the previous owned implementation.
+fn directory_name_str(path: &str) -> &str {
     Path::new(path)
         .file_name()
+        .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
+        .unwrap_or(path)
+}
+
+/// Build the discovery layer's ordering key: parent directory -> best history
+/// score in that directory. A discovered candidate looks up its own parent, so
+/// siblings of a hot history entry inherit that entry's heat, while directories
+/// in corners history never touched map to 0. Keyed on the parent (not the path
+/// itself) precisely so the level-1 siblings the scan surfaces get a signal.
+fn build_score_map(items: &[Recommendation]) -> HashMap<String, f32> {
+    let mut map: HashMap<String, f32> = HashMap::new();
+    for item in items {
+        let score = item.score.clamp(0.0, 1.0) as f32;
+        if let Some(parent) = parent_dir(&item.path) {
+            map.entry(parent)
+                .and_modify(|existing| *existing = existing.max(score))
+                .or_insert(score);
+        }
+    }
+    map
 }
 
 fn load_last_visits(ctx: Option<&AppContext>) -> HashMap<String, i64> {
@@ -967,7 +1066,6 @@ fn load_last_visits(ctx: Option<&AppContext>) -> HashMap<String, i64> {
 
 struct Match {
     idx: usize,
-    highlights: Vec<u32>,
 }
 
 struct Filter {
@@ -983,19 +1081,23 @@ impl Filter {
         }
     }
 
-    /// An empty query preserves recommendation order. Fuzzy matches rank by
-    /// matcher quality, then the existing recommendation score; stale paths
-    /// remain after valid paths so they can be cleaned up without competing
-    /// with jump targets.
+    /// An empty query preserves recommendation order (history first, then the
+    /// discovered tree). Fuzzy matches rank by matcher quality, then by source
+    /// (History before Discovered -- a place the user actually visited outranks
+    /// a merely-existing sibling at the same fuzzy score), then by the existing
+    /// recommendation score; stale paths remain after valid paths so they can be
+    /// cleaned up without competing with jump targets.
+    ///
+    /// Only the *ranking* score is computed here -- one `pattern.score` pass per
+    /// candidate. Match highlight indices are deliberately NOT computed: a query
+    /// can hit tens of thousands of candidates while only ~20 rows are ever on
+    /// screen, so highlighting is deferred to the render path and run for visible
+    /// rows only (see `compute_row_highlights`). Dropping the second per-match
+    /// pass roughly halves filter cost on wide result sets.
     fn run(&mut self, candidates: &[Candidate], query: &str) -> Vec<Match> {
         let query = query.trim();
         if query.is_empty() {
-            return (0..candidates.len())
-                .map(|idx| Match {
-                    idx,
-                    highlights: Vec::new(),
-                })
-                .collect();
+            return (0..candidates.len()).map(|idx| Match { idx }).collect();
         }
 
         let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
@@ -1003,48 +1105,61 @@ impl Filter {
         let mut missing = Vec::new();
 
         for (idx, candidate) in candidates.iter().enumerate() {
-            let mut highlight_buffer = Vec::new();
             let haystack = Utf32Str::new(&candidate.raw, &mut self.buffer);
             let Some(score) = pattern.score(haystack, &mut self.matcher) else {
                 continue;
             };
 
-            let mut highlights = Vec::new();
-            let match_haystack = Utf32Str::new(&candidate.raw, &mut highlight_buffer);
-            let _ = self.matcher.fuzzy_indices(
-                match_haystack,
-                Utf32Str::new(query, &mut Vec::new()),
-                &mut highlights,
-            );
-            highlights.sort_unstable();
-            highlights.dedup();
-
             if candidate.exists {
-                valid.push((score, idx, highlights));
+                valid.push((score, idx));
             } else {
-                missing.push((idx, highlights));
+                missing.push(idx);
             }
         }
 
         valid.sort_by(|left, right| {
-            right.0.cmp(&left.0).then_with(|| {
-                candidates[right.1]
-                    .score
-                    .partial_cmp(&candidates[left.1].score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| {
+                    source_rank(candidates[left.1].source)
+                        .cmp(&source_rank(candidates[right.1].source))
+                })
+                .then_with(|| {
+                    candidates[right.1]
+                        .score
+                        .partial_cmp(&candidates[left.1].score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
         });
 
         valid
             .into_iter()
-            .map(|(_, idx, highlights)| Match { idx, highlights })
-            .chain(
-                missing
-                    .into_iter()
-                    .map(|(idx, highlights)| Match { idx, highlights }),
-            )
+            .map(|(_, idx)| Match { idx })
+            .chain(missing.into_iter().map(|idx| Match { idx }))
             .collect()
     }
+}
+
+/// Compute raw match-highlight indices for a single path, on demand. Run only
+/// for on-screen rows (see `Filter::run`'s note), so the O(pool) filter never
+/// pays for highlighting candidates the user will not see.
+fn compute_row_highlights(matcher: &mut Matcher, raw: &str, query: &str) -> Vec<u32> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut haystack_buffer = Vec::new();
+    let mut needle_buffer = Vec::new();
+    let mut highlights = Vec::new();
+    let _ = matcher.fuzzy_indices(
+        Utf32Str::new(raw, &mut haystack_buffer),
+        Utf32Str::new(query, &mut needle_buffer),
+        &mut highlights,
+    );
+    highlights.sort_unstable();
+    highlights.dedup();
+    highlights
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1151,6 +1266,41 @@ struct App {
     /// out of the layout and render paths -- which run every animation frame --
     /// and lets tests exercise the opt-out without mutating process state.
     corner_3d_env: bool,
+    /// Streamed batches from the directory-tree discovery worker. `None` when
+    /// discovery is disabled (`CDH_DISCOVER=0`), non-interactive, or finished
+    /// (the channel disconnects and we drop the receiver).
+    discover_rx: Option<mpsc::Receiver<Vec<String>>>,
+    /// Parent directory -> best recommendation score. A discovered candidate
+    /// inherits the score of the neighborhood it sits in (a sibling of a hot
+    /// history entry ranks with that entry's heat); parents unknown to history
+    /// map to 0. This is the internal ordering key for the discovery layer --
+    /// no fabricated frecency, just "how hot is this corner of the tree".
+    discover_score_map: HashMap<String, f32>,
+    /// `$HOME` for abbreviating paths at render time, captured once.
+    home: Option<String>,
+    /// Fingerprints (see `path_fingerprint`) of the normalized raw paths already
+    /// present, so streamed discoveries dedup against history (history wins) and
+    /// against each other. Storing hashes rather than the paths keeps this off the
+    /// per-candidate memory bill — see `path_fingerprint` for the trade-off.
+    known_paths: HashSet<u64>,
+    /// Index where the discovered slice begins in `candidates` (== the history
+    /// count). The prefix `[0, discovered_start)` is history in frecency order
+    /// and never reordered; the suffix is the discovery layer, kept sorted by
+    /// (score desc, path asc) so the empty-query view is deterministic.
+    discovered_start: usize,
+    /// User exclusion list, subtree semantics. Nothing under an excluded root
+    /// reaches the pool: history candidates are filtered at startup, discovered
+    /// ones in `ingest_discovered`, and the scan worker takes the same set as a
+    /// prune set so the subtree is never even `read_dir`'d.
+    excludes: Excludes,
+    /// Where the exclusion list lives. `None` without an `AppContext` (no disk
+    /// to write to), in which case Ctrl+D reports instead of pretending.
+    excludes_path: Option<PathBuf>,
+    /// `CDH_IGNORE_RE`. History candidates were already filtered by it inside
+    /// the recommend pipeline, but discovered ones are pushed straight into
+    /// `ingest_discovered` and bypass that pipeline entirely -- without this
+    /// second check the user's regex silently stops applying to ~98% of the pool.
+    ignore_re: Option<Regex>,
 }
 
 impl App {
@@ -1213,6 +1363,11 @@ impl App {
         let language = resolve_language_preference(effective.language, locale_language);
         let mut filter = Filter::new();
         let filtered_results = filter.run(&candidates, "");
+        let known_paths = candidates
+            .iter()
+            .map(|candidate| path_fingerprint(&candidate.raw))
+            .collect::<HashSet<_>>();
+        let discovered_start = candidates.len();
         let mut app = Self {
             settings: loaded.settings,
             language,
@@ -1245,6 +1400,14 @@ impl App {
             last_list_start: Cell::new(0),
             corner_anim_started: Instant::now(),
             corner_3d_env: env_flag_enabled("CDH_CORNER_3D", true),
+            discover_rx: None,
+            discover_score_map: HashMap::new(),
+            home: env::var("HOME").ok().filter(|home| !home.is_empty()),
+            known_paths,
+            discovered_start,
+            excludes: Excludes::default(),
+            excludes_path: None,
+            ignore_re: None,
         };
         app.notice = loaded.warning.map(|warning| {
             format!(
@@ -1310,7 +1473,15 @@ impl App {
 
     fn corner_anim_angle(&self, now: Instant) -> f32 {
         let elapsed = now.saturating_duration_since(self.corner_anim_started);
-        elapsed.as_secs_f32() * 1.15
+        // Wrap so a long-lived process keeps f32 precision. Unbounded, the angle
+        // reaches ~10^5 rad after a day or so, where an f32 step is ~0.01 rad and
+        // the rotation visibly ratchets. We cannot wrap at TAU, though: the two
+        // spin rates are `angle` (rate 1) and `angle * 0.47`, so a TAU wrap of the
+        // raw angle would snap the second rotation by 0.47*TAU and jump the pose.
+        // Both rates realign to their start only after the angle advances a full
+        // `CORNER_SPIN_PERIOD`; wrapping there bounds the magnitude while the pose
+        // sequence stays continuous across the seam.
+        (elapsed.as_secs_f32() * 1.15).rem_euclid(CORNER_SPIN_PERIOD)
     }
 
     fn restore_selected_path(&mut self, path: Option<&str>) {
@@ -1329,6 +1500,92 @@ impl App {
                 .min(self.filtered_results.len().saturating_sub(1));
         }
         self.sync_pagination();
+    }
+
+    /// Merge streamed discovery batches into the candidate pool. Called once per
+    /// event-loop drain with every pending batch, so the O(pool) refilter runs a
+    /// single time no matter how many batches arrived -- the reason we drain-all
+    /// before refiltering is that not doing so would smear ~100 batches x a
+    /// ~25k-deep pool of rescoring across the fill window and stutter typing.
+    /// Returns whether anything changed (and the view needs a redraw).
+    fn ingest_discovered(&mut self, batches: Vec<Vec<String>>) -> bool {
+        let selected_path = self.selected_raw();
+        let mut added = false;
+        for batch in batches {
+            for raw in batch {
+                // Checked before the fingerprint insert so a filtered path stays
+                // genuinely unknown: batches already in flight when the user
+                // excludes something still have to be dropped here, and the
+                // prune set only stops descent, not paths already queued.
+                if self.excludes.contains(&raw)
+                    || self
+                        .ignore_re
+                        .as_ref()
+                        .is_some_and(|pattern| pattern.is_match(&raw))
+                {
+                    continue;
+                }
+                if !self.known_paths.insert(path_fingerprint(&raw)) {
+                    // History or an earlier discovery already owns this path.
+                    continue;
+                }
+                let score = parent_dir(&raw)
+                    .and_then(|parent| self.discover_score_map.get(&parent).copied())
+                    .unwrap_or(0.0);
+                self.candidates.push(Candidate {
+                    raw,
+                    score,
+                    exists: true,
+                    last_visit: None,
+                    source: CandidateSource::Discovered,
+                });
+                added = true;
+            }
+        }
+        if !added {
+            return false;
+        }
+        // Keep the discovered suffix ordered by (score desc, path asc): the empty
+        // query renders candidates in vec order and the history prefix must stay
+        // untouched, so only the suffix is (re)sorted.
+        self.candidates[self.discovered_start..].sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.raw.cmp(&right.raw))
+        });
+        self.filtered_results = self.filter.run(&self.candidates, &self.query);
+        self.restore_selected_path(selected_path.as_deref());
+        true
+    }
+
+    /// Empty-history bootstrap: synchronously seed the pool from `$PWD` -- its
+    /// ancestor chain plus one level of children -- so an interactive picker with
+    /// no history still has something to jump to on the first frame. Pure string
+    /// splitting plus a single `read_dir`; the full tree scan streams in behind.
+    fn bootstrap_from_pwd(&mut self, pwd: &str) {
+        let mut seeds: Vec<String> = Vec::new();
+        let mut current = normalize_path(pwd);
+        loop {
+            seeds.push(current.clone());
+            match parent_dir(&current) {
+                Some(parent) if parent != current => current = parent,
+                _ => break,
+            }
+        }
+        if let Ok(entries) = fs::read_dir(pwd) {
+            for entry in entries.flatten() {
+                let is_dir = entry
+                    .file_type()
+                    .map(|file_type| file_type.is_dir() && !file_type.is_symlink())
+                    .unwrap_or(false);
+                if is_dir {
+                    seeds.push(entry.path().to_string_lossy().into_owned());
+                }
+            }
+        }
+        self.ingest_discovered(vec![seeds]);
     }
 
     fn recompute_after_query_change(&mut self) {
@@ -1476,13 +1733,32 @@ impl App {
         self.set_selected(self.filtered_results.len().saturating_sub(1))
     }
 
-    fn remove_candidate(&mut self, idx: usize) {
-        if idx >= self.candidates.len() {
-            self.notice = Some(self.language.text(TextKey::RecordMissing).to_string());
-            return;
-        }
+    /// Drop `root` and everything under it from the pool.
+    ///
+    /// Subtree rather than single row, because that is what the exclusion list
+    /// stores: excluding `~/miniforge3` while its 6,000 children stayed on
+    /// screen would read as a broken delete. Fingerprints stay in `known_paths`
+    /// — the excluded paths can no longer be produced anyway, so removing them
+    /// would only cost hashing.
+    fn exclude_subtree(&mut self, root: &str) {
         let selected = self.selected_index;
-        self.candidates.remove(idx);
+        // Keep `discovered_start` pointing at the first discovered candidate.
+        // Every removal inside the history prefix shifts the whole discovered
+        // suffix left; forgetting this leaves the start stale-high, which both
+        // drops the leading discovered rows out of the sort window and, once the
+        // start exceeds the pool length, panics the next `[start..]` slice.
+        let discovered_start = self.discovered_start;
+        let mut removed_from_history = 0;
+        let mut idx = 0;
+        self.candidates.retain(|candidate| {
+            let keep = !discover::under_prefix(&candidate.raw, root);
+            if !keep && idx < discovered_start {
+                removed_from_history += 1;
+            }
+            idx += 1;
+            keep
+        });
+        self.discovered_start -= removed_from_history;
         self.filtered_results = self.filter.run(&self.candidates, &self.query);
         self.selected_index = selected.min(self.filtered_results.len().saturating_sub(1));
         self.sync_pagination();
@@ -1815,17 +2091,75 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
     let loaded = UiSettings::load(config_dir.join("tui.toml"), UiEnvironment::from_process());
     let initial_mouse = loaded.settings.effective().mouse;
     let locale_language = detect_locale_language();
+
+    // Exclusions are applied before the pool is built, not after: a filtered-out
+    // candidate must never reach `known_paths`, or the scan would treat it as
+    // already-owned and the row would be missing from history and discovery both.
+    let excludes = ctx
+        .map(|context| Excludes::load(&context.paths.excludes))
+        .unwrap_or_default();
+    let items: Vec<Recommendation> = items
+        .iter()
+        .filter(|item| !excludes.contains(&item.path))
+        .cloned()
+        .collect();
+
     let mut app = App::new(
-        build_candidates_with_visits(items, &last_visits),
+        build_candidates_with_visits(&items, &last_visits),
         loaded,
         locale_language,
     );
+    app.excludes = excludes;
+    app.excludes_path = ctx.map(|context| context.paths.excludes.clone());
+    app.ignore_re = ctx.and_then(|context| context.config.ignore_re.clone());
+
+    // Wire up the directory-tree discovery layer. The score map orders the
+    // discovered candidates; the scan worker streams new paths in on a channel
+    // and takes the exclusion list as a prune set, so excluded subtrees cost no
+    // I/O at all rather than being filtered out after the fact.
+    app.discover_score_map = build_score_map(&items);
+    app.discover_rx = discover::spawn(
+        items.iter().map(|item| item.path.clone()).collect(),
+        app.excludes.prune_set(),
+    );
+    // Empty-history bootstrap: seed from $PWD before the loop so the first frame
+    // isn't blank while the full scan spins up.
+    if app.candidates.is_empty() {
+        if let Ok(pwd) = env::current_dir() {
+            app.bootstrap_from_pwd(&pwd.to_string_lossy());
+        }
+    }
+
     let mut guard = TermGuard::enter(initial_mouse)?;
     let backend = CrosstermBackend::new(io::stderr());
     let mut terminal = Terminal::new(backend)?;
     let mut dirty = true;
 
     loop {
+        // Drain every pending discovery batch, then merge and refilter once.
+        if app.discover_rx.is_some() {
+            let mut batches = Vec::new();
+            let mut disconnected = false;
+            if let Some(rx) = &app.discover_rx {
+                loop {
+                    match rx.try_recv() {
+                        Ok(batch) => batches.push(batch),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !batches.is_empty() && app.ingest_discovered(batches) {
+                dirty = true;
+            }
+            if disconnected {
+                app.discover_rx = None;
+            }
+        }
+
         let terminal_size = terminal.size()?;
         let terminal_area = Rect::new(0, 0, terminal_size.width, terminal_size.height);
         if app.set_page_size(page_size_for(
@@ -1851,11 +2185,16 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
         }
 
         let animating = app.corner_3d_enabled() && matches!(app.mode, Mode::Normal);
-        let timeout = if animating {
+        let mut timeout = if animating {
             CORNER_3D_FRAME.min(app.preview_wait_timeout(now))
         } else {
             app.preview_wait_timeout(now)
         };
+        // While the scan streams, wake often enough to drain batches promptly so
+        // the pool fills visibly instead of in one late lurch.
+        if app.discover_rx.is_some() {
+            timeout = timeout.min(Duration::from_millis(50));
+        }
         if !event::poll(timeout)? {
             // Keep the ambient cube moving while idle in Normal mode.
             if animating {
@@ -1966,20 +2305,37 @@ fn handle_key_confirm_delete(
         );
         return None;
     };
-    let Some(path) = app
-        .candidates
-        .get(candidate_idx)
-        .map(|candidate| candidate.raw.clone())
-    else {
+    let Some(candidate) = app.candidates.get(candidate_idx) else {
         app.notice = Some(app.language.text(TextKey::RecordMissing).to_string());
         return None;
     };
-    match history::remove_path(ctx, &path) {
-        Ok(()) => app.remove_candidate(candidate_idx),
-        Err(error) => {
+    let path = candidate.raw.clone();
+    let from_history = candidate.source == CandidateSource::History;
+
+    // History rows lose their history entry too, not just their visibility. The
+    // exclusion list only governs what the picker shows; leaving the record on
+    // disk would keep it feeding frecency and would bring the row straight back
+    // for anyone running with `CDH_DISCOVER=0`.
+    if from_history {
+        if let Err(error) = history::remove_path(ctx, &path) {
             app.notice = Some(format!(
                 "{}{error}",
                 app.language.text(TextKey::DeleteFailedPrefix)
+            ));
+            return None;
+        }
+    }
+    match excludes::add(&ctx.paths.excludes, &path) {
+        Ok(excludes) => {
+            app.excludes = excludes;
+            app.exclude_subtree(&path);
+        }
+        Err(error) => {
+            // The history entry is already gone at this point; say what failed
+            // rather than implying the whole action rolled back.
+            app.notice = Some(format!(
+                "{}{error}",
+                app.language.text(TextKey::ExcludeFailedPrefix)
             ));
         }
     }
@@ -1996,13 +2352,15 @@ fn handle_key_normal(
         KeyCode::Char('u') if ctrl => {
             app.clear_query();
         }
-        KeyCode::Char('d') if ctrl => {
-            if let Some(candidate_idx) = app.selected_candidate_idx() {
-                app.mode = Mode::ConfirmDelete { candidate_idx };
-            } else {
+        // Works on discovered rows too. They have no history entry to delete,
+        // but with 50k of them on tap, banishing noise is the whole point of the
+        // key -- refusing there left the pool with no in-TUI way to get quieter.
+        KeyCode::Char('d') if ctrl => match app.selected_candidate_idx() {
+            Some(candidate_idx) => app.mode = Mode::ConfirmDelete { candidate_idx },
+            None => {
                 app.notice = Some(app.language.text(TextKey::NoDeletableHistory).to_string());
             }
-        }
+        },
         KeyCode::Enter => match app.selected_candidate() {
             Some(candidate) if candidate.exists => return Some(Some(candidate.raw.clone())),
             Some(_) => {
@@ -2285,6 +2643,24 @@ fn draw(frame: &mut Frame, app: &App, theme: &Theme, corner_angle: f32) {
     }
 }
 
+/// The 256 Braille cell glyphs (U+2800..U+28FF), mapped from a `CubeCell`'s
+/// glyph char to a shared `&'static str`. The renderer draws one per lit cell
+/// every frame; without this each would `char::to_string()` into a fresh heap
+/// `String` (~800 allocations/sec at the animation rate). The table is built
+/// once on first use and every frame after borrows from it.
+fn braille_glyph(glyph: char) -> &'static str {
+    static TABLE: std::sync::OnceLock<[String; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        std::array::from_fn(|i| {
+            char::from_u32(0x2800 + i as u32)
+                .expect("U+2800..=U+28FF are all valid scalars")
+                .to_string()
+        })
+    });
+    let idx = (glyph as u32).wrapping_sub(0x2800) as usize;
+    table.get(idx).map(String::as_str).unwrap_or("\u{2800}")
+}
+
 /// Paint the cube into the gutter `screen_layout` reserved for it. The area is
 /// already excluded from the list and preview, so filling it opaquely cannot
 /// clip a path or break the selection bar.
@@ -2318,9 +2694,12 @@ fn render_corner_3d(frame: &mut Frame, theme: &Theme, area: Rect, angle: f32) {
                 .map(|cell| match cell {
                     Some(c) => {
                         // One color per cell is all a terminal offers, so the
-                        // cell takes the average light of its lit dots.
+                        // cell takes the coverage-weighted light of its lit dots.
+                        // `braille_glyph` hands back a `&'static str` from a table
+                        // built once, sparing the ~800 heap allocations/sec the
+                        // old per-cell `glyph.to_string()` cost.
                         Span::styled(
-                            c.glyph.to_string(),
+                            braille_glyph(c.glyph),
                             Style::default().fg(ramp(c.light)).bg(surface_bg),
                         )
                     }
@@ -2333,11 +2712,19 @@ fn render_corner_3d(frame: &mut Frame, theme: &Theme, area: Rect, angle: f32) {
     frame.render_widget(Paragraph::new(lines).style(theme.surface()), area);
 }
 
-/// The dim end of the cube's shading ramp. Pulls the accent most of the way
-/// toward the surface so receding edges stay hue-tinted rather than washing out
-/// to gray, while sitting far enough from the lit end to read as depth.
+/// The dim end of the cube's shading ramp. Pulls the accent past halfway toward
+/// the surface so receding edges stay hue-tinted rather than washing out to
+/// gray, while sitting far enough from the lit end to read as depth.
+///
+/// The pull is 0.55 rather than nearer the surface on purpose. `CUBE_AMBIENT`
+/// was lowered to give the lighting its dynamic range back, which drops the
+/// darkest edges further down this ramp; pulling all the way to the surface
+/// from there would fade the dimmest silhouette edges into the background,
+/// breaking the outline. Measured against surface across the dark palettes and
+/// daylight, 0.55 keeps even the darkest edge clearly separated from the
+/// background while the shadow end still reads as the dim, receding one.
 fn cube_shadow(accent: Rgb, surface: Rgb) -> Rgb {
-    lerp_rgb(accent, surface, 0.72)
+    lerp_rgb(accent, surface, 0.55)
 }
 
 /// One rendered terminal cell of the cube: a Braille glyph packing a 2x4 dot
@@ -2358,13 +2745,13 @@ struct CubeCell {
     light: f32,
 }
 
-/// Sub-pixel dot canvas carrying, per dot, whether it is filled plus the
-/// nearest depth and the light at that depth. Bundling the buffers keeps the
-/// rasterizer signatures small (clippy caps args at 7).
+/// Sub-pixel dot canvas carrying, per dot, its accumulated ink coverage (0..1)
+/// plus the nearest depth and the light at that depth. Bundling the buffers keeps
+/// the rasterizer signatures small (clippy caps args at 7).
 struct DotCanvas {
     width: usize,
     height: usize,
-    filled: Vec<bool>,
+    coverage: Vec<f32>,
     depth: Vec<f32>,
     light: Vec<f32>,
 }
@@ -2374,63 +2761,142 @@ impl DotCanvas {
         Self {
             width,
             height,
-            filled: vec![false; width * height],
+            coverage: vec![0.0; width * height],
             depth: vec![f32::NEG_INFINITY; width * height],
             light: vec![0.0; width * height],
         }
     }
 
-    fn plot_dot(&mut self, x: i32, y: i32, z: f32, light: f32) {
+    /// Deposit `coverage` (0..1) of ink at a dot, carrying its `z` and `light`.
+    ///
+    /// Two things are resolved here, and deliberately differently:
+    ///
+    /// * **Colour follows depth.** Larger z is nearer the camera; where two edges
+    ///   cross, the nearer one owns the dot's light, exactly as the old binary
+    ///   plotter did. Only a strictly-nearer z reclaims the light, so the outcome
+    ///   is independent of the order edges are drawn in.
+    /// * **Coverage accumulates.** A nearer stroke that only *grazes* a dot must
+    ///   not blank out the farther ink already sitting under it -- that would
+    ///   trade a stair-step for a hole. So coverage saturating-adds rather than
+    ///   overwriting: the dot ends up as inked as its busiest pair of strokes make
+    ///   it (capped at full), while the *colour* is still the nearest stroke's.
+    ///   The residual case -- a near sliver stealing the colour from a far solid
+    ///   stroke beneath it -- is left as-is: at the near corner where crossings
+    ///   actually happen the two strokes' brightnesses are close, so the visible
+    ///   error is negligible and not worth a coverage-weighted colour blend here.
+    fn plot_dot(&mut self, x: i32, y: i32, z: f32, light: f32, coverage: f32) {
+        if coverage <= 0.0 {
+            return;
+        }
         if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height {
             return;
         }
         let idx = y as usize * self.width + x as usize;
-        // Larger z is nearer the camera. Where two edges cross, the nearer one
-        // owns the dot, so its light wins and the crossing reads with the
-        // right one in front.
-        if z < self.depth[idx] {
-            return;
+        if z > self.depth[idx] {
+            self.depth[idx] = z;
+            self.light[idx] = light;
         }
-        self.depth[idx] = z;
-        self.light[idx] = light;
-        self.filled[idx] = true;
+        self.coverage[idx] = (self.coverage[idx] + coverage).min(1.0);
     }
 
-    /// Bresenham edge draw, interpolating depth and light between the two
-    /// endpoints so an edge running front-to-back fades as it recedes.
-    fn draw_edge(&mut self, start: (i32, i32, f32, f32), end: (i32, i32, f32, f32)) {
-        let (x0, y0, z0, l0) = start;
-        let (x1, y1, z1, l1) = end;
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-        let steps = dx.max((-dy).max(1));
-        let mut x = x0;
-        let mut y = y0;
-        let mut step = 0i32;
-        loop {
-            let t = step as f32 / steps as f32;
-            let z = z0 + (z1 - z0) * t;
-            let light = l0 + (l1 - l0) * t;
-            self.plot_dot(x, y, z, light);
-            if x == x1 && y == y1 {
-                break;
-            }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y += sy;
-            }
-            step += 1;
-            if step > (self.width + self.height) as i32 * 4 {
-                break;
-            }
+    /// Xiaolin Wu anti-aliased edge draw. Bresenham lit exactly one dot per step
+    /// and hard-snapped it to the nearer grid line, which is what stair-stepped
+    /// the old edges; Wu instead splits each step's ink across the two dots
+    /// straddling the true line, weighted by how close the line runs to each. Fed
+    /// the fractional endpoints `project_point` now returns, that turns a vertex
+    /// creeping less than a dot per frame into a smooth shift of coverage between
+    /// neighbours rather than a periodic one-dot jump.
+    ///
+    /// Depth and light are interpolated by the parameter `t` along the segment
+    /// (0 at `start`, 1 at `end`) so an edge running front-to-back still fades as
+    /// it recedes; `plot_dot` then composites the coverage and resolves depth.
+    fn draw_edge(&mut self, start: (f32, f32, f32, f32), end: (f32, f32, f32, f32)) {
+        let (mut x0, mut y0, mut z0, mut l0) = start;
+        let (mut x1, mut y1, mut z1, mut l1) = end;
+
+        // Wu marches the major axis one integer step at a time and splits ink
+        // along the minor axis. Transpose steep lines so the major axis is always
+        // x, then orient left-to-right so `t` runs forward with the endpoints.
+        let steep = (y1 - y0).abs() > (x1 - x0).abs();
+        if steep {
+            std::mem::swap(&mut x0, &mut y0);
+            std::mem::swap(&mut x1, &mut y1);
+        }
+        if x0 > x1 {
+            std::mem::swap(&mut x0, &mut x1);
+            std::mem::swap(&mut y0, &mut y1);
+            std::mem::swap(&mut z0, &mut z1);
+            std::mem::swap(&mut l0, &mut l1);
+        }
+
+        let dx = x1 - x0;
+        // Coincident (or sub-dot) endpoints: one dot, no gradient to march.
+        if dx.abs() < 1e-6 {
+            let (px, py) = if steep { (y0, x0) } else { (x0, y0) };
+            self.plot_dot(px.round() as i32, py.round() as i32, z0.max(z1), l0, 1.0);
+            return;
+        }
+        let gradient = (y1 - y0) / dx;
+
+        let fpart = |v: f32| v - v.floor();
+        let rfpart = |v: f32| 1.0 - fpart(v);
+
+        // Plot the two dots straddling minor coordinate `lower..lower+1` for the
+        // step at major coordinate `maj`, honouring the steep transpose and
+        // interpolating depth/light at `t`.
+        let plot =
+            |canvas: &mut Self, maj: i32, lower: i32, lower_cov: f32, upper_cov: f32, t: f32| {
+                let z = z0 + (z1 - z0) * t;
+                let light = l0 + (l1 - l0) * t;
+                if steep {
+                    canvas.plot_dot(lower, maj, z, light, lower_cov);
+                    canvas.plot_dot(lower + 1, maj, z, light, upper_cov);
+                } else {
+                    canvas.plot_dot(maj, lower, z, light, lower_cov);
+                    canvas.plot_dot(maj, lower + 1, z, light, upper_cov);
+                }
+            };
+
+        // First endpoint. `xgap` fades the ink where the line starts partway into
+        // a dot, so a sub-dot endpoint shift changes coverage smoothly.
+        let xend1 = x0.round();
+        let yend1 = y0 + gradient * (xend1 - x0);
+        let xgap1 = rfpart(x0 + 0.5);
+        let ypxl1 = yend1.floor();
+        let t1 = ((xend1 - x0) / dx).clamp(0.0, 1.0);
+        plot(
+            self,
+            xend1 as i32,
+            ypxl1 as i32,
+            rfpart(yend1) * xgap1,
+            fpart(yend1) * xgap1,
+            t1,
+        );
+
+        // Second endpoint.
+        let xend2 = x1.round();
+        let yend2 = y1 + gradient * (xend2 - x1);
+        let xgap2 = fpart(x1 + 0.5);
+        let ypxl2 = yend2.floor();
+        let t2 = ((xend2 - x0) / dx).clamp(0.0, 1.0);
+        plot(
+            self,
+            xend2 as i32,
+            ypxl2 as i32,
+            rfpart(yend2) * xgap2,
+            fpart(yend2) * xgap2,
+            t2,
+        );
+
+        // Interior: each step deposits a total of ~1 ink split across the pair, so
+        // the busier dot always clears the membership threshold and the stroke
+        // never gaps.
+        let mut intery = yend1 + gradient;
+        for maj in (xend1 as i32 + 1)..(xend2 as i32) {
+            let lower = intery.floor();
+            let t = ((maj as f32 - x0) / dx).clamp(0.0, 1.0);
+            plot(self, maj, lower as i32, rfpart(intery), fpart(intery), t);
+            intery += gradient;
         }
     }
 }
@@ -2492,11 +2958,89 @@ const CUBE_CAMERA: f32 = 4.6;
 /// nothing. `corner_cube_span_is_a_tight_upper_bound` pins this value.
 const CUBE_SPAN: f32 = 1.87;
 
+/// Direction the light arrives from, in *view* space -- fixed relative to the
+/// camera rather than to the cube, so the cube tumbles beneath a stationary
+/// lamp and each face brightens as it turns into the light. Upper left and
+/// tilted toward the viewer: the conventional key-light placement, and the one
+/// that keeps at least one visible face well lit at any orientation. The tilt
+/// toward the viewer (+z) is deliberately the largest component: a lamp that
+/// leans overhead (+y dominant) leaves the side faces -- whose normals are
+/// near-horizontal -- all pointing the same amount away from it, so they read
+/// identically flat. Leaning the lamp toward the eye instead splays the side
+/// faces across a range of angles, so each takes a distinct brightness. Unit
+/// length, which `cube_light_direction_is_unit_length` pins.
+const CUBE_LIGHT: (f32, f32, f32) = (-0.551380, 0.451129, 0.701757);
+
+/// Floor under the diffuse term. A face turned fully from the lamp lands here
+/// rather than at zero: pure Lambert would erase its edges entirely and punch
+/// holes in the silhouette, so the cube has to stay whole even where it is
+/// unlit. Kept low so the lit faces keep most of the dynamic range and the
+/// sides show real gradation rather than sitting bunched near the floor.
+const CUBE_AMBIENT: f32 = 0.10;
+
+/// Contrast curve on the diffuse term. Half-Lambert (below) is intrinsically
+/// low-contrast -- it compresses the whole sphere of normals into the upper
+/// half of the range -- so a gamma > 1 pulls the midtones back down and
+/// restores the sense of a shaped, directionally lit object. Tuned against a
+/// 64-pose rotation sweep to hold the brightness spread across visible faces
+/// even with ambient this low.
+const CUBE_GAMMA: f32 = 1.8;
+
+/// Diffuse brightness for a face, given its rotated unit normal. Returns
+/// `CUBE_AMBIENT..=1.0`.
+///
+/// Uses half-Lambert -- `(dot + 1) / 2` with no clamp -- rather than clamped
+/// Lambert. Clamped Lambert collapses every face at or past 90 degrees from the
+/// lamp onto the exact same `max(0, dot) = 0`, i.e. the ambient floor; with an
+/// overhead lamp that is most of the side faces at once, and two visible faces
+/// pinned to an identical value read as unlit, not lit. Half-Lambert keeps
+/// `dot` flowing through the full -1..1 range, so faces angled away from the
+/// lamp still differ from one another and the shading never flat-lines. The
+/// gamma curve pays back the contrast half-Lambert costs.
+fn face_light(nx: f32, ny: f32, nz: f32) -> f32 {
+    let (lx, ly, lz) = CUBE_LIGHT;
+    // (dot + 1) / 2 is mathematically in 0..1, but a dot of exactly -1 (a face
+    // pointing dead away from the lamp) can land a hair below zero in f32, and
+    // a negative base under a fractional gamma is NaN -- clamp so the floor
+    // stays the floor rather than blowing up the whole cell.
+    let half_lambert = (((nx * lx + ny * ly + nz * lz) + 1.0) * 0.5).max(0.0);
+    CUBE_AMBIENT + (1.0 - CUBE_AMBIENT) * half_lambert.powf(CUBE_GAMMA)
+}
+
+/// Depth's remaining contribution, now that lighting carries the shading. Kept
+/// deliberately narrow: it kicks in along an edge running away from the viewer,
+/// where lighting alone is constant and would flatten the recession.
+fn depth_falloff(depth: f32) -> f32 {
+    0.78 + 0.22 * depth
+}
+
 fn cube_edge_index(a: usize, b: usize) -> Option<usize> {
     CUBE_EDGES
         .iter()
         .position(|&(p, q)| (p == a && q == b) || (p == b && q == a))
 }
+
+/// The angle at which the cube's tumble returns to its starting pose. The two
+/// spin rates below are `ay = angle` and `ax = angle * 0.47 + 0.5`; `ay` repeats
+/// every TAU and `ax` every TAU/0.47, so the combined pose repeats only when the
+/// angle has advanced a common multiple of both -- 100*TAU, since 0.47 = 47/100
+/// clears its denominator at 100 turns. `corner_anim_angle` wraps the running
+/// angle here so it never grows large enough to lose f32 resolution, and because
+/// this is a whole-pose period the wrap is seamless.
+const CORNER_SPIN_PERIOD: f32 = std::f32::consts::TAU * 100.0;
+
+/// Coverage a Braille dot must reach before it counts as part of the glyph. This
+/// is the one place coverage must collapse to a binary yes/no -- a terminal cell
+/// either sets a dot's bit or it does not. Wu splits each step's ink across the
+/// two dots straddling the line, and that split always sums to ~1, so the busier
+/// of the pair is always >= 0.5: a threshold at or below 0.5 therefore lights at
+/// least one dot per step and a stroke never gaps. 0.35 sits below the 0.5 an
+/// even straddle lands on -- so a line running exactly between two dot rows lights
+/// both and reads as the ~1.5-dot stroke it is -- yet well above the sliver a line
+/// merely grazing a dot deposits, so strokes stay a crisp one-to-two dots wide
+/// instead of blooming to double width. (Cell *brightness*, unlike membership, is
+/// left continuous and weighted by coverage -- see the cell-assembly loop.)
+const CUBE_DOT_ON: f32 = 0.35;
 
 /// Rasterize a rotating cube into Braille sub-pixels. Each terminal cell holds
 /// a 2x4 dot matrix, so a `width x height` cell area gives a `2*width x
@@ -2509,9 +3053,11 @@ fn cube_edge_index(a: usize, b: usize) -> Option<usize> {
 ///   it visibly flips inside-out as it turns. Culling the back edges leaves the
 ///   9-edge silhouette the eye already knows as a cube, so the rotation reads
 ///   in one consistent direction.
-/// * **Depth shading.** Surviving edges are lit by depth, near corners bright
-///   and far corners dim, which agrees with the perspective instead of fighting
-///   it.
+/// * **Diffuse lighting.** Each vertex is lit from the averaged normal of the
+///   visible faces meeting there, and an edge fades between its two endpoint
+///   brightnesses, so a face turning toward the lamp lifts its whole outline as
+///   a smooth gradient. Depth then modulates that slightly, so the two cues
+///   reinforce rather than compete.
 fn corner_cube_grid(angle: f32, width: usize, height: usize) -> Vec<Vec<Option<CubeCell>>> {
     if width == 0 || height == 0 {
         return Vec::new();
@@ -2526,40 +3072,71 @@ fn corner_cube_grid(angle: f32, width: usize, height: usize) -> Vec<Vec<Option<C
     let ay = angle;
     let ax = angle * 0.47 + 0.5;
 
-    let mut proj = [(0i32, 0i32, 0f32); 8];
-    let mut vlight = [0f32; 8];
+    let mut proj = [(0f32, 0f32, 0f32); 8];
+    let mut depth_shade = [0f32; 8];
     for (i, &(x, y, z)) in CUBE_V.iter().enumerate() {
         let (x, y, z) = rotate_y(x, y, z, ay);
         let (x, y, z) = rotate_x(x, y, z, ax);
-        // z spans about -1.73..1.73; map that to a wide, clearly graded ramp.
-        vlight[i] = (0.5 + 0.5 * (z / 1.74)).clamp(0.0, 1.0);
+        // z spans about -1.73..1.73; map that to 0..1.
+        depth_shade[i] = (0.5 + 0.5 * (z / 1.74)).clamp(0.0, 1.0);
         proj[i] = project_point(x, y, z, dot_w, dot_h);
     }
 
-    // Mark the edges of every camera-facing face. A face is camera-facing when
-    // its rotated outward normal still points toward +z (the eye).
-    let mut visible = [false; 12];
+    // Smooth (Gouraud) shading from per-vertex normals. A face is camera-facing
+    // when its rotated outward normal still points toward +z (the eye), which is
+    // also the culling test -- the same normal decides both whether an edge is
+    // drawn and how it is shaded. For each vertex we sum the normals of the
+    // *visible* faces meeting there and light the normalized result; an edge then
+    // gets a distinct brightness at each end and `draw_edge` interpolates between
+    // them, so a face reads as a shaped gradient rather than one flat tone.
+    //
+    // This replaces the old per-edge flat average of adjacent face lights. Only
+    // visible faces contribute a vertex's normal, so a silhouette vertex leans
+    // toward its single visible face while the near-corner vertex blends three --
+    // and crucially, two faces placed symmetrically about the lamp still hand a
+    // shared vertex *different* normals, so the seam between them never flat-lines
+    // the way a fill light (rejected: it buys outlier removal with global
+    // contrast) would leave it.
+    let mut vnormal = [(0f32, 0f32, 0f32); 8];
+    let mut edge_drawn = [false; 12];
     for (corners, normal) in CUBE_FACES {
         let (nx, ny, nz) = normal;
         let (nx, ny, nz) = rotate_y(nx, ny, nz, ay);
-        let (_, _, nz) = rotate_x(nx, ny, nz, ax);
+        let (nx, ny, nz) = rotate_x(nx, ny, nz, ax);
         if nz <= 0.0 {
             continue;
         }
         for i in 0..4 {
+            let v = &mut vnormal[corners[i]];
+            v.0 += nx;
+            v.1 += ny;
+            v.2 += nz;
             if let Some(edge) = cube_edge_index(corners[i], corners[(i + 1) % 4]) {
-                visible[edge] = true;
+                edge_drawn[edge] = true;
             }
         }
     }
 
+    // Light each vertex from its accumulated normal. A drawn edge always borders a
+    // visible face, so both its endpoints have a non-zero accumulated normal here.
+    let mut vlight = [0.0f32; 8];
+    for (i, &(nx, ny, nz)) in vnormal.iter().enumerate() {
+        let len = (nx * nx + ny * ny + nz * nz).sqrt();
+        if len > 1e-6 {
+            vlight[i] = face_light(nx / len, ny / len, nz / len);
+        }
+    }
+
     for (i, &(a, b)) in CUBE_EDGES.iter().enumerate() {
-        if !visible[i] {
+        if !edge_drawn[i] {
             continue;
         }
         let (ax0, ay0, az0) = proj[a];
         let (bx0, by0, bz0) = proj[b];
-        canvas.draw_edge((ax0, ay0, az0, vlight[a]), (bx0, by0, bz0, vlight[b]));
+        canvas.draw_edge(
+            (ax0, ay0, az0, vlight[a] * depth_falloff(depth_shade[a])),
+            (bx0, by0, bz0, vlight[b] * depth_falloff(depth_shade[b])),
+        );
     }
 
     // Braille dot -> bit layout within a 2x4 cell. The low six bits run down
@@ -2576,15 +3153,25 @@ fn corner_cube_grid(angle: f32, width: usize, height: usize) -> Vec<Vec<Option<C
             (0..width)
                 .map(|cx| {
                     let mut bits = 0u8;
-                    let mut light_sum = 0.0f32;
-                    let mut count = 0u32;
+                    let mut ink_sum = 0.0f32;
+                    let mut members = 0u32;
                     for (col, column) in BRAILLE_BITS.iter().enumerate() {
                         for (row, bit) in column.iter().enumerate() {
                             let idx = (cy * 4 + row) * dot_w + cx * 2 + col;
-                            if canvas.filled[idx] {
+                            let cov = canvas.coverage[idx];
+                            // Membership is binary -- the dot's bit is set only
+                            // once it holds a real share of a stroke. Brightness,
+                            // though, stays continuous: each member dot's light is
+                            // weighted by its coverage, so a cell a stroke merely
+                            // grazes (few dots, low coverage) reads faint while one
+                            // a stroke crosses through the middle (many dots near
+                            // full coverage) reads at full brightness. The old mean
+                            // of lit-dot light ignored coverage entirely, so a cell
+                            // grazed by one dot was as bright as one packed solid.
+                            if cov >= CUBE_DOT_ON {
                                 bits |= bit;
-                                light_sum += canvas.light[idx];
-                                count += 1;
+                                ink_sum += cov * canvas.light[idx];
+                                members += 1;
                             }
                         }
                     }
@@ -2593,7 +3180,7 @@ fn corner_cube_grid(angle: f32, width: usize, height: usize) -> Vec<Vec<Option<C
                     } else {
                         Some(CubeCell {
                             glyph: char::from_u32(0x2800 + bits as u32).unwrap_or('\u{2800}'),
-                            light: light_sum / count as f32,
+                            light: ink_sum / members as f32,
                         })
                     }
                 })
@@ -2620,12 +3207,19 @@ fn rotate_x(x: f32, y: f32, z: f32, angle: f32) -> (f32, f32, f32) {
 /// the size and lighting cues pointed opposite ways.)
 ///
 /// Braille dots are near-square, so the same scale applies to both axes.
-fn project_point(x: f32, y: f32, z: f32, width: usize, height: usize) -> (i32, i32, f32) {
+///
+/// The screen coordinates are returned *fractional*, not snapped to the nearest
+/// dot. Rounding here is what made the cube stutter: at the running spin rate a
+/// vertex advances only ~0.7 dots per frame, so a rounded position sat still for
+/// a frame or so and then jumped a whole dot every ~70ms. Handing the fractional
+/// position to Wu's anti-aliased rasterizer instead lets that sub-dot motion show
+/// as a smooth shift of coverage between neighbouring dots.
+fn project_point(x: f32, y: f32, z: f32, width: usize, height: usize) -> (f32, f32, f32) {
     let factor = CUBE_CAMERA / (CUBE_CAMERA - z);
     // Fill the canvas, keeping one dot of margin on every side.
     let scale = (width.min(height) as f32 * 0.5 - 1.0) / CUBE_SPAN;
-    let px = (width as f32 * 0.5 + x * scale * factor).round() as i32;
-    let py = (height as f32 * 0.5 - y * scale * factor).round() as i32;
+    let px = width as f32 * 0.5 + x * scale * factor;
+    let py = height as f32 * 0.5 - y * scale * factor;
     (px, py, z)
 }
 
@@ -2831,15 +3425,27 @@ fn render_list(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         return;
     }
 
+    // Highlights and the abbreviated display are built here, for visible rows
+    // only -- one throwaway matcher for the page instead of a stored index per
+    // candidate. See `Filter::run` and `Candidate::display`.
+    let home = app.home.as_deref();
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
     let mut lines = Vec::with_capacity(page.end - page.start);
     for (offset, matched) in app.filtered_results[page.start..page.end]
         .iter()
         .enumerate()
     {
         let index = page.start + offset;
+        let candidate = &app.candidates[matched.idx];
+        let highlights = if candidate.exists {
+            compute_row_highlights(&mut matcher, &candidate.raw, &app.query)
+        } else {
+            Vec::new()
+        };
         lines.push(list_row_line(
-            &app.candidates[matched.idx],
-            &matched.highlights,
+            candidate,
+            home,
+            &highlights,
             ListRowOptions {
                 index,
                 total: app.filtered_results.len(),
@@ -2864,10 +3470,12 @@ struct ListRowOptions {
 
 fn list_row_line(
     candidate: &Candidate,
+    home: Option<&str>,
     highlights: &[u32],
     options: ListRowOptions,
     theme: &Theme,
 ) -> Line<'static> {
+    let display = candidate.display(home);
     let ListRowOptions {
         index,
         total,
@@ -2936,7 +3544,7 @@ fn list_row_line(
         Span::styled(index_label, row_style),
     ];
     spans.extend(list_path_spans(
-        &candidate.display,
+        &display,
         highlights,
         available,
         path_style,
@@ -3071,7 +3679,7 @@ fn render_preview(
     let width = inner.width as usize;
     let mut lines = vec![
         Line::from(Span::styled(
-            trim_end(&candidate.name, width),
+            trim_end(candidate.name(), width),
             theme.title(),
         )),
         Line::from(Span::styled(
@@ -3492,7 +4100,7 @@ fn render_confirm_delete(
     let path = app
         .candidates
         .get(candidate_idx)
-        .map(|candidate| candidate.display.text.clone())
+        .map(|candidate| candidate.display(app.home.as_deref()).text)
         .unwrap_or_else(|| app.language.text(TextKey::UnknownDirectory).to_string());
     let message = confirm_delete_message(&path, width.saturating_sub(2) as usize, app.language);
     let lines = vec![
@@ -3635,6 +4243,32 @@ fn take_width_back(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_name_borrows_the_last_segment() {
+        // `name` is derived from `raw` rather than stored, so the derivation is
+        // what needs pinning: trailing slashes normalize away and rootless paths
+        // fall back to the whole input.
+        // (Mutation check: return `path` unconditionally and the first case fails.)
+        let cases = [
+            ("/home/jason/workspace/cdh", "cdh"),
+            ("/home/jason/workspace/cdh/", "cdh"),
+            ("/", "/"),
+            ("relative", "relative"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(directory_name_str(raw), want, "directory_name_str({raw:?})");
+            let candidate = Candidate {
+                raw: raw.to_string(),
+                score: 0.0,
+                exists: true,
+                last_visit: None,
+                source: CandidateSource::Discovered,
+            };
+            assert_eq!(candidate.name(), want, "Candidate::name() for {raw:?}");
+        }
+    }
+
     use crate::{EffectiveConfig, Paths};
     use ratatui::{backend::TestBackend, buffer::Buffer};
     use settings::{LanguagePreference, SettingKey, UiEnvironment, UiSettings};
@@ -4663,6 +5297,7 @@ mod tests {
             cache_dir: root.join("cache"),
             history_raw: root.join("data").join("history").join("history_raw"),
             history_uniq: root.join("data").join("history").join("history_uniq"),
+            excludes: root.join("data").join("excludes"),
         };
         fs::create_dir_all(paths.history_raw.parent().unwrap()).unwrap();
         (
@@ -4756,8 +5391,21 @@ mod tests {
         assert!(grid.iter().all(|row| row.len() == CORNER_3D_WIDTH as usize));
         let cells: Vec<CubeCell> = grid.iter().flatten().flatten().copied().collect();
         // An edge outline, not a fill: some cells lit, nowhere near all of them.
+        //
+        // Re-derived for anti-aliasing. Bresenham lit one dot per step, so this
+        // pose drew ~30 cells and the old 12..80 bracket fit. Wu now splits each
+        // step's ink across the two straddling dots, and the 0.35 membership
+        // threshold keeps the busier one (plus, at a true straddle, both), so a
+        // stroke reads 1-2 dots wide and this pose lights 46 of the 98 (14x7)
+        // cells. The bracket is derived from that, not widened to fit:
+        //   * upper 60 (~60% of the grid) rejects a fill -- interior spill would
+        //     climb toward 98, and the busiest pose over a full turn still only
+        //     reaches 49, so 60 clears the real outline yet bars a fill;
+        //   * lower 34 (~a third of the grid) rejects a collapsed outline -- if
+        //     the membership threshold were cranked so high it dropped the AA body
+        //     (e.g. 0.9), this pose falls to ~20 and trips the floor.
         assert!(
-            (12..80).contains(&cells.len()),
+            (34..60).contains(&cells.len()),
             "expected an edge outline, got {} cells",
             cells.len()
         );
@@ -4832,8 +5480,11 @@ mod tests {
                 let (x, y, z) = rotate_y(x, y, z, ay);
                 let (x, y, z) = rotate_x(x, y, z, ax);
                 let (px, py, _) = project_point(x, y, z, dot_w, dot_h);
+                // Fractional now, so bound the continuous coordinate against the
+                // canvas: a corner must land within [0, dim) even before the
+                // rasterizer floors it to a dot.
                 assert!(
-                    px >= 0 && (px as usize) < dot_w && py >= 0 && (py as usize) < dot_h,
+                    px >= 0.0 && px < dot_w as f32 && py >= 0.0 && py < dot_h as f32,
                     "angle {angle}: corner projected to ({px},{py}), outside {dot_w}x{dot_h}"
                 );
             }
@@ -4845,6 +5496,230 @@ mod tests {
         assert!(
             lit >= 20,
             "cube should fill its corner, only {lit} cells lit"
+        );
+    }
+
+    #[test]
+    fn cube_light_direction_is_unit_length() {
+        let (lx, ly, lz) = CUBE_LIGHT;
+        let len = (lx * lx + ly * ly + lz * lz).sqrt();
+        assert!(
+            (len - 1.0).abs() < 1e-3,
+            "CUBE_LIGHT must be normalized or the diffuse term is scaled, got {len}"
+        );
+    }
+
+    #[test]
+    fn cube_face_light_tracks_the_normal_against_the_lamp() {
+        let (lx, ly, lz) = CUBE_LIGHT;
+        // Facing straight into the light: fully lit.
+        assert!((face_light(lx, ly, lz) - 1.0).abs() < 1e-3);
+        // Facing straight away: this is the only orientation that reaches the
+        // floor. Under half-Lambert the floor is a single point, not a whole
+        // hemisphere -- that is the fix; a face merely angled off the lamp must
+        // stay above it.
+        assert!((face_light(-lx, -ly, -lz) - CUBE_AMBIENT).abs() < 1e-3);
+        // Perpendicular to the lamp: half-Lambert puts dot = 0 at the midpoint
+        // of the curve, so this sits strictly between floor and full rather
+        // than pinned to the floor the way clamped Lambert left it.
+        let (px, py, pz) = (-ly, lx, 0.0);
+        let perp = face_light(px, py, pz);
+        assert!(
+            perp > CUBE_AMBIENT + 0.02 && perp < 1.0,
+            "an edge-on face must lift off the floor under half-Lambert, got {perp}"
+        );
+        // Monotonic in between, so a face turning toward the lamp brightens, and
+        // strictly brighter than the perpendicular face it turned from.
+        let half = face_light(
+            (lx + px) / 2f32.sqrt(),
+            (ly + py) / 2f32.sqrt(),
+            (lz + pz) / 2f32.sqrt(),
+        );
+        assert!(
+            half > perp && half < 1.0,
+            "a half-turned face should sit between the edge-on face and full, got {half}"
+        );
+    }
+
+    #[test]
+    fn cube_shading_depends_on_orientation_not_only_depth() {
+        // The distinguishing property of lighting over the depth-only shading
+        // this replaced: hold depth constant and brightness must still change.
+        // A face's depth cue is symmetric about the z axis, so a pose and its
+        // mirror share depths while presenting different normals to the lamp.
+        let brightest = |angle: f32| -> f32 {
+            corner_cube_grid(angle, CORNER_3D_WIDTH as usize, CORNER_3D_HEIGHT as usize)
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|c| c.light)
+                .fold(0.0f32, f32::max)
+        };
+        // Sweep a full turn and require the peak brightness itself to vary --
+        // under depth-only shading the near corner is always at max depth, so
+        // the peak would be pinned and this spread would be ~0.
+        let peaks: Vec<f32> = (0..24).map(|i| brightest(i as f32 * 0.26)).collect();
+        let spread = peaks.iter().cloned().fold(0.0f32, f32::max)
+            - peaks.iter().cloned().fold(1.0f32, f32::min);
+        assert!(
+            spread > 0.1,
+            "peak brightness should swing as faces turn into the lamp, got {spread} over {peaks:?}"
+        );
+    }
+
+    /// The per-face diffuse brightness for every camera-facing face at `angle`,
+    /// mirroring `corner_cube_grid`'s cull-then-light rule so the test asserts
+    /// on the lighting model rather than on rasterized pixels.
+    fn cube_visible_face_lights(angle: f32) -> Vec<f32> {
+        let ay = angle;
+        let ax = angle * 0.47 + 0.5;
+        let mut lights = Vec::new();
+        for (_corners, normal) in CUBE_FACES {
+            let (nx, ny, nz) = normal;
+            let (nx, ny, nz) = rotate_y(nx, ny, nz, ay);
+            let (nx, ny, nz) = rotate_x(nx, ny, nz, ax);
+            if nz <= 0.0 {
+                continue;
+            }
+            lights.push(face_light(nx, ny, nz));
+        }
+        lights
+    }
+
+    #[test]
+    fn cube_never_pins_two_visible_faces_to_the_ambient_floor() {
+        // The defect this shading was rebuilt to kill: clamped Lambert sends
+        // every face at or past 90 degrees from the lamp to `max(0, dot) = 0`,
+        // i.e. the exact ambient floor. With more than a couple such faces
+        // visible at once, two of the three the eye can see sit at an identical
+        // dead value and the cube stops reading as lit at all. Half-Lambert
+        // makes the floor a single unreachable-in-practice point (only the
+        // normal pointing dead away from the lamp), so at most one visible face
+        // can ever touch it.
+        //
+        // Sweep a full turn and assert no pose puts two visible faces on the
+        // floor together. This fails against the old clamped model -- verified
+        // by mutation: temporarily restoring `max(0.0, dot)` in `face_light`
+        // pins two-plus faces to the floor in 9 of these 64 poses.
+        for step in 0..64 {
+            let angle = step as f32 / 64.0 * std::f32::consts::TAU;
+            let lights = cube_visible_face_lights(angle);
+            let at_floor = lights
+                .iter()
+                .filter(|l| (**l - CUBE_AMBIENT).abs() < 1e-3)
+                .count();
+            assert!(
+                at_floor < 2,
+                "angle {angle}: {at_floor} visible faces pinned to the ambient \
+                 floor together -- that is the flat-shading defect, lights {lights:?}"
+            );
+        }
+    }
+
+    /// The per-vertex diffuse brightness the renderer now shades edges with:
+    /// average the normals of the *visible* faces meeting at each vertex,
+    /// normalize, light that. Mirrors `corner_cube_grid` so the test asserts on
+    /// the shading model rather than on rasterized pixels. Only vertices touched
+    /// by a visible face (a non-zero accumulated normal) are returned -- those are
+    /// exactly the endpoints of the edges that get drawn.
+    fn cube_visible_vertex_lights(angle: f32) -> Vec<f32> {
+        let ay = angle;
+        let ax = angle * 0.47 + 0.5;
+        let mut vnormal = [(0f32, 0f32, 0f32); 8];
+        for (corners, normal) in CUBE_FACES {
+            let (nx, ny, nz) = normal;
+            let (nx, ny, nz) = rotate_y(nx, ny, nz, ay);
+            let (nx, ny, nz) = rotate_x(nx, ny, nz, ax);
+            if nz <= 0.0 {
+                continue;
+            }
+            for &c in &corners {
+                vnormal[c].0 += nx;
+                vnormal[c].1 += ny;
+                vnormal[c].2 += nz;
+            }
+        }
+        vnormal
+            .iter()
+            .filter_map(|&(nx, ny, nz)| {
+                let len = (nx * nx + ny * ny + nz * nz).sqrt();
+                (len > 1e-6).then(|| face_light(nx / len, ny / len, nz / len))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cube_never_pins_two_visible_vertices_to_the_ambient_floor() {
+        // The flat-shading floor defect, restated at the level shading now
+        // happens. With per-vertex normals the edges are lit from vertex
+        // brightnesses, not face brightnesses, so the invariant that keeps the
+        // cube from reading as unlit is now vertex-level: no pose may pin two of
+        // the drawn vertices to the ambient floor at once.
+        //
+        // This is a strictly stronger guarantee than the face-level one, and for
+        // a good reason: a vertex normal is the average of two or three visible
+        // face normals, so it only reaches the floor if that *average* points
+        // dead away from the lamp -- rarer than any single face doing so. Over a
+        // full turn no vertex touches the floor at all, so any pair-at-floor pose
+        // would signal the averaging or culling had broken.
+        for step in 0..64 {
+            let angle = step as f32 / 64.0 * std::f32::consts::TAU;
+            let lights = cube_visible_vertex_lights(angle);
+            let at_floor = lights
+                .iter()
+                .filter(|l| (**l - CUBE_AMBIENT).abs() < 1e-3)
+                .count();
+            assert!(
+                at_floor < 2,
+                "angle {angle}: {at_floor} drawn vertices pinned to the ambient \
+                 floor together, lights {lights:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn corner_cube_vertices_advance_smoothly_between_frames() {
+        // Regression cover for the stutter in change (1), which had none. The old
+        // `project_point` ended in `.round()`, snapping every vertex to an integer
+        // dot. At the spin rate a vertex crosses only ~0.7 dots per frame, so a
+        // rounded vertex sat frozen for a frame or two and then jumped a whole dot
+        // -- a visible ~72ms ratchet, temporal and independent of resolution.
+        // Fractional projection feeding Wu makes that motion continuous.
+        //
+        // Assert it on the projected vertex path, not on a whole-grid coverage
+        // sum: culling legitimately pops whole edges in and out as faces cross the
+        // horizon, which would swamp the sub-dot signal. A single vertex's screen
+        // position has no such discontinuity, so bound its second difference --
+        // discrete acceleration. Smooth sub-dot motion keeps this near zero; a
+        // staircase of whole-dot jumps spikes it (a one-dot jump that reverses
+        // across three frames contributes a second difference of order sqrt(2)).
+        //
+        // Load-bearing, proven by mutation: restoring `.round()` in
+        // `project_point` lifts the measured maximum from ~0.08 to ~2.24, far past
+        // this 0.5 bound, and the test fails. (See the change report.)
+        let (dw, dh) = (CORNER_3D_WIDTH as usize * 2, CORNER_3D_HEIGHT as usize * 4);
+        let dangle = 1.15 * 0.05; // spin rate (rad/s) * one 20fps frame
+        let pos = |vx: f32, vy: f32, vz: f32, a: f32| {
+            let (x, y, z) = rotate_y(vx, vy, vz, a);
+            let (x, y, z) = rotate_x(x, y, z, a * 0.47 + 0.5);
+            let (px, py, _) = project_point(x, y, z, dw, dh);
+            (px, py)
+        };
+        let mut worst = 0.0f32;
+        for &(vx, vy, vz) in CUBE_V.iter() {
+            for step in 0..1200 {
+                let a = step as f32 * dangle;
+                let (x0, y0) = pos(vx, vy, vz, a);
+                let (x1, y1) = pos(vx, vy, vz, a + dangle);
+                let (x2, y2) = pos(vx, vy, vz, a + 2.0 * dangle);
+                let ddx = x2 - 2.0 * x1 + x0;
+                let ddy = y2 - 2.0 * y1 + y0;
+                worst = worst.max((ddx * ddx + ddy * ddy).sqrt());
+            }
+        }
+        assert!(
+            worst < 0.5,
+            "vertex screen path should advance smoothly (second difference), got {worst}"
         );
     }
 
@@ -4881,7 +5756,7 @@ mod tests {
         let (far_x, _, far_z) = project_point(1.0, 0.0, -1.5, 28, 28);
         assert!(near_z > far_z, "z ordering: {near_z} should exceed {far_z}");
         assert!(
-            (near_x as f32 - center).abs() > (far_x as f32 - center).abs(),
+            (near_x - center).abs() > (far_x - center).abs(),
             "near corner must project wider: near {near_x}, far {far_x}"
         );
     }
@@ -5101,8 +5976,13 @@ mod tests {
             "2 hours ago"
         );
 
-        let message = confirm_delete_message("~/archive/old-project", 50, Language::En);
-        assert_eq!(message, "Delete history entry “~/archive/old-project”?");
+        // 80, not 50: the subtree clause makes the English sentence 61 columns,
+        // so a 50-column budget now exercises truncation rather than the copy.
+        let message = confirm_delete_message("~/archive/old-project", 80, Language::En);
+        assert_eq!(
+            message,
+            "Stop showing “~/archive/old-project” and everything under it?"
+        );
     }
 
     #[test]
@@ -5147,7 +6027,7 @@ mod tests {
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
         assert_eq!(
             app.notice.as_deref(),
-            Some("Directory is missing; press Ctrl+D to delete its history entry")
+            Some("Directory is missing; press Ctrl+D to exclude it")
         );
 
         app.query = "not-found".to_string();
@@ -5337,19 +6217,20 @@ mod tests {
         let raw = "/home/jason/workspace/api-client";
         let candidate = Candidate {
             raw: raw.to_string(),
-            display: PathDisplay::from_path(raw, Some("/home/jason")),
-            name: "api-client".to_string(),
             score: 1.0,
             exists: true,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let mut filter = Filter::new();
         let matches = filter.run(std::slice::from_ref(&candidate), "/home/jason");
         assert_eq!(matches.len(), 1);
-        assert!(candidate
-            .display
-            .display_highlight_indices(&matches[0].highlights)
-            .contains(&0));
+        // Highlights are computed at render time (deferred to visible rows);
+        // rebuild them here and confirm they still map onto the "~" display char.
+        let display = candidate.display(Some("/home/jason"));
+        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+        let highlights = compute_row_highlights(&mut matcher, &candidate.raw, "/home/jason");
+        assert!(display.display_highlight_indices(&highlights).contains(&0));
     }
 
     #[test]
@@ -5749,16 +6630,16 @@ mod tests {
         let mut app = app_with_paths(&[("/a", 0.9), ("/b", 0.8), ("/c", 0.7)]);
         app.set_page_size(2);
         app.set_selected(2);
-        let idx = app.selected_candidate_idx().unwrap();
-        app.remove_candidate(idx);
+        let selected = app.selected_raw().unwrap();
+        app.exclude_subtree(&selected);
         assert_eq!(app.filtered_results.len(), 2);
         assert_eq!(app.selected_index, 1);
         assert_eq!(app.page().page, 1);
 
-        let idx = app.selected_candidate_idx().unwrap();
-        app.remove_candidate(idx);
-        let idx = app.selected_candidate_idx().unwrap();
-        app.remove_candidate(idx);
+        let selected = app.selected_raw().unwrap();
+        app.exclude_subtree(&selected);
+        let selected = app.selected_raw().unwrap();
+        app.exclude_subtree(&selected);
         assert!(app.filtered_results.is_empty());
         assert_eq!(app.selected_index, 0);
     }
@@ -5786,10 +6667,7 @@ mod tests {
             handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None),
             None
         );
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("目录已失效，按 Ctrl+D 删除历史记录")
-        );
+        assert_eq!(app.notice.as_deref(), Some("目录已失效，按 Ctrl+D 排除它"));
     }
 
     #[test]
@@ -5839,7 +6717,96 @@ mod tests {
             fs::read_to_string(&ctx.paths.history_uniq).unwrap(),
             format!("{}\n", keep.display())
         );
+        // Deleting a history row must also write the exclusion list, or the
+        // directory walks straight back in as a discovered row on next launch --
+        // and discovered rows carry no history entry to delete a second time.
+        assert!(
+            crate::excludes::Excludes::load(&ctx.paths.excludes).contains(stale.to_str().unwrap())
+        );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ctrl_d_on_discovered_row_excludes_without_touching_history() {
+        let (root, ctx) = test_ctx("exclude_discovered");
+        let keep = root.join("keep");
+        fs::create_dir_all(&keep).unwrap();
+        let history_line = format!("{}\n", keep.display());
+        fs::write(&ctx.paths.history_raw, format!("100\t{}\n", keep.display())).unwrap();
+        fs::write(&ctx.paths.history_uniq, &history_line).unwrap();
+        let mut app = App::with_preview_worker(
+            build_candidates(&recs(&[(keep.to_str().unwrap(), 0.8)])),
+            None,
+            false,
+        );
+        let noise = root.join("noise");
+        app.ingest_discovered(vec![vec![
+            noise.to_string_lossy().into_owned(),
+            noise.join("deep/deeper").to_string_lossy().into_owned(),
+        ]]);
+        assert_eq!(app.candidates.len(), 3);
+        app.set_selected(1);
+        assert_eq!(
+            app.selected_candidate().unwrap().source,
+            CandidateSource::Discovered
+        );
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            Some(&ctx),
+        );
+        handle_key(
+            &mut app,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            Some(&ctx),
+        );
+
+        // The subtree goes, not just the selected row.
+        assert_eq!(app.candidates.len(), 1);
+        assert_eq!(app.candidates[0].raw, keep.to_str().unwrap());
+        assert!(app
+            .excludes
+            .contains(&noise.join("deep/deeper").to_string_lossy()));
+        assert!(
+            crate::excludes::Excludes::load(&ctx.paths.excludes).contains(&noise.to_string_lossy())
+        );
+        // A discovered row has no history entry; the history files must be
+        // untouched rather than rewritten for a path that was never in them.
+        assert_eq!(
+            fs::read_to_string(&ctx.paths.history_uniq).unwrap(),
+            history_line
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn excluded_and_ignored_paths_never_enter_the_pool() {
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/h", 0.9)])), None, false);
+        app.excludes = crate::excludes::Excludes::from_paths(["/noise"]);
+        app.ignore_re = Some(Regex::new("/target/").unwrap());
+        app.ingest_discovered(vec![vec![
+            "/noise".to_string(),
+            "/noise/deep".to_string(),
+            "/keep/src".to_string(),
+            "/keep/target/debug".to_string(),
+        ]]);
+        let discovered: Vec<_> = app
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.source == CandidateSource::Discovered)
+            .map(|candidate| candidate.raw.as_str())
+            .collect();
+        assert_eq!(discovered, vec!["/keep/src"]);
+        // Filtered paths must stay unknown: recording them as seen would make a
+        // later, legitimate arrival of the same path dedup away into nothing.
+        assert!(!app.known_paths.contains(&path_fingerprint("/noise/deep")));
+        assert!(!app
+            .known_paths
+            .contains(&path_fingerprint("/keep/target/debug")));
     }
 
     #[test]
@@ -5885,14 +6852,19 @@ mod tests {
         let raw = "/home/jason/workspace/repos/easy_proxies";
         let candidate = Candidate {
             raw: raw.to_string(),
-            display: PathDisplay::from_path(raw, Some("/home/jason")),
-            name: "easy_proxies".to_string(),
             score: 1.0,
             exists: true,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let theme = Theme::new(true);
-        let line = list_row_line(&candidate, &[], row_options(1, 10, false, 80), &theme);
+        let line = list_row_line(
+            &candidate,
+            Some("/home/jason"),
+            &[],
+            row_options(1, 10, false, 80),
+            &theme,
+        );
         let rendered = line_text(&line);
 
         assert!(rendered.contains("~/workspace/repos/easy_proxies"));
@@ -5910,14 +6882,13 @@ mod tests {
         let raw = "/archive/old-project";
         let candidate = Candidate {
             raw: raw.to_string(),
-            display: PathDisplay::from_path(raw, None),
-            name: "old-project".to_string(),
             score: 1.0,
             exists: false,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let theme = Theme::new(true);
-        let line = list_row_line(&candidate, &[], row_options(5, 10, false, 80), &theme);
+        let line = list_row_line(&candidate, None, &[], row_options(5, 10, false, 80), &theme);
         let rendered = line_text(&line);
         let status = line
             .spans
@@ -5935,15 +6906,15 @@ mod tests {
         let raw = "/home/jason/workspace/repos/github.com/jasonwong1991/easy_proxies";
         let candidate = Candidate {
             raw: raw.to_string(),
-            display: PathDisplay::from_path(raw, Some("/home/jason")),
-            name: "easy_proxies".to_string(),
             score: 1.0,
             exists: true,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let theme = Theme::new(true);
-        let wide = list_row_line(&candidate, &[], row_options(0, 1, false, 80), &theme);
-        let narrow = list_row_line(&candidate, &[], row_options(0, 1, false, 24), &theme);
+        let home = Some("/home/jason");
+        let wide = list_row_line(&candidate, home, &[], row_options(0, 1, false, 80), &theme);
+        let narrow = list_row_line(&candidate, home, &[], row_options(0, 1, false, 24), &theme);
         let wide_text = line_text(&wide);
         let narrow_text = line_text(&narrow);
 
@@ -5961,23 +6932,25 @@ mod tests {
             Language::ZhCn,
         );
         assert!(UnicodeWidthStr::width(message.as_str()) <= 32);
-        assert!(message.starts_with("删除历史记录 “"));
-        assert!(message.ends_with("”？"));
+        assert!(message.starts_with("不再显示 “"));
+        // The subtree half of the sentence must survive truncation: it is the
+        // difference between hiding one row and hiding a few thousand.
+        assert!(message.ends_with("” 及其子目录？"));
     }
 
     #[test]
     fn search_match_in_selected_row_keeps_the_same_background() {
         let candidate = Candidate {
             raw: "/projects/api-client".to_string(),
-            display: PathDisplay::from_path("/projects/api-client", None),
-            name: "api-client".to_string(),
             score: 1.0,
             exists: true,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let theme = Theme::new(true);
         let line = list_row_line(
             &candidate,
+            None,
             &[10, 11, 12],
             row_options(0, 1, true, 80),
             &theme,
@@ -5996,15 +6969,15 @@ mod tests {
     fn colorless_selected_row_keeps_one_continuous_reverse_style() {
         let candidate = Candidate {
             raw: "/projects/api-client".to_string(),
-            display: PathDisplay::from_path("/projects/api-client", None),
-            name: "api-client".to_string(),
             score: 1.0,
             exists: true,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let theme = Theme::new(false);
         let line = list_row_line(
             &candidate,
+            None,
             &[10, 11, 12],
             row_options(0, 1, true, 40),
             &theme,
@@ -6020,11 +6993,10 @@ mod tests {
         let raw = "/home/jason/workspace/api-client";
         let candidate = Candidate {
             raw: raw.to_string(),
-            display: PathDisplay::from_path(raw, Some("/home/jason")),
-            name: "api-client".to_string(),
             score: 1.0,
             exists: true,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let theme = Theme::new(true);
         let highlights = (raw[..raw.find("api-client").unwrap()].chars().count() as u32
@@ -6032,6 +7004,7 @@ mod tests {
             .collect::<Vec<_>>();
         let line = list_row_line(
             &candidate,
+            Some("/home/jason"),
             &highlights,
             row_options(0, 1, false, 80),
             &theme,
@@ -6148,5 +7121,221 @@ mod tests {
         fs::write(repo.join("note.txt"), "dirty").unwrap();
         assert_eq!(read_git_info(&repo).unwrap().dirty, Some(true));
         let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- Directory-tree discovery layer ----
+
+    fn discovered_cand(raw: &str, score: f32) -> Candidate {
+        Candidate {
+            raw: raw.to_string(),
+            score,
+            exists: true,
+            last_visit: None,
+            source: CandidateSource::Discovered,
+        }
+    }
+
+    fn history_cand(raw: &str, score: f32) -> Candidate {
+        Candidate {
+            source: CandidateSource::History,
+            ..discovered_cand(raw, score)
+        }
+    }
+
+    #[test]
+    fn filter_ranks_history_before_discovered_at_equal_fuzzy_score() {
+        // Same raw path => identical fuzzy score and identical recommendation
+        // score, so only the source tiebreak can order them. Discovered is listed
+        // first to prove the sort actively reorders. (Mutation check: drop the
+        // source clause and Rust's stable sort leaves Discovered first -> fails.)
+        let candidates = vec![discovered_cand("/a/b", 0.5), history_cand("/a/b", 0.5)];
+        let mut filter = Filter::new();
+        let matches = filter.run(&candidates, "b");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(candidates[matches[0].idx].source, CandidateSource::History);
+        assert_eq!(
+            candidates[matches[1].idx].source,
+            CandidateSource::Discovered
+        );
+    }
+
+    #[test]
+    fn ingest_dedups_against_history_and_within_itself() {
+        // History owns /a/b. The batch re-offers /a/b (must lose) and /a/c twice
+        // (once with a trailing slash, which normalizes equal). (Mutation check:
+        // remove the known_paths dedup and this becomes 4 candidates -> fails.)
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/a/b", 0.9)])), None, false);
+        app.ingest_discovered(vec![vec![
+            "/a/b".to_string(),
+            "/a/c".to_string(),
+            "/a/c/".to_string(),
+        ]]);
+        assert_eq!(app.candidates.len(), 2);
+        assert_eq!(app.candidates[0].source, CandidateSource::History);
+        let discovered: Vec<_> = app
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.source == CandidateSource::Discovered)
+            .map(|candidate| candidate.raw.clone())
+            .collect();
+        assert_eq!(discovered, vec!["/a/c".to_string()]);
+    }
+
+    #[test]
+    fn empty_query_keeps_history_first_then_sorted_discovery() {
+        let mut app = App::with_preview_worker(
+            build_candidates(&recs(&[("/hist1", 0.9), ("/hist2", 0.8)])),
+            None,
+            false,
+        );
+        app.ingest_discovered(vec![vec!["/disc/z".to_string(), "/disc/a".to_string()]]);
+        let order: Vec<_> = app
+            .filtered_results
+            .iter()
+            .map(|matched| app.candidates[matched.idx].raw.clone())
+            .collect();
+        // History prefix unchanged (frecency order); discovered suffix sorted by
+        // (score desc, path asc) -- both score 0 here, so path ascending.
+        assert_eq!(
+            order,
+            vec![
+                "/hist1".to_string(),
+                "/hist2".to_string(),
+                "/disc/a".to_string(),
+                "/disc/z".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_inherits_parent_neighborhood_score_for_ordering() {
+        // /hot has a high score, so its parent /p maps hot; a discovered sibling
+        // /p/cold under the same parent inherits that heat and sorts ahead of a
+        // discovered dir in a cold corner.
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/p/hot", 0.9)])), None, false);
+        app.discover_score_map = build_score_map(&recs(&[("/p/hot", 0.9)]));
+        app.ingest_discovered(vec![vec!["/z/cold".to_string(), "/p/sibling".to_string()]]);
+        let discovered: Vec<_> = app.candidates[app.discovered_start..]
+            .iter()
+            .map(|candidate| candidate.raw.clone())
+            .collect();
+        assert_eq!(
+            discovered,
+            vec!["/p/sibling".to_string(), "/z/cold".to_string()]
+        );
+    }
+
+    #[test]
+    fn ingest_preserves_selected_path() {
+        let mut app = App::with_preview_worker(
+            build_candidates(&recs(&[("/hist1", 0.9), ("/hist2", 0.8)])),
+            None,
+            false,
+        );
+        app.set_selected(1);
+        let before = app.selected_raw();
+        assert_eq!(before.as_deref(), Some("/hist2"));
+        app.ingest_discovered(vec![vec!["/disc/a".to_string(), "/disc/b".to_string()]]);
+        assert_eq!(app.selected_raw(), before);
+    }
+
+    #[test]
+    fn ctrl_d_on_discovered_row_arms_confirmation_too() {
+        // Discovered rows have no history entry, but Ctrl+D now excludes rather
+        // than deletes, and excluding noise out of a 50k pool is exactly what a
+        // discovered row needs. Refusing here would leave the discovery layer
+        // with no in-TUI way to get quieter.
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/hist", 0.9)])), None, false);
+        app.ingest_discovered(vec![vec!["/disc/a".to_string()]]);
+        app.set_selected(1);
+        assert_eq!(
+            app.selected_candidate().unwrap().source,
+            CandidateSource::Discovered
+        );
+        let result = handle_key_normal(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(result.is_none());
+        assert!(matches!(app.mode, Mode::ConfirmDelete { .. }));
+    }
+
+    #[test]
+    fn ctrl_d_on_history_row_still_arms_confirmation() {
+        // Guard the mutation the other way: History rows keep the delete flow.
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/hist", 0.9)])), None, false);
+        let result = handle_key_normal(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(result.is_none());
+        assert!(matches!(app.mode, Mode::ConfirmDelete { .. }));
+    }
+
+    #[test]
+    fn bootstrap_seeds_pwd_ancestors_and_children() {
+        let tree = {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            std::env::temp_dir().join(format!("cdh-bootstrap-{}-{stamp}", std::process::id()))
+        };
+        fs::create_dir_all(tree.join("child_a")).unwrap();
+        fs::create_dir_all(tree.join("child_b")).unwrap();
+        let mut app = App::with_preview_worker(Vec::new(), None, false);
+        app.bootstrap_from_pwd(&tree.to_string_lossy());
+        let raws: HashSet<String> = app.candidates.iter().map(|c| c.raw.clone()).collect();
+        // $PWD itself, its children, and at least one ancestor are present.
+        assert!(raws.contains(&tree.to_string_lossy().into_owned()));
+        assert!(raws.contains(&tree.join("child_a").to_string_lossy().into_owned()));
+        assert!(raws.contains(&tree.join("child_b").to_string_lossy().into_owned()));
+        assert!(app
+            .candidates
+            .iter()
+            .all(|c| c.source == CandidateSource::Discovered));
+        let _ = fs::remove_dir_all(&tree);
+    }
+
+    #[test]
+    fn ingest_after_deleting_all_history_does_not_panic() {
+        // Repro: delete every history row (Ctrl+D's main use), then a small
+        // discovery batch arrives. If `discovered_start` isn't decremented on
+        // removal it stays stale-high and `candidates[discovered_start..]` panics
+        // once the start exceeds the pool length.
+        let mut app = App::with_preview_worker(
+            build_candidates(&recs(&[("/h1", 0.9), ("/h2", 0.8)])),
+            None,
+            false,
+        );
+        assert_eq!(app.discovered_start, 2);
+        app.exclude_subtree("/h1");
+        app.exclude_subtree("/h2");
+        assert!(app.candidates.is_empty());
+        // Must not panic on the slice inside ingest.
+        app.ingest_discovered(vec![vec!["/d/a".to_string()]]);
+        assert_eq!(app.candidates.len(), 1);
+        assert_eq!(app.candidates[0].source, CandidateSource::Discovered);
+    }
+
+    #[test]
+    fn ingest_after_deleting_history_keeps_discovered_suffix_sorted() {
+        // Deleting a history row must shift `discovered_start` so the whole
+        // discovered suffix stays in the sort window; otherwise the leading
+        // discovered rows freeze in insertion order.
+        let mut app = App::with_preview_worker(
+            build_candidates(&recs(&[("/h1", 0.9), ("/h2", 0.8)])),
+            None,
+            false,
+        );
+        app.ingest_discovered(vec![vec!["/d/z".to_string()]]);
+        app.exclude_subtree("/h1"); // history prefix shrinks by one
+        app.ingest_discovered(vec![vec!["/d/a".to_string()]]);
+        let discovered: Vec<_> = app
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.source == CandidateSource::Discovered)
+            .map(|candidate| candidate.raw.clone())
+            .collect();
+        // Both score 0 -> path ascending across the whole suffix.
+        assert_eq!(discovered, vec!["/d/a".to_string(), "/d/z".to_string()]);
     }
 }

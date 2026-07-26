@@ -149,7 +149,9 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
     // 3) 计算推荐路径（推荐算法完全由 recommend 控制）
     //    注意：这里保留 Recommendation（含融合分 score），交给 TUI 渲染分数条。
     let items = recommend(&opt);
-    if items.is_empty() {
+    // 空历史：非交互仍退 2（契约不变）；交互则照常打开 picker——目录树发现层
+    // 与 $PWD 自举会给它候选，历史为空也能模糊搜索没 cd 过的目录。
+    if items.is_empty() && !interactive {
         return 2;
     }
 
@@ -245,6 +247,7 @@ mod tests {
             cache_dir: root.join("cache"),
             history_raw: root.join("data").join("history").join("history_raw"),
             history_uniq: root.join("data").join("history").join("history_uniq"),
+            excludes: root.join("data").join("excludes"),
         };
         fs::create_dir_all(paths.history_raw.parent().unwrap()).unwrap();
         fs::write(&paths.history_raw, format!("1\t{}\n", root.display())).unwrap();
