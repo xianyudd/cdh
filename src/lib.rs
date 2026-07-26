@@ -4,6 +4,7 @@ pub mod app;
 pub mod config;
 pub mod controller;
 pub mod discover;
+pub mod excludes;
 pub mod frecency;
 pub mod history;
 pub mod paths;

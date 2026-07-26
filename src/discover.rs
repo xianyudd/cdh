@@ -163,7 +163,9 @@ pub(crate) fn discover_enabled() -> bool {
 /// `/mnt/d` 这类历史条目的父目录 `/mnt` 加成扫描根，若判成本地，它就会进阶段 1b
 /// 那个「本地专用、绝不能被慢挂载阻塞」的堆——挂死的网络挂载在那里一次
 /// 不可中断的 `read_dir` 就能把整个防饥饿设计卡住。
-fn under_prefix(path: &str, prefix: &str) -> bool {
+/// （`crate::excludes` 也用它做子树匹配——同一个「路径是否落在某个目录之内」的
+/// 问题，只保留一份实现。）
+pub(crate) fn under_prefix(path: &str, prefix: &str) -> bool {
     let root = prefix.strip_suffix('/').unwrap_or(prefix);
     path.strip_prefix(root)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
@@ -351,6 +353,23 @@ fn push_node(heap: &mut BinaryHeap<Reverse<Prioritized>>, key: (u32, u64), node:
 
 fn path_has_prefix(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|prefix| under_prefix(path, prefix))
+}
+
+/// 从根列表里剔除被排除的根。
+///
+/// `prune_abs` 只挡子目录，挡不住根自己：被排除的目录仍可能因为祖先关系被算成扫描根
+/// （`$HOME` 全树、或某条历史条目的父目录），那样整棵子树会照旧被遍历、只是发射出来
+/// 的路径最后在 UI 侧被滤掉——I/O 一点没省，而省掉那部分 I/O 正是排除清单的主要收益。
+fn drop_excluded_roots(roots: &mut Vec<RootSpec>, excluded: &HashSet<String>) {
+    if excluded.is_empty() {
+        return;
+    }
+    roots.retain(|root| {
+        let path = root.path.to_string_lossy();
+        !excluded
+            .iter()
+            .any(|prefix| under_prefix(&path, prefix.as_str()))
+    });
 }
 
 /// 一次扫描任务。
@@ -636,7 +655,10 @@ pub(crate) fn run<F: FnMut(Vec<String>) -> bool>(job: ScanJob, on_batch: F) {
 ///
 /// 放弃语义：调用方退出时直接丢弃 `Receiver`、不 join——死挂载上的 `read_dir`
 /// 不可中断，靠进程退出回收线程。
-pub(crate) fn spawn(history_paths: Vec<String>) -> Option<mpsc::Receiver<Vec<String>>> {
+pub(crate) fn spawn(
+    history_paths: Vec<String>,
+    excluded: HashSet<String>,
+) -> Option<mpsc::Receiver<Vec<String>>> {
     if !discover_enabled() {
         return None;
     }
@@ -648,11 +670,13 @@ pub(crate) fn spawn(history_paths: Vec<String>) -> Option<mpsc::Receiver<Vec<Str
     thread::Builder::new()
         .name("cdh-discover".to_string())
         .spawn(move || {
-            let roots = compute_roots(&history_paths, home.as_deref(), &scan_env);
+            let mut roots = compute_roots(&history_paths, home.as_deref(), &scan_env);
+            drop_excluded_roots(&mut roots, &excluded);
             if roots.is_empty() {
                 return;
             }
-            let prune_abs = prune_abs_set(home.as_deref());
+            let mut prune_abs = prune_abs_set(home.as_deref());
+            prune_abs.extend(excluded);
             let job = ScanJob {
                 roots,
                 cap: CANDIDATE_CAP,
@@ -929,6 +953,30 @@ mod tests {
     fn discover_enabled_reads_switch() {
         // 只验证解析函数纯逻辑（不动全局 env 的既有值）。
         assert!(discover_enabled() || !discover_enabled()); // 不 panic
+    }
+
+    #[test]
+    fn excluded_roots_are_dropped_before_the_scan_starts() {
+        // 排除的收益主要在省 I/O：根这一层不滤掉，整棵子树照样被遍历，只是发射出来
+        // 的路径最后在 UI 侧被丢掉。
+        // （变异验证：把 drop_excluded_roots 改成空函数，第一条断言即失败。）
+        let mut roots = vec![
+            root(PathBuf::from("/home/u/miniforge3"), 1, UNLIMITED),
+            root(PathBuf::from("/home/u/miniforge3/envs"), 1, UNLIMITED),
+            root(PathBuf::from("/home/u/work"), 1, UNLIMITED),
+        ];
+        let excluded: HashSet<String> = ["/home/u/miniforge3".to_string()].into_iter().collect();
+        drop_excluded_roots(&mut roots, &excluded);
+        let kept: Vec<_> = roots
+            .iter()
+            .map(|root| root.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept, vec!["/home/u/work".to_string()]);
+
+        // 空清单是常态，必须原样放行。
+        let mut roots = vec![root(PathBuf::from("/home/u/work"), 1, UNLIMITED)];
+        drop_excluded_roots(&mut roots, &HashSet::new());
+        assert_eq!(roots.len(), 1);
     }
 
     #[test]
