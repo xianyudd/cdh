@@ -66,6 +66,11 @@ impl Excludes {
         self.roots.is_empty()
     }
 
+    /// 清单条目，排序稳定（供 TUI 面板逐条展示与删除）。
+    pub fn roots(&self) -> &[String] {
+        &self.roots
+    }
+
     /// `path` 是否落在某条排除记录之内（等于它，或是它的子孙）。
     pub fn contains(&self, path: &str) -> bool {
         self.roots
@@ -104,6 +109,21 @@ impl Excludes {
 pub fn add(file: &Path, dir: &str) -> io::Result<Excludes> {
     let mut excludes = Excludes::load(file);
     if excludes.insert(dir) {
+        write(file, &excludes)?;
+    }
+    Ok(excludes)
+}
+
+/// 删掉一条排除记录并落盘，返回更新后的清单。
+///
+/// 按**精确条目**删，不做子树推断：清单里本来就不存在相互包含的条目，用户在面板上
+/// 看到什么就删掉什么。条目不存在时视为已达成目标，不报错。
+pub fn remove(file: &Path, dir: &str) -> io::Result<Excludes> {
+    let mut excludes = Excludes::load(file);
+    let dir = dir.trim().trim_end_matches('/');
+    let before = excludes.roots.len();
+    excludes.roots.retain(|root| root != dir);
+    if excludes.roots.len() != before {
         write(file, &excludes)?;
     }
     Ok(excludes)
@@ -178,6 +198,24 @@ mod tests {
         assert!(excludes.contains("/a/b/deep"));
         assert!(excludes.contains("/c/d"));
         assert!(!excludes.contains("/e"));
+    }
+
+    #[test]
+    fn remove_drops_exactly_one_entry_and_tolerates_misses() {
+        let file = temp_file("remove");
+        let _ = fs::remove_file(&file);
+        add(&file, "/a/one").unwrap();
+        add(&file, "/a/two").unwrap();
+
+        let excludes = remove(&file, "/a/one").unwrap();
+        assert_eq!(excludes.roots(), ["/a/two".to_string()]);
+        assert!(!Excludes::load(&file).contains("/a/one"));
+        // 精确条目，不做子树推断：删父目录不该顺手带走别的条目。
+        assert!(Excludes::load(&file).contains("/a/two"));
+        // 尾斜杠等价；不存在的条目视为已达成，不报错。
+        assert!(remove(&file, "/a/two/").unwrap().is_empty());
+        assert!(remove(&file, "/never/there").unwrap().is_empty());
+        let _ = fs::remove_file(&file);
     }
 
     #[test]
