@@ -37,6 +37,7 @@ pub(super) enum TextKey {
     ExcludesEmpty,
     ExcludesFooter,
     ExcludeRemoved,
+    ExcludeRemovedNoRescan,
     OpenExcludes,
     NoDeletableHistory,
     MissingDeleteHint,
@@ -164,6 +165,11 @@ impl Language {
             ExcludeRemoved => self.pick(
                 "已取消排除，正在找回该目录",
                 "Un-excluded; bringing the directory back",
+            ),
+            // 发现层关掉时（`CDH_DISCOVER=0`）没有补扫可跑，别说「正在找回」。
+            ExcludeRemovedNoRescan => self.pick(
+                "已取消排除（发现层已关闭，重启后可见）",
+                "Un-excluded; discovery is off, so it returns on next launch",
             ),
             OpenExcludes => self.pick("打开排除清单", "Open exclusion list"),
             NoDeletableHistory => self.pick("没有可排除的目录", "No directory to exclude"),
