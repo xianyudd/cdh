@@ -45,7 +45,10 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use regex::Regex;
+
 use crate::discover;
+use crate::excludes::{self, Excludes};
 use crate::recommend::Recommendation;
 use crate::{history, AppContext, Paths};
 #[cfg(test)]
@@ -1285,6 +1288,19 @@ struct App {
     /// and never reordered; the suffix is the discovery layer, kept sorted by
     /// (score desc, path asc) so the empty-query view is deterministic.
     discovered_start: usize,
+    /// User exclusion list, subtree semantics. Nothing under an excluded root
+    /// reaches the pool: history candidates are filtered at startup, discovered
+    /// ones in `ingest_discovered`, and the scan worker takes the same set as a
+    /// prune set so the subtree is never even `read_dir`'d.
+    excludes: Excludes,
+    /// Where the exclusion list lives. `None` without an `AppContext` (no disk
+    /// to write to), in which case Ctrl+D reports instead of pretending.
+    excludes_path: Option<PathBuf>,
+    /// `CDH_IGNORE_RE`. History candidates were already filtered by it inside
+    /// the recommend pipeline, but discovered ones are pushed straight into
+    /// `ingest_discovered` and bypass that pipeline entirely -- without this
+    /// second check the user's regex silently stops applying to ~98% of the pool.
+    ignore_re: Option<Regex>,
 }
 
 impl App {
@@ -1389,6 +1405,9 @@ impl App {
             home: env::var("HOME").ok().filter(|home| !home.is_empty()),
             known_paths,
             discovered_start,
+            excludes: Excludes::default(),
+            excludes_path: None,
+            ignore_re: None,
         };
         app.notice = loaded.warning.map(|warning| {
             format!(
@@ -1494,6 +1513,18 @@ impl App {
         let mut added = false;
         for batch in batches {
             for raw in batch {
+                // Checked before the fingerprint insert so a filtered path stays
+                // genuinely unknown: batches already in flight when the user
+                // excludes something still have to be dropped here, and the
+                // prune set only stops descent, not paths already queued.
+                if self.excludes.contains(&raw)
+                    || self
+                        .ignore_re
+                        .as_ref()
+                        .is_some_and(|pattern| pattern.is_match(&raw))
+                {
+                    continue;
+                }
                 if !self.known_paths.insert(path_fingerprint(&raw)) {
                     // History or an earlier discovery already owns this path.
                     continue;
@@ -1702,26 +1733,32 @@ impl App {
         self.set_selected(self.filtered_results.len().saturating_sub(1))
     }
 
-    fn remove_candidate(&mut self, idx: usize) {
-        if idx >= self.candidates.len() {
-            self.notice = Some(self.language.text(TextKey::RecordMissing).to_string());
-            return;
-        }
+    /// Drop `root` and everything under it from the pool.
+    ///
+    /// Subtree rather than single row, because that is what the exclusion list
+    /// stores: excluding `~/miniforge3` while its 6,000 children stayed on
+    /// screen would read as a broken delete. Fingerprints stay in `known_paths`
+    /// — the excluded paths can no longer be produced anyway, so removing them
+    /// would only cost hashing.
+    fn exclude_subtree(&mut self, root: &str) {
         let selected = self.selected_index;
-        // The path's fingerprint stays in `known_paths` on purpose. Dropping it
-        // would let the discovery scan re-surface the directory moments later,
-        // which reads as "the delete did nothing"; keeping it means a deleted
-        // record stays gone for the rest of the session and comes back — as a
-        // discovered row, not a history row — only on the next launch.
-        self.candidates.remove(idx);
         // Keep `discovered_start` pointing at the first discovered candidate.
-        // Removing anything in the history prefix shifts the whole discovered
-        // suffix left by one; forgetting this leaves the start stale-high, which
-        // both drops the leading discovered rows out of the sort window and, once
-        // the start exceeds the pool length, panics the next `[start..]` slice.
-        if idx < self.discovered_start {
-            self.discovered_start -= 1;
-        }
+        // Every removal inside the history prefix shifts the whole discovered
+        // suffix left; forgetting this leaves the start stale-high, which both
+        // drops the leading discovered rows out of the sort window and, once the
+        // start exceeds the pool length, panics the next `[start..]` slice.
+        let discovered_start = self.discovered_start;
+        let mut removed_from_history = 0;
+        let mut idx = 0;
+        self.candidates.retain(|candidate| {
+            let keep = !discover::under_prefix(&candidate.raw, root);
+            if !keep && idx < discovered_start {
+                removed_from_history += 1;
+            }
+            idx += 1;
+            keep
+        });
+        self.discovered_start -= removed_from_history;
         self.filtered_results = self.filter.run(&self.candidates, &self.query);
         self.selected_index = selected.min(self.filtered_results.len().saturating_sub(1));
         self.sync_pagination();
@@ -2054,16 +2091,37 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
     let loaded = UiSettings::load(config_dir.join("tui.toml"), UiEnvironment::from_process());
     let initial_mouse = loaded.settings.effective().mouse;
     let locale_language = detect_locale_language();
+
+    // Exclusions are applied before the pool is built, not after: a filtered-out
+    // candidate must never reach `known_paths`, or the scan would treat it as
+    // already-owned and the row would be missing from history and discovery both.
+    let excludes = ctx
+        .map(|context| Excludes::load(&context.paths.excludes))
+        .unwrap_or_default();
+    let items: Vec<Recommendation> = items
+        .iter()
+        .filter(|item| !excludes.contains(&item.path))
+        .cloned()
+        .collect();
+
     let mut app = App::new(
-        build_candidates_with_visits(items, &last_visits),
+        build_candidates_with_visits(&items, &last_visits),
         loaded,
         locale_language,
     );
+    app.excludes = excludes;
+    app.excludes_path = ctx.map(|context| context.paths.excludes.clone());
+    app.ignore_re = ctx.and_then(|context| context.config.ignore_re.clone());
 
     // Wire up the directory-tree discovery layer. The score map orders the
-    // discovered candidates; the scan worker streams new paths in on a channel.
-    app.discover_score_map = build_score_map(items);
-    app.discover_rx = discover::spawn(items.iter().map(|item| item.path.clone()).collect());
+    // discovered candidates; the scan worker streams new paths in on a channel
+    // and takes the exclusion list as a prune set, so excluded subtrees cost no
+    // I/O at all rather than being filtered out after the fact.
+    app.discover_score_map = build_score_map(&items);
+    app.discover_rx = discover::spawn(
+        items.iter().map(|item| item.path.clone()).collect(),
+        app.excludes.prune_set(),
+    );
     // Empty-history bootstrap: seed from $PWD before the loop so the first frame
     // isn't blank while the full scan spins up.
     if app.candidates.is_empty() {
@@ -2247,20 +2305,37 @@ fn handle_key_confirm_delete(
         );
         return None;
     };
-    let Some(path) = app
-        .candidates
-        .get(candidate_idx)
-        .map(|candidate| candidate.raw.clone())
-    else {
+    let Some(candidate) = app.candidates.get(candidate_idx) else {
         app.notice = Some(app.language.text(TextKey::RecordMissing).to_string());
         return None;
     };
-    match history::remove_path(ctx, &path) {
-        Ok(()) => app.remove_candidate(candidate_idx),
-        Err(error) => {
+    let path = candidate.raw.clone();
+    let from_history = candidate.source == CandidateSource::History;
+
+    // History rows lose their history entry too, not just their visibility. The
+    // exclusion list only governs what the picker shows; leaving the record on
+    // disk would keep it feeding frecency and would bring the row straight back
+    // for anyone running with `CDH_DISCOVER=0`.
+    if from_history {
+        if let Err(error) = history::remove_path(ctx, &path) {
             app.notice = Some(format!(
                 "{}{error}",
                 app.language.text(TextKey::DeleteFailedPrefix)
+            ));
+            return None;
+        }
+    }
+    match excludes::add(&ctx.paths.excludes, &path) {
+        Ok(excludes) => {
+            app.excludes = excludes;
+            app.exclude_subtree(&path);
+        }
+        Err(error) => {
+            // The history entry is already gone at this point; say what failed
+            // rather than implying the whole action rolled back.
+            app.notice = Some(format!(
+                "{}{error}",
+                app.language.text(TextKey::ExcludeFailedPrefix)
             ));
         }
     }
@@ -2277,22 +2352,11 @@ fn handle_key_normal(
         KeyCode::Char('u') if ctrl => {
             app.clear_query();
         }
-        KeyCode::Char('d') if ctrl => match app.selected_candidate() {
-            // Discovered rows have no history entry; deleting would only rewrite
-            // the history files for a path that isn't there. Disable it outright
-            // rather than risk corrupting history.
-            Some(candidate) if candidate.source == CandidateSource::Discovered => {
-                app.notice = Some(
-                    app.language
-                        .text(TextKey::DiscoveredNotDeletable)
-                        .to_string(),
-                );
-            }
-            Some(_) => {
-                if let Some(candidate_idx) = app.selected_candidate_idx() {
-                    app.mode = Mode::ConfirmDelete { candidate_idx };
-                }
-            }
+        // Works on discovered rows too. They have no history entry to delete,
+        // but with 50k of them on tap, banishing noise is the whole point of the
+        // key -- refusing there left the pool with no in-TUI way to get quieter.
+        KeyCode::Char('d') if ctrl => match app.selected_candidate_idx() {
+            Some(candidate_idx) => app.mode = Mode::ConfirmDelete { candidate_idx },
             None => {
                 app.notice = Some(app.language.text(TextKey::NoDeletableHistory).to_string());
             }
@@ -5233,6 +5297,7 @@ mod tests {
             cache_dir: root.join("cache"),
             history_raw: root.join("data").join("history").join("history_raw"),
             history_uniq: root.join("data").join("history").join("history_uniq"),
+            excludes: root.join("data").join("excludes"),
         };
         fs::create_dir_all(paths.history_raw.parent().unwrap()).unwrap();
         (
@@ -5911,8 +5976,13 @@ mod tests {
             "2 hours ago"
         );
 
-        let message = confirm_delete_message("~/archive/old-project", 50, Language::En);
-        assert_eq!(message, "Delete history entry “~/archive/old-project”?");
+        // 80, not 50: the subtree clause makes the English sentence 61 columns,
+        // so a 50-column budget now exercises truncation rather than the copy.
+        let message = confirm_delete_message("~/archive/old-project", 80, Language::En);
+        assert_eq!(
+            message,
+            "Stop showing “~/archive/old-project” and everything under it?"
+        );
     }
 
     #[test]
@@ -5957,7 +6027,7 @@ mod tests {
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None);
         assert_eq!(
             app.notice.as_deref(),
-            Some("Directory is missing; press Ctrl+D to delete its history entry")
+            Some("Directory is missing; press Ctrl+D to exclude it")
         );
 
         app.query = "not-found".to_string();
@@ -6560,16 +6630,16 @@ mod tests {
         let mut app = app_with_paths(&[("/a", 0.9), ("/b", 0.8), ("/c", 0.7)]);
         app.set_page_size(2);
         app.set_selected(2);
-        let idx = app.selected_candidate_idx().unwrap();
-        app.remove_candidate(idx);
+        let selected = app.selected_raw().unwrap();
+        app.exclude_subtree(&selected);
         assert_eq!(app.filtered_results.len(), 2);
         assert_eq!(app.selected_index, 1);
         assert_eq!(app.page().page, 1);
 
-        let idx = app.selected_candidate_idx().unwrap();
-        app.remove_candidate(idx);
-        let idx = app.selected_candidate_idx().unwrap();
-        app.remove_candidate(idx);
+        let selected = app.selected_raw().unwrap();
+        app.exclude_subtree(&selected);
+        let selected = app.selected_raw().unwrap();
+        app.exclude_subtree(&selected);
         assert!(app.filtered_results.is_empty());
         assert_eq!(app.selected_index, 0);
     }
@@ -6597,10 +6667,7 @@ mod tests {
             handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, None),
             None
         );
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("目录已失效，按 Ctrl+D 删除历史记录")
-        );
+        assert_eq!(app.notice.as_deref(), Some("目录已失效，按 Ctrl+D 排除它"));
     }
 
     #[test]
@@ -6650,7 +6717,96 @@ mod tests {
             fs::read_to_string(&ctx.paths.history_uniq).unwrap(),
             format!("{}\n", keep.display())
         );
+        // Deleting a history row must also write the exclusion list, or the
+        // directory walks straight back in as a discovered row on next launch --
+        // and discovered rows carry no history entry to delete a second time.
+        assert!(
+            crate::excludes::Excludes::load(&ctx.paths.excludes).contains(stale.to_str().unwrap())
+        );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ctrl_d_on_discovered_row_excludes_without_touching_history() {
+        let (root, ctx) = test_ctx("exclude_discovered");
+        let keep = root.join("keep");
+        fs::create_dir_all(&keep).unwrap();
+        let history_line = format!("{}\n", keep.display());
+        fs::write(&ctx.paths.history_raw, format!("100\t{}\n", keep.display())).unwrap();
+        fs::write(&ctx.paths.history_uniq, &history_line).unwrap();
+        let mut app = App::with_preview_worker(
+            build_candidates(&recs(&[(keep.to_str().unwrap(), 0.8)])),
+            None,
+            false,
+        );
+        let noise = root.join("noise");
+        app.ingest_discovered(vec![vec![
+            noise.to_string_lossy().into_owned(),
+            noise.join("deep/deeper").to_string_lossy().into_owned(),
+        ]]);
+        assert_eq!(app.candidates.len(), 3);
+        app.set_selected(1);
+        assert_eq!(
+            app.selected_candidate().unwrap().source,
+            CandidateSource::Discovered
+        );
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            Some(&ctx),
+        );
+        handle_key(
+            &mut app,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            Some(&ctx),
+        );
+
+        // The subtree goes, not just the selected row.
+        assert_eq!(app.candidates.len(), 1);
+        assert_eq!(app.candidates[0].raw, keep.to_str().unwrap());
+        assert!(app
+            .excludes
+            .contains(&noise.join("deep/deeper").to_string_lossy()));
+        assert!(
+            crate::excludes::Excludes::load(&ctx.paths.excludes).contains(&noise.to_string_lossy())
+        );
+        // A discovered row has no history entry; the history files must be
+        // untouched rather than rewritten for a path that was never in them.
+        assert_eq!(
+            fs::read_to_string(&ctx.paths.history_uniq).unwrap(),
+            history_line
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn excluded_and_ignored_paths_never_enter_the_pool() {
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/h", 0.9)])), None, false);
+        app.excludes = crate::excludes::Excludes::from_paths(["/noise"]);
+        app.ignore_re = Some(Regex::new("/target/").unwrap());
+        app.ingest_discovered(vec![vec![
+            "/noise".to_string(),
+            "/noise/deep".to_string(),
+            "/keep/src".to_string(),
+            "/keep/target/debug".to_string(),
+        ]]);
+        let discovered: Vec<_> = app
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.source == CandidateSource::Discovered)
+            .map(|candidate| candidate.raw.as_str())
+            .collect();
+        assert_eq!(discovered, vec!["/keep/src"]);
+        // Filtered paths must stay unknown: recording them as seen would make a
+        // later, legitimate arrival of the same path dedup away into nothing.
+        assert!(!app.known_paths.contains(&path_fingerprint("/noise/deep")));
+        assert!(!app
+            .known_paths
+            .contains(&path_fingerprint("/keep/target/debug")));
     }
 
     #[test]
@@ -6776,8 +6932,10 @@ mod tests {
             Language::ZhCn,
         );
         assert!(UnicodeWidthStr::width(message.as_str()) <= 32);
-        assert!(message.starts_with("删除历史记录 “"));
-        assert!(message.ends_with("”？"));
+        assert!(message.starts_with("不再显示 “"));
+        // The subtree half of the sentence must survive truncation: it is the
+        // difference between hiding one row and hiding a few thousand.
+        assert!(message.ends_with("” 及其子目录？"));
     }
 
     #[test]
@@ -7084,7 +7242,11 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_on_discovered_row_is_disabled_and_never_confirms() {
+    fn ctrl_d_on_discovered_row_arms_confirmation_too() {
+        // Discovered rows have no history entry, but Ctrl+D now excludes rather
+        // than deletes, and excluding noise out of a 50k pool is exactly what a
+        // discovered row needs. Refusing here would leave the discovery layer
+        // with no in-TUI way to get quieter.
         let mut app =
             App::with_preview_worker(build_candidates(&recs(&[("/hist", 0.9)])), None, false);
         app.ingest_discovered(vec![vec!["/disc/a".to_string()]]);
@@ -7095,9 +7257,7 @@ mod tests {
         );
         let result = handle_key_normal(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
         assert!(result.is_none());
-        // Must not arm the delete confirmation for a path that has no history.
-        assert_eq!(app.mode, Mode::Normal);
-        assert!(app.notice.is_some());
+        assert!(matches!(app.mode, Mode::ConfirmDelete { .. }));
     }
 
     #[test]
@@ -7147,8 +7307,8 @@ mod tests {
             false,
         );
         assert_eq!(app.discovered_start, 2);
-        app.remove_candidate(0); // delete /h1
-        app.remove_candidate(0); // delete /h2
+        app.exclude_subtree("/h1");
+        app.exclude_subtree("/h2");
         assert!(app.candidates.is_empty());
         // Must not panic on the slice inside ingest.
         app.ingest_discovered(vec![vec!["/d/a".to_string()]]);
@@ -7167,7 +7327,7 @@ mod tests {
             false,
         );
         app.ingest_discovered(vec![vec!["/d/z".to_string()]]);
-        app.remove_candidate(0); // delete /h1 (history prefix)
+        app.exclude_subtree("/h1"); // history prefix shrinks by one
         app.ingest_discovered(vec![vec!["/d/a".to_string()]]);
         let discovered: Vec<_> = app
             .candidates

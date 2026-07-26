@@ -10,6 +10,9 @@
 //! 历史文件：
 //!   DATA/history/history_raw
 //!   DATA/history/history_uniq
+//!
+//! 排除清单：
+//!   DATA/excludes
 
 use std::env;
 use std::path::PathBuf;
@@ -29,6 +32,8 @@ pub struct Paths {
     pub history_raw: PathBuf,
     /// 最近唯一历史：DATA/history/history_uniq
     pub history_uniq: PathBuf,
+    /// 用户排除清单：DATA/excludes（不存在即空清单）
+    pub excludes: PathBuf,
 }
 
 impl Paths {
@@ -67,6 +72,9 @@ impl Paths {
         let history_raw = history_dir.join("history_raw");
         let history_uniq = history_dir.join("history_uniq");
 
+        // 排除清单和历史平级放在 DATA 下：它是用户数据（手按出来的），不是配置。
+        let excludes = data_dir.join("excludes");
+
         Self {
             config_dir,
             data_dir,
@@ -74,6 +82,7 @@ impl Paths {
             cache_dir,
             history_raw,
             history_uniq,
+            excludes,
         }
     }
 }

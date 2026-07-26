@@ -247,6 +247,7 @@ mod tests {
             cache_dir: root.join("cache"),
             history_raw: root.join("data").join("history").join("history_raw"),
             history_uniq: root.join("data").join("history").join("history_uniq"),
+            excludes: root.join("data").join("excludes"),
         };
         fs::create_dir_all(paths.history_raw.parent().unwrap()).unwrap();
         fs::write(&paths.history_raw, format!("1\t{}\n", root.display())).unwrap();
