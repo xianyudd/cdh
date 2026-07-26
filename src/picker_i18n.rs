@@ -33,6 +33,11 @@ pub(super) enum TextKey {
     HistoryWriteUnavailable,
     DeleteFailedPrefix,
     ExcludeFailedPrefix,
+    ExcludesTitle,
+    ExcludesEmpty,
+    ExcludesFooter,
+    ExcludeRemoved,
+    OpenExcludes,
     NoDeletableHistory,
     MissingDeleteHint,
     NoJumpTarget,
@@ -147,6 +152,20 @@ impl Language {
             ),
             DeleteFailedPrefix => self.pick("删除历史记录失败: ", "Deleting history entry failed: "),
             ExcludeFailedPrefix => self.pick("写入排除清单失败: ", "Writing exclusion list failed: "),
+            ExcludesTitle => self.pick("排除清单", "Excluded directories"),
+            ExcludesEmpty => self.pick(
+                "清单为空 —— 在列表里按 Ctrl+D 可排除目录",
+                "Nothing excluded yet — press Ctrl+D on a row to exclude it",
+            ),
+            ExcludesFooter => self.pick(
+                "上下选择 · Ctrl+D 取消排除 · F4/Esc 关闭",
+                "Up/Down select · Ctrl+D un-exclude · F4/Esc close",
+            ),
+            ExcludeRemoved => self.pick(
+                "已取消排除，正在找回该目录",
+                "Un-excluded; bringing the directory back",
+            ),
+            OpenExcludes => self.pick("打开排除清单", "Open exclusion list"),
             NoDeletableHistory => self.pick("没有可排除的目录", "No directory to exclude"),
             MissingDeleteHint => self.pick(
                 "目录已失效，按 Ctrl+D 排除它",
