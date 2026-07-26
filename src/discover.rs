@@ -22,8 +22,10 @@
 //!   缓存目录名 + 按绝对路径点名的几个工具存储目录；保留隐藏目录（垃圾按名字点名，
 //!   不按属性一刀切）；不跟符号链接；无权限静默跳过。
 //!
-//! * **边界**：候选数上限 50,000 + 全局时间预算 ~5s。深度上限是工作量的代理指标，
-//!   这里直接约束工作量本身，BFS 保证截断时丢的是「最深最不可能」的尾部。
+//! * **边界**：候选数上限 50,000 + 全局时间预算 ~5s，之后还有一段最多 300ms 的
+//!   收尾补齐（`TOPUP_GRACE`，把慢挂载没认领的槽用本地填满），所以最坏总时长是
+//!   预算 + 宽限。深度上限是工作量的代理指标，这里直接约束工作量本身，BFS 保证
+//!   截断时丢的是「最深最不可能」的尾部。
 //!
 //! 纯 std 实现，不用 `ignore` crate、不依赖 fd、不建磁盘索引。
 
@@ -154,10 +156,23 @@ pub(crate) fn discover_enabled() -> bool {
     }
 }
 
+/// 前缀匹配：`prefix` 当作目录看，既匹配其子孙，也匹配挂载根**自身**。
+///
+/// 尾斜杠有无等价（`/mnt` 与 `/mnt/` 同义），两边都在目录边界上对齐——所以
+/// `/mnt` 命中而 `/mnturbo` 不命中。挂载根自身必须命中：`compute_roots` 会把
+/// `/mnt/d` 这类历史条目的父目录 `/mnt` 加成扫描根，若判成本地，它就会进阶段 1b
+/// 那个「本地专用、绝不能被慢挂载阻塞」的堆——挂死的网络挂载在那里一次
+/// 不可中断的 `read_dir` 就能把整个防饥饿设计卡住。
+fn under_prefix(path: &str, prefix: &str) -> bool {
+    let root = prefix.strip_suffix('/').unwrap_or(prefix);
+    path.strip_prefix(root)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 fn is_slow_mount(path: &str) -> bool {
     SLOW_MOUNT_PREFIXES
         .iter()
-        .any(|prefix| path.starts_with(prefix))
+        .any(|prefix| under_prefix(path, prefix))
 }
 
 /// 默认慢挂载前缀（`String` 形式，供 `ScanJob::slow_prefixes` 使用）。
@@ -335,9 +350,7 @@ fn push_node(heap: &mut BinaryHeap<Reverse<Prioritized>>, key: (u32, u64), node:
 }
 
 fn path_has_prefix(path: &str, prefixes: &[String]) -> bool {
-    prefixes
-        .iter()
-        .any(|prefix| path.starts_with(prefix.as_str()))
+    prefixes.iter().any(|prefix| under_prefix(path, prefix))
 }
 
 /// 一次扫描任务。
@@ -916,6 +929,27 @@ mod tests {
     fn discover_enabled_reads_switch() {
         // 只验证解析函数纯逻辑（不动全局 env 的既有值）。
         assert!(discover_enabled() || !discover_enabled()); // 不 panic
+    }
+
+    #[test]
+    fn mount_root_itself_counts_as_slow() {
+        // 挂载根自身必须判成慢挂载：历史里有 /mnt/d 时 compute_roots 会把 /mnt 加成
+        // 扫描根，判成本地就会让 9p 的 read_dir 进到阶段 1b 那个本地专用堆里。
+        // （变异验证：把 under_prefix 换回 `path.starts_with(prefix)`，第一条断言即失败。）
+        assert!(is_slow_mount("/mnt"));
+        assert!(is_slow_mount("/mnt/"));
+        assert!(is_slow_mount("/mnt/d"));
+        assert!(is_slow_mount("/media"));
+        assert!(is_slow_mount("/Volumes"));
+        // 目录边界对齐：同前缀的另一个目录名不算。
+        assert!(!is_slow_mount("/mnturbo"));
+        assert!(!is_slow_mount("/media-server/x"));
+        assert!(!is_slow_mount("/home/a"));
+        // 注入前缀（单测用）走同一条规则。
+        let prefixes = vec!["/tmp/t/slow".to_string()];
+        assert!(path_has_prefix("/tmp/t/slow", &prefixes));
+        assert!(path_has_prefix("/tmp/t/slow/x", &prefixes));
+        assert!(!path_has_prefix("/tmp/t/slowpoke", &prefixes));
     }
 
     #[test]
