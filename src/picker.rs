@@ -1708,6 +1708,11 @@ impl App {
             return;
         }
         let selected = self.selected_index;
+        // The path's fingerprint stays in `known_paths` on purpose. Dropping it
+        // would let the discovery scan re-surface the directory moments later,
+        // which reads as "the delete did nothing"; keeping it means a deleted
+        // record stays gone for the rest of the session and comes back — as a
+        // discovered row, not a history row — only on the next launch.
         self.candidates.remove(idx);
         // Keep `discovered_start` pointing at the first discovered candidate.
         // Removing anything in the history prefix shifts the whole discovered
