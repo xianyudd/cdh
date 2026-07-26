@@ -697,6 +697,7 @@ mod tests {
     use super::*;
     use std::fs as stdfs;
     use std::os::unix::fs::symlink;
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -897,7 +898,7 @@ mod tests {
         let find = |path: &str, eff: u32| {
             roots
                 .iter()
-                .find(|r| r.path == PathBuf::from(tree.s(path)) && r.eff_depth == eff)
+                .find(|r| r.path == Path::new(&tree.s(path)) && r.eff_depth == eff)
         };
         // 1) 历史锚点：两个父目录，eff0 / rem1。
         assert!(find("home/work", 0).unwrap().remaining == ANCHOR_DESCENT);
