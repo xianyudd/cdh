@@ -10,7 +10,7 @@ Calm, precise, and fast. The interface should feel dependable under repeated dai
 
 ### Aesthetic Direction
 
-A refined utilitarian terminal interface: dense but breathable, keyboard-first, and compatible with both colored and color-disabled terminals. Visual hierarchy comes from restrained contrast, weight, alignment, and progressive disclosure rather than logos, score graphics, cards, gradients, or animation.
+A refined utilitarian terminal interface: dense but breathable, keyboard-first, and compatible with both colored and color-disabled terminals. Visual hierarchy comes from restrained contrast, weight, alignment, and progressive disclosure rather than logos, score graphics, cards, or gradients. Motion is limited to a non-blocking ambient corner accent that never steals focus or obscures the selected row.
 
 ### Design Principles
 
@@ -18,4 +18,4 @@ A refined utilitarian terminal interface: dense but breathable, keyboard-first, 
 2. Show only information that helps users choose or recover; reveal preview and help on demand.
 3. Preserve a stable layout across filtering, paging, resize, loading, and error states.
 4. Treat Unicode display width, narrow terminals, and color-disabled mode as first-class cases.
-5. Prefer immediate event-driven feedback and explicit recovery paths over motion or timed behavior.
+5. Prefer immediate event-driven feedback and explicit recovery paths over motion or timed behavior. Ambient corner motion is the sole exception and must remain non-blocking, colorless-safe (disabled), and opt-out via environment.

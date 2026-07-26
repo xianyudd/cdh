@@ -62,6 +62,21 @@ const PREVIEW_BOTTOM_MIN_WIDTH: u16 = 70;
 const PREVIEW_BOTTOM_MIN_HEIGHT: u16 = 18;
 const GIT_DIRTY_TIMEOUT: Duration = Duration::from_millis(300);
 const EVENT_POLL_FALLBACK: Duration = Duration::from_millis(100);
+/// Ambient cube frame interval. Every tick rebuilds the whole frame -- ratatui
+/// diffs the result so the terminal writes stay tiny, but the widget tree is
+/// reconstructed regardless, and this runs precisely while the user sits
+/// reading. 20fps is well past smooth for something turning at a fifth of a
+/// revolution per second, and costs a third less idle work than 30.
+/// Ambient corner wireframe cube: small, continuous, non-blocking chrome.
+const CORNER_3D_WIDTH: u16 = 14;
+const CORNER_3D_HEIGHT: u16 = 7;
+const CORNER_3D_FRAME: Duration = Duration::from_millis(50);
+/// Cube columns plus one blank separator column, carved out of the content area.
+const CORNER_3D_GUTTER: u16 = CORNER_3D_WIDTH + 1;
+/// Content width that must survive the gutter before the cube is allowed at
+/// all. Ambient decoration never costs the list room it actually needs, so on
+/// narrower terminals the cube simply does not appear.
+const CORNER_3D_MIN_CONTENT: u16 = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GitInfo {
@@ -1072,6 +1087,30 @@ impl PageWindow {
     }
 }
 
+/// Ambient corner 3D is opt-out, color-only chrome. Disabled when colorless or
+/// when `CDH_CORNER_3D` is set to a falsey value.
+fn corner_3d_enabled(color_enabled: bool) -> bool {
+    color_enabled && env_flag_enabled("CDH_CORNER_3D", true)
+}
+
+fn env_flag_enabled(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(value) => env_truthy(&value, default),
+        Err(_) => default,
+    }
+}
+
+fn env_truthy(value: &str, default: bool) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return default;
+    }
+    !(value.eq_ignore_ascii_case("0")
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("no"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
@@ -1111,6 +1150,8 @@ struct App {
     last_click: Option<(usize, Instant)>,
     last_list_area: Cell<Rect>,
     last_list_start: Cell<usize>,
+    /// Monotonic clock origin for the ambient corner wireframe cube.
+    corner_anim_started: Instant,
 }
 
 impl App {
@@ -1203,6 +1244,7 @@ impl App {
             last_click: None,
             last_list_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_list_start: Cell::new(0),
+            corner_anim_started: Instant::now(),
         };
         app.notice = loaded.warning.map(|warning| {
             format!(
@@ -1256,6 +1298,11 @@ impl App {
         self.page_size = page_size;
         self.restore_selected_path(selected_path.as_deref());
         true
+    }
+
+    fn corner_anim_angle(&self, now: Instant) -> f32 {
+        let elapsed = now.saturating_duration_since(self.corner_anim_started);
+        elapsed.as_secs_f32() * 1.15
     }
 
     fn restore_selected_path(&mut self, path: Option<&str>) {
@@ -1773,13 +1820,18 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
     loop {
         let terminal_size = terminal.size()?;
         let terminal_area = Rect::new(0, 0, terminal_size.width, terminal_size.height);
-        if app.set_page_size(page_size_for(terminal_area, app.preview_visible)) {
+        if app.set_page_size(page_size_for(
+            terminal_area,
+            app.preview_visible,
+            corner_3d_enabled(app.color_enabled),
+        )) {
             dirty = true;
         }
         if dirty {
+            let corner_angle = app.corner_anim_angle(Instant::now());
             terminal.draw(|frame| {
                 let theme = Theme::with_choice(app.color_enabled, app.theme_choice);
-                draw(frame, &app, &theme);
+                draw(frame, &app, &theme, corner_angle);
             })?;
             dirty = false;
         }
@@ -1790,7 +1842,17 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
             continue;
         }
 
-        if !event::poll(app.preview_wait_timeout(now))? {
+        let animating = corner_3d_enabled(app.color_enabled) && matches!(app.mode, Mode::Normal);
+        let timeout = if animating {
+            CORNER_3D_FRAME.min(app.preview_wait_timeout(now))
+        } else {
+            app.preview_wait_timeout(now)
+        };
+        if !event::poll(timeout)? {
+            // Keep the ambient cube moving while idle in Normal mode.
+            if animating {
+                dirty = true;
+            }
             continue;
         }
 
@@ -2074,9 +2136,38 @@ struct ScreenLayout {
     list: Rect,
     preview: Option<(Rect, PreviewPlacement)>,
     preview_unavailable: bool,
+    /// Reserved space for the ambient cube, already excluded from `list` and
+    /// `preview`. `None` when the cube is disabled or the terminal is too small.
+    corner: Option<Rect>,
 }
 
-fn screen_layout(full: Rect, preview_visible: bool) -> Option<ScreenLayout> {
+/// Carve the ambient cube's gutter out of the content area before the list and
+/// preview are laid out. The cube is chrome, so it gets reserved space rather
+/// than being painted over content: that keeps every list row the same width
+/// (paths truncate honestly, with the usual ellipsis) and lets the selection
+/// highlight span each row edge to edge.
+///
+/// The gutter spans the full content height even though the cube only occupies
+/// its bottom rows -- a uniform content width is what keeps rows from going
+/// ragged, and a stable layout is worth more than the blank columns above.
+fn reserve_corner_gutter(content: Rect, enabled: bool) -> (Rect, Option<Rect>) {
+    if !enabled
+        || content.height < CORNER_3D_HEIGHT
+        || content.width < CORNER_3D_GUTTER + CORNER_3D_MIN_CONTENT
+    {
+        return (content, None);
+    }
+    let width = content.width - CORNER_3D_GUTTER;
+    let corner = Rect {
+        x: content.x + width + 1,
+        y: content.y + content.height - CORNER_3D_HEIGHT,
+        width: CORNER_3D_WIDTH,
+        height: CORNER_3D_HEIGHT,
+    };
+    (Rect { width, ..content }, Some(corner))
+}
+
+fn screen_layout(full: Rect, preview_visible: bool, corner_enabled: bool) -> Option<ScreenLayout> {
     if full.width < 3 || full.height < MIN_HEIGHT {
         return None;
     }
@@ -2097,7 +2188,7 @@ fn screen_layout(full: Rect, preview_visible: bool) -> Option<ScreenLayout> {
         Constraint::Length(1),
     ])
     .split(inner);
-    let content = sections[3];
+    let (content, corner) = reserve_corner_gutter(sections[3], corner_enabled);
     let (list, preview, preview_unavailable) = if preview_visible
         && full.width >= PREVIEW_SIDE_MIN_WIDTH
     {
@@ -2133,18 +2224,28 @@ fn screen_layout(full: Rect, preview_visible: bool) -> Option<ScreenLayout> {
         list,
         preview,
         preview_unavailable,
+        corner,
     })
 }
 
-fn page_size_for(full: Rect, preview_visible: bool) -> usize {
-    screen_layout(full, preview_visible)
+fn page_size_for(full: Rect, preview_visible: bool, corner_enabled: bool) -> usize {
+    screen_layout(full, preview_visible, corner_enabled)
         .map(|layout| (layout.list.height as usize).max(1))
         .unwrap_or(1)
 }
 
-fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
+/// `corner_angle` is passed in rather than read from the clock here, so that
+/// rendering stays a pure function of state and a test can pin a frame.
+fn draw(frame: &mut Frame, app: &App, theme: &Theme, corner_angle: f32) {
     let full = frame.area();
-    if let Some(layout) = screen_layout(full, app.preview_visible) {
+
+    // The gutter is reserved for the whole session, not per mode: opening help
+    // or settings must not reflow the list underneath the overlay.
+    if let Some(layout) = screen_layout(
+        full,
+        app.preview_visible,
+        corner_3d_enabled(app.color_enabled),
+    ) {
         // Flat main chrome: solid surface fill, no outer box border. Hierarchy
         // comes from dividers, spacing, and the elevated panel overlays.
         frame.render_widget(Clear, full);
@@ -2158,6 +2259,9 @@ fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
         }
         render_divider(frame, theme, layout.bottom_divider);
         render_footer(frame, app, theme, layout.footer, layout.preview_unavailable);
+        if let (Some(corner), Mode::Normal) = (layout.corner, app.mode) {
+            render_corner_3d(frame, theme, corner, corner_angle);
+        }
     } else {
         frame.render_widget(Clear, full);
         frame.render_widget(Block::default().style(theme.surface()), full);
@@ -2175,6 +2279,357 @@ fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
             render_confirm_delete(frame, app, theme, full, candidate_idx)
         }
     }
+}
+
+/// Paint the cube into the gutter `screen_layout` reserved for it. The area is
+/// already excluded from the list and preview, so filling it opaquely cannot
+/// clip a path or break the selection bar.
+fn render_corner_3d(frame: &mut Frame, theme: &Theme, area: Rect, angle: f32) {
+    let grid = corner_cube_grid(angle, area.width as usize, area.height as usize);
+    if grid.is_empty() {
+        return;
+    }
+    // Map each cell's depth-derived light onto a shadow -> accent -> highlight
+    // ramp, so near edges read hot and far ones sink toward the background.
+    // On a light palette `highlight` is the darkest ink and `shadow` sits
+    // nearest the surface, which inverts the ramp and still lands on the cue
+    // that matters: near edges high-contrast, far edges low.
+    let shadow = cube_shadow(theme.palette.accent, theme.palette.surface);
+    let accent = theme.palette.accent;
+    let highlight = theme.palette.title;
+    let ramp = |light: f32| -> Color {
+        let color = if light < 0.5 {
+            lerp_rgb(shadow, accent, light / 0.5)
+        } else {
+            lerp_rgb(accent, highlight, (light - 0.5) / 0.5)
+        };
+        theme.rgb(color)
+    };
+    let surface_bg = theme.rgb(theme.palette.surface);
+    let lines: Vec<Line> = grid
+        .into_iter()
+        .map(|row| {
+            let spans: Vec<Span> = row
+                .into_iter()
+                .map(|cell| match cell {
+                    Some(c) => {
+                        // One color per cell is all a terminal offers, so the
+                        // cell takes the average light of its lit dots.
+                        Span::styled(
+                            c.glyph.to_string(),
+                            Style::default().fg(ramp(c.light)).bg(surface_bg),
+                        )
+                    }
+                    None => Span::raw(" "),
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).style(theme.surface()), area);
+}
+
+/// The dim end of the cube's shading ramp. Pulls the accent most of the way
+/// toward the surface so receding edges stay hue-tinted rather than washing out
+/// to gray, while sitting far enough from the lit end to read as depth.
+fn cube_shadow(accent: Rgb, surface: Rgb) -> Rgb {
+    lerp_rgb(accent, surface, 0.72)
+}
+
+/// One rendered terminal cell of the cube: a Braille glyph packing a 2x4 dot
+/// matrix, plus the diffuse light (0..1) averaged over its lit dots.
+///
+/// Braille beats the block-quadrant glyphs it replaced on both axes that
+/// matter here. Resolution: 8 dots per cell instead of 4, so a line is a thin
+/// stroke rather than a chunky stair-step. Aspect: a terminal cell is about
+/// twice as tall as it is wide, so a 2x4 split yields near-square dots, while
+/// a 2x2 split yields dots twice as tall as they are wide -- that stretch is
+/// what made the old cube look sheared. The whole Braille block is also East
+/// Asian Width "Neutral", so nothing here can widen to two columns and tear the
+/// drawing apart in a CJK-configured terminal; the full block U+2588 that the
+/// quadrant encoding reached for on a solid cell is "Ambiguous" and could.
+#[derive(Debug, Clone, Copy)]
+struct CubeCell {
+    glyph: char,
+    light: f32,
+}
+
+/// Sub-pixel dot canvas carrying, per dot, whether it is filled plus the
+/// nearest depth and the light at that depth. Bundling the buffers keeps the
+/// rasterizer signatures small (clippy caps args at 7).
+struct DotCanvas {
+    width: usize,
+    height: usize,
+    filled: Vec<bool>,
+    depth: Vec<f32>,
+    light: Vec<f32>,
+}
+
+impl DotCanvas {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            filled: vec![false; width * height],
+            depth: vec![f32::NEG_INFINITY; width * height],
+            light: vec![0.0; width * height],
+        }
+    }
+
+    fn plot_dot(&mut self, x: i32, y: i32, z: f32, light: f32) {
+        if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height {
+            return;
+        }
+        let idx = y as usize * self.width + x as usize;
+        // Larger z is nearer the camera. Where two edges cross, the nearer one
+        // owns the dot, so its light wins and the crossing reads with the
+        // right one in front.
+        if z < self.depth[idx] {
+            return;
+        }
+        self.depth[idx] = z;
+        self.light[idx] = light;
+        self.filled[idx] = true;
+    }
+
+    /// Bresenham edge draw, interpolating depth and light between the two
+    /// endpoints so an edge running front-to-back fades as it recedes.
+    fn draw_edge(&mut self, start: (i32, i32, f32, f32), end: (i32, i32, f32, f32)) {
+        let (x0, y0, z0, l0) = start;
+        let (x1, y1, z1, l1) = end;
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        let steps = dx.max((-dy).max(1));
+        let mut x = x0;
+        let mut y = y0;
+        let mut step = 0i32;
+        loop {
+            let t = step as f32 / steps as f32;
+            let z = z0 + (z1 - z0) * t;
+            let light = l0 + (l1 - l0) * t;
+            self.plot_dot(x, y, z, light);
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+            step += 1;
+            if step > (self.width + self.height) as i32 * 4 {
+                break;
+            }
+        }
+    }
+}
+
+/// Unit cube centered at the origin.
+const CUBE_V: [(f32, f32, f32); 8] = [
+    (-1.0, -1.0, -1.0),
+    (1.0, -1.0, -1.0),
+    (1.0, 1.0, -1.0),
+    (-1.0, 1.0, -1.0),
+    (-1.0, -1.0, 1.0),
+    (1.0, -1.0, 1.0),
+    (1.0, 1.0, 1.0),
+    (-1.0, 1.0, 1.0),
+];
+
+const CUBE_EDGES: [(usize, usize); 12] = [
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 0),
+    (4, 5),
+    (5, 6),
+    (6, 7),
+    (7, 4),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
+];
+
+/// The six faces as (corner loop, outward normal). Used to hide the edges that
+/// belong only to faces pointing away from the camera.
+const CUBE_FACES: [([usize; 4], (f32, f32, f32)); 6] = [
+    ([4, 5, 6, 7], (0.0, 0.0, 1.0)),
+    ([0, 1, 2, 3], (0.0, 0.0, -1.0)),
+    ([1, 2, 6, 5], (1.0, 0.0, 0.0)),
+    ([0, 3, 7, 4], (-1.0, 0.0, 0.0)),
+    ([3, 2, 6, 7], (0.0, 1.0, 0.0)),
+    ([0, 1, 5, 4], (0.0, -1.0, 0.0)),
+];
+
+/// Camera distance along +z. Must exceed the cube's corner radius (sqrt(3)) so
+/// no vertex passes through the eye.
+const CUBE_CAMERA: f32 = 4.6;
+
+/// Largest screen radius the projection can produce, and therefore what the
+/// canvas has to accommodate. A corner rides the sphere of radius sqrt(3), so
+/// its projected distance from center is
+///
+/// ```text
+///   r(z) = sqrt(3 - z^2) * CUBE_CAMERA / (CUBE_CAMERA - z)
+/// ```
+///
+/// which peaks at about z = 0.65 -- not at either extreme, because swinging a
+/// corner toward the eye magnifies it but also foreshortens how far off-axis it
+/// sits. Taking the naive bound (full radius at maximum magnification, a pose
+/// no corner can actually reach) costs about a third of the drawing's size for
+/// nothing. `corner_cube_span_is_a_tight_upper_bound` pins this value.
+const CUBE_SPAN: f32 = 1.87;
+
+fn cube_edge_index(a: usize, b: usize) -> Option<usize> {
+    CUBE_EDGES
+        .iter()
+        .position(|&(p, q)| (p == a && q == b) || (p == b && q == a))
+}
+
+/// Rasterize a rotating cube into Braille sub-pixels. Each terminal cell holds
+/// a 2x4 dot matrix, so a `width x height` cell area gives a `2*width x
+/// 4*height` dot canvas.
+///
+/// Two things make this read as a solid object rather than a flat tangle:
+///
+/// * **Hidden-line removal.** Only edges bordering a camera-facing face are
+///   drawn. A full 12-edge wireframe is a Necker cube -- genuinely ambiguous,
+///   it visibly flips inside-out as it turns. Culling the back edges leaves the
+///   9-edge silhouette the eye already knows as a cube, so the rotation reads
+///   in one consistent direction.
+/// * **Depth shading.** Surviving edges are lit by depth, near corners bright
+///   and far corners dim, which agrees with the perspective instead of fighting
+///   it.
+fn corner_cube_grid(angle: f32, width: usize, height: usize) -> Vec<Vec<Option<CubeCell>>> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let dot_w = width * 2;
+    let dot_h = height * 4;
+    let mut canvas = DotCanvas::new(dot_w, dot_h);
+
+    // Tumble on two axes at unrelated rates so the cube keeps presenting new
+    // orientations rather than looping through one pose.
+    let ay = angle;
+    let ax = angle * 0.47 + 0.5;
+
+    let mut proj = [(0i32, 0i32, 0f32); 8];
+    let mut vlight = [0f32; 8];
+    for (i, &(x, y, z)) in CUBE_V.iter().enumerate() {
+        let (x, y, z) = rotate_y(x, y, z, ay);
+        let (x, y, z) = rotate_x(x, y, z, ax);
+        // z spans about -1.73..1.73; map that to a wide, clearly graded ramp.
+        vlight[i] = (0.5 + 0.5 * (z / 1.74)).clamp(0.0, 1.0);
+        proj[i] = project_point(x, y, z, dot_w, dot_h);
+    }
+
+    // Mark the edges of every camera-facing face. A face is camera-facing when
+    // its rotated outward normal still points toward +z (the eye).
+    let mut visible = [false; 12];
+    for (corners, normal) in CUBE_FACES {
+        let (nx, ny, nz) = normal;
+        let (nx, ny, nz) = rotate_y(nx, ny, nz, ay);
+        let (_, _, nz) = rotate_x(nx, ny, nz, ax);
+        if nz <= 0.0 {
+            continue;
+        }
+        for i in 0..4 {
+            if let Some(edge) = cube_edge_index(corners[i], corners[(i + 1) % 4]) {
+                visible[edge] = true;
+            }
+        }
+    }
+
+    for (i, &(a, b)) in CUBE_EDGES.iter().enumerate() {
+        if !visible[i] {
+            continue;
+        }
+        let (ax0, ay0, az0) = proj[a];
+        let (bx0, by0, bz0) = proj[b];
+        canvas.draw_edge((ax0, ay0, az0, vlight[a]), (bx0, by0, bz0, vlight[b]));
+    }
+
+    // Braille dot -> bit layout within a 2x4 cell. The low six bits run down
+    // the two columns, and the bottom row is the high two bits -- a historical
+    // quirk of the 8-dot encoding, hence the table rather than a formula.
+    //   (col, row) -> bit
+    const BRAILLE_BITS: [[u8; 4]; 2] = [
+        [0x01, 0x02, 0x04, 0x40], // left column, top to bottom
+        [0x08, 0x10, 0x20, 0x80], // right column, top to bottom
+    ];
+
+    (0..height)
+        .map(|cy| {
+            (0..width)
+                .map(|cx| {
+                    let mut bits = 0u8;
+                    let mut light_sum = 0.0f32;
+                    let mut count = 0u32;
+                    for (col, column) in BRAILLE_BITS.iter().enumerate() {
+                        for (row, bit) in column.iter().enumerate() {
+                            let idx = (cy * 4 + row) * dot_w + cx * 2 + col;
+                            if canvas.filled[idx] {
+                                bits |= bit;
+                                light_sum += canvas.light[idx];
+                                count += 1;
+                            }
+                        }
+                    }
+                    if bits == 0 {
+                        None
+                    } else {
+                        Some(CubeCell {
+                            glyph: char::from_u32(0x2800 + bits as u32).unwrap_or('\u{2800}'),
+                            light: light_sum / count as f32,
+                        })
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn rotate_y(x: f32, y: f32, z: f32, angle: f32) -> (f32, f32, f32) {
+    let (s, c) = angle.sin_cos();
+    (x * c + z * s, y, -x * s + z * c)
+}
+
+fn rotate_x(x: f32, y: f32, z: f32, angle: f32) -> (f32, f32, f32) {
+    let (s, c) = angle.sin_cos();
+    (x, y * c - z * s, y * s + z * c)
+}
+
+/// Perspective-project a rotated point into dot-canvas coordinates.
+///
+/// Larger z is nearer the eye, so the divisor shrinks as z grows and near
+/// corners are drawn *larger*. (The reverse -- near corners drawn smaller while
+/// shaded brighter -- is what previously made the cube read as a flat smear:
+/// the size and lighting cues pointed opposite ways.)
+///
+/// Braille dots are near-square, so the same scale applies to both axes.
+fn project_point(x: f32, y: f32, z: f32, width: usize, height: usize) -> (i32, i32, f32) {
+    let factor = CUBE_CAMERA / (CUBE_CAMERA - z);
+    // Fill the canvas, keeping one dot of margin on every side.
+    let scale = (width.min(height) as f32 * 0.5 - 1.0) / CUBE_SPAN;
+    let px = (width as f32 * 0.5 + x * scale * factor).round() as i32;
+    let py = (height as f32 * 0.5 - y * scale * factor).round() as i32;
+    (px, py, z)
+}
+
+/// Linear blend between two RGB seeds; `t` in 0..1 moves `from` -> `to`.
+fn lerp_rgb(from: Rgb, to: Rgb, t: f32) -> Rgb {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Rgb(mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
 }
 
 fn render_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
@@ -3404,6 +3859,11 @@ mod tests {
             .collect()
     }
 
+    /// Fixed cube orientation for rendering tests. Pinning the angle keeps
+    /// full-screen buffer assertions reproducible instead of depending on how
+    /// long the process has been alive.
+    const TEST_CUBE_ANGLE: f32 = 0.7;
+
     fn app_with_paths(paths: &[(&str, f64)]) -> App {
         App::with_preview_worker(build_candidates(&recs(paths)), None, false)
     }
@@ -3438,7 +3898,7 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, app, &Theme::new(color)))
+            .draw(|frame| draw(frame, app, &Theme::new(color), TEST_CUBE_ANGLE))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -3580,7 +4040,9 @@ mod tests {
         let theme = Theme::with_choice(true, ThemeChoice::Amber);
         let backend = TestBackend::new(60, 16);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &theme, TEST_CUBE_ANGLE))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let surface = theme.surface().bg.unwrap();
         // Corners should be surface-colored spaces, not box-drawing characters.
@@ -4222,6 +4684,315 @@ mod tests {
     }
 
     #[test]
+    fn env_truthy_treats_common_falsey_spellings_as_off() {
+        assert!(!corner_3d_enabled(false));
+        assert!(env_truthy("", true));
+        assert!(env_truthy("1", true));
+        assert!(env_truthy("yes", true));
+        assert!(!env_truthy("0", true));
+        assert!(!env_truthy("false", true));
+        assert!(!env_truthy("OFF", true));
+        assert!(!env_truthy("No", true));
+    }
+
+    #[test]
+    fn corner_cube_grid_draws_a_depth_shaded_braille_wireframe() {
+        let grid = corner_cube_grid(0.7, CORNER_3D_WIDTH as usize, CORNER_3D_HEIGHT as usize);
+        assert_eq!(grid.len(), CORNER_3D_HEIGHT as usize);
+        assert!(grid.iter().all(|row| row.len() == CORNER_3D_WIDTH as usize));
+        let cells: Vec<CubeCell> = grid.iter().flatten().flatten().copied().collect();
+        // An edge outline, not a fill: some cells lit, nowhere near all of them.
+        assert!(
+            (12..80).contains(&cells.len()),
+            "expected an edge outline, got {} cells",
+            cells.len()
+        );
+        // Braille only -- and never the blank pattern U+2800, which would be an
+        // invisible cell masquerading as drawn content.
+        assert!(
+            cells
+                .iter()
+                .all(|c| ('\u{2801}'..='\u{28FF}').contains(&c.glyph)),
+            "all glyphs should be non-blank braille, got {:?}",
+            cells.iter().map(|c| c.glyph).collect::<Vec<_>>()
+        );
+        assert!(cells.iter().all(|c| (0.0..=1.0).contains(&c.light)));
+        // Depth shading must produce real contrast between near and far edges.
+        let max_light = cells.iter().map(|c| c.light).fold(0.0f32, f32::max);
+        let min_light = cells.iter().map(|c| c.light).fold(1.0f32, f32::min);
+        assert!(
+            max_light - min_light > 0.2,
+            "expected near/far depth contrast, got {min_light}..{max_light}"
+        );
+    }
+
+    #[test]
+    fn corner_cube_hides_edges_facing_away_from_the_camera() {
+        // A cube shows at most 9 of its 12 edges from any viewpoint (7 when a
+        // face is dead-on). Drawing all 12 is the ambiguous Necker wireframe
+        // this renderer deliberately avoids, so sample the spin and prove the
+        // back edges really are dropped.
+        for step in 0..48 {
+            let angle = step as f32 * 0.13;
+            let drawn = cube_visible_edges(angle);
+            assert!(
+                (7..=9).contains(&drawn),
+                "angle {angle}: {drawn} edges drawn, expected a culled 7..=9"
+            );
+        }
+    }
+
+    /// Count the edges `corner_cube_grid` would draw at `angle`, mirroring its
+    /// culling rule so the test asserts on the rule rather than on pixels.
+    fn cube_visible_edges(angle: f32) -> usize {
+        let ay = angle;
+        let ax = angle * 0.47 + 0.5;
+        let mut visible = [false; 12];
+        for (corners, normal) in CUBE_FACES {
+            let (nx, ny, nz) = normal;
+            let (nx, ny, nz) = rotate_y(nx, ny, nz, ay);
+            let (_, _, nz) = rotate_x(nx, ny, nz, ax);
+            if nz <= 0.0 {
+                continue;
+            }
+            for i in 0..4 {
+                visible[cube_edge_index(corners[i], corners[(i + 1) % 4]).unwrap()] = true;
+            }
+        }
+        visible.iter().filter(|v| **v).count()
+    }
+
+    #[test]
+    fn corner_cube_never_clips_against_its_canvas() {
+        // `plot_dot` silently drops out-of-bounds dots, so asserting that lit
+        // cells are in bounds proves nothing -- it is true even for a cube
+        // scaled ten times too large. Assert on the projection instead: every
+        // corner, at every orientation, must land inside the dot canvas. That
+        // is what actually fails when the scale is too generous.
+        let (dot_w, dot_h) = (CORNER_3D_WIDTH as usize * 2, CORNER_3D_HEIGHT as usize * 4);
+        for step in 0..360 {
+            let angle = step as f32 * 0.0349;
+            let ay = angle;
+            let ax = angle * 0.47 + 0.5;
+            for &(x, y, z) in CUBE_V.iter() {
+                let (x, y, z) = rotate_y(x, y, z, ay);
+                let (x, y, z) = rotate_x(x, y, z, ax);
+                let (px, py, _) = project_point(x, y, z, dot_w, dot_h);
+                assert!(
+                    px >= 0 && (px as usize) < dot_w && py >= 0 && (py as usize) < dot_h,
+                    "angle {angle}: corner projected to ({px},{py}), outside {dot_w}x{dot_h}"
+                );
+            }
+        }
+        // And the cube must actually be there and reasonably large -- a scale
+        // that is too small would pass the bounds check above trivially.
+        let grid = corner_cube_grid(0.4, CORNER_3D_WIDTH as usize, CORNER_3D_HEIGHT as usize);
+        let lit = grid.iter().flatten().filter(|c| c.is_some()).count();
+        assert!(
+            lit >= 20,
+            "cube should fill its corner, only {lit} cells lit"
+        );
+    }
+
+    #[test]
+    fn corner_cube_span_is_a_tight_upper_bound() {
+        // Sweep the corner sphere and confirm CUBE_SPAN both covers the real
+        // maximum (or the cube clips) and does not overshoot it (or the cube is
+        // needlessly small). Guards the hand-derived constant against a later
+        // change to CUBE_CAMERA silently invalidating it.
+        let mut peak = 0.0f32;
+        for i in 0..=2000 {
+            let z = -3f32.sqrt() + (2.0 * 3f32.sqrt()) * (i as f32 / 2000.0);
+            let r = (3.0 - z * z).max(0.0).sqrt() * CUBE_CAMERA / (CUBE_CAMERA - z);
+            peak = peak.max(r);
+        }
+        assert!(
+            peak <= CUBE_SPAN,
+            "CUBE_SPAN {CUBE_SPAN} must cover the peak {peak} or the cube clips"
+        );
+        assert!(
+            CUBE_SPAN - peak < 0.05,
+            "CUBE_SPAN {CUBE_SPAN} wastes {} of canvas over peak {peak}",
+            CUBE_SPAN - peak
+        );
+    }
+
+    #[test]
+    fn corner_cube_projects_near_corners_larger_than_far_ones() {
+        // Perspective and shading must agree: the corner swung toward the eye
+        // is both brighter and further from the center. When these disagree the
+        // cube reads inside-out.
+        let center = 14.0f32;
+        let (near_x, _, near_z) = project_point(1.0, 0.0, 1.5, 28, 28);
+        let (far_x, _, far_z) = project_point(1.0, 0.0, -1.5, 28, 28);
+        assert!(near_z > far_z, "z ordering: {near_z} should exceed {far_z}");
+        assert!(
+            (near_x as f32 - center).abs() > (far_x as f32 - center).abs(),
+            "near corner must project wider: near {near_x}, far {far_x}"
+        );
+    }
+
+    #[test]
+    fn corner_gutter_is_reserved_outside_the_list_and_preview() {
+        let full = Rect::new(0, 0, 100, 24);
+        let plain = screen_layout(full, false, false).expect("roomy terminal");
+        assert!(plain.corner.is_none());
+
+        let layout = screen_layout(full, false, true).expect("roomy terminal");
+        let corner = layout.corner.expect("cube gutter");
+        assert_eq!(corner.width, CORNER_3D_WIDTH);
+        assert_eq!(corner.height, CORNER_3D_HEIGHT);
+        // The gutter costs the list exactly its own width plus the separator,
+        // and the two must not overlap at all.
+        assert_eq!(layout.list.width, plain.list.width - CORNER_3D_GUTTER);
+        assert!(
+            layout.list.x + layout.list.width <= corner.x,
+            "list {:?} must not reach into corner {corner:?}",
+            layout.list
+        );
+        assert_eq!(corner.x + corner.width, plain.list.x + plain.list.width);
+        assert_eq!(corner.y + corner.height, layout.list.y + layout.list.height);
+
+        // Side preview is laid out inside the already-narrowed content, so it
+        // stays clear of the gutter too.
+        let with_preview = screen_layout(Rect::new(0, 0, 120, 24), true, true).unwrap();
+        let (preview, _) = with_preview.preview.expect("side preview");
+        let corner = with_preview.corner.expect("cube gutter");
+        assert!(preview.x + preview.width <= corner.x);
+    }
+
+    #[test]
+    fn corner_gutter_is_dropped_when_it_would_crowd_the_list() {
+        // Too narrow: the list would lose room it needs, so no cube at all.
+        assert!(screen_layout(Rect::new(0, 0, 70, 24), false, true)
+            .expect("layout")
+            .corner
+            .is_none());
+        // Too short for the cube to fit in the content area.
+        assert!(screen_layout(Rect::new(0, 0, 100, MIN_HEIGHT), false, true)
+            .expect("layout")
+            .corner
+            .is_none());
+    }
+
+    #[test]
+    fn corner_gutter_does_not_reflow_when_an_overlay_opens() {
+        let full = Rect::new(0, 0, 100, 24);
+        let normal = screen_layout(full, false, true).unwrap();
+        // `draw` gates only rendering on mode, never the layout, so a list row
+        // keeps its width and position while help or settings is open.
+        let again = screen_layout(full, false, true).unwrap();
+        assert_eq!(normal.list, again.list);
+        assert_eq!(
+            page_size_for(full, false, true),
+            normal.list.height as usize
+        );
+    }
+
+    /// Read one buffer row restricted to a column range, so assertions can look
+    /// at the list without picking up the cube gutter beside it.
+    fn buffer_row_range(buffer: &Buffer, y: u16, x0: u16, x1: u16) -> String {
+        (x0..x1).map(|x| buffer[(x, y)].symbol()).collect()
+    }
+
+    fn corner_overlap_app(count: usize) -> App {
+        let paths: Vec<String> = (0..count)
+            .map(|i| format!("/home/u/workspace/repos/github.com/acme/project-{i:02}/deeply/nested/source/tree/module"))
+            .collect();
+        let refs: Vec<(&str, f64)> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.as_str(), 0.9 - i as f64 * 0.001))
+            .collect();
+        let mut app = app_with_paths(&refs);
+        app.color_enabled = true;
+        app
+    }
+
+    #[test]
+    fn corner_cube_never_clips_list_rows() {
+        let full = Rect::new(0, 0, 100, 24);
+        let layout = screen_layout(full, false, true).unwrap();
+        let mut app = corner_overlap_app(30);
+        app.set_page_size(page_size_for(full, false, true));
+        let buffer = settings_panel_buffer(&app, full.width, full.height, true);
+
+        // Every visible row is truncated by the same list width, so rows beside
+        // the cube read exactly like the rows above them -- no silent clipping.
+        let list_end = layout.list.x + layout.list.width;
+        let widths: Vec<usize> = (layout.list.y..layout.list.y + layout.list.height)
+            .map(|y| {
+                UnicodeWidthStr::width(
+                    buffer_row_range(&buffer, y, layout.list.x, list_end).trim_end(),
+                )
+            })
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "list rows must truncate uniformly, got {widths:?}"
+        );
+        // And the truncation is visible rather than swallowed by the overlay.
+        let last = buffer_row_range(
+            &buffer,
+            layout.list.y + layout.list.height - 1,
+            layout.list.x,
+            list_end,
+        );
+        assert!(
+            last.contains('…'),
+            "clipped path should show an ellipsis: {last:?}"
+        );
+    }
+
+    #[test]
+    fn corner_cube_never_breaks_the_selection_bar() {
+        let full = Rect::new(0, 0, 100, 24);
+        let layout = screen_layout(full, false, true).unwrap();
+        let rows = layout.list.height;
+        let mut app = corner_overlap_app(30);
+        app.set_page_size(page_size_for(full, false, true));
+
+        let bar_run = |app: &App| -> (u16, u16) {
+            let buffer = settings_panel_buffer(app, full.width, full.height, true);
+            let y = layout.list.y + app.selected_index as u16;
+            let bg = buffer[(layout.list.x, y)].bg;
+            let end = (layout.list.x..layout.list.x + layout.list.width)
+                .take_while(|x| buffer[(*x, y)].bg == bg)
+                .count() as u16;
+            (layout.list.x, end)
+        };
+
+        // A row well above the cube and a row level with it must highlight the
+        // same way: the bar spans the full list width in both cases.
+        app.set_selected(0);
+        let top = bar_run(&app);
+        app.set_selected(rows as usize - 1);
+        let beside_cube = bar_run(&app);
+        assert_eq!(
+            top, beside_cube,
+            "selection bar must not be cut short beside the cube"
+        );
+        assert_eq!(
+            beside_cube.1, layout.list.width,
+            "selection bar should span the whole list row"
+        );
+    }
+
+    #[test]
+    fn corner_3d_render_is_a_no_op_when_colorless() {
+        let mut app = app_with_paths(&[("/tmp/cdh-corner-alpha", 0.9)]);
+        app.color_enabled = false;
+        let buffer = settings_panel_buffer(&app, 60, 16, false);
+        let text = settings_panel_text(&buffer);
+        // Main UI should still render; no braille cube anywhere on screen.
+        assert!(text.contains("cdh"));
+        assert!(
+            !text.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+            "colorless mode must skip corner cube: {text:?}"
+        );
+    }
+
+    #[test]
     fn empty_returns_none() {
         assert_eq!(pick(&[]).unwrap(), None);
     }
@@ -4430,15 +5201,18 @@ mod tests {
     fn page_size_uses_the_actual_list_area_after_resize() {
         let regular_area = Rect::new(0, 0, 80, 24);
         let short_area = Rect::new(0, 0, 80, 12);
-        let regular = page_size_for(regular_area, false);
-        let short = page_size_for(short_area, false);
+        let regular = page_size_for(regular_area, false, false);
+        let short = page_size_for(short_area, false, false);
         assert_eq!(
             regular,
-            screen_layout(regular_area, false).unwrap().list.height as usize
+            screen_layout(regular_area, false, false)
+                .unwrap()
+                .list
+                .height as usize
         );
         assert_eq!(
             short,
-            screen_layout(short_area, false).unwrap().list.height as usize
+            screen_layout(short_area, false, false).unwrap().list.height as usize
         );
         assert!(short < regular);
         assert!(short > 0);
@@ -5287,16 +6061,16 @@ mod tests {
 
     #[test]
     fn preview_layout_uses_side_then_bottom_then_notice() {
-        assert!(screen_layout(Rect::new(0, 0, 110, 24), true)
+        assert!(screen_layout(Rect::new(0, 0, 110, 24), true, false)
             .unwrap()
             .preview
             .is_some());
-        assert!(screen_layout(Rect::new(0, 0, 80, 24), true)
+        assert!(screen_layout(Rect::new(0, 0, 80, 24), true, false)
             .unwrap()
             .preview
             .is_some());
         assert!(
-            screen_layout(Rect::new(0, 0, 60, 24), true)
+            screen_layout(Rect::new(0, 0, 60, 24), true, false)
                 .unwrap()
                 .preview_unavailable
         );
