@@ -1087,12 +1087,6 @@ impl PageWindow {
     }
 }
 
-/// Ambient corner 3D is opt-out, color-only chrome. Disabled when colorless or
-/// when `CDH_CORNER_3D` is set to a falsey value.
-fn corner_3d_enabled(color_enabled: bool) -> bool {
-    color_enabled && env_flag_enabled("CDH_CORNER_3D", true)
-}
-
 fn env_flag_enabled(name: &str, default: bool) -> bool {
     match env::var(name) {
         Ok(value) => env_truthy(&value, default),
@@ -1152,6 +1146,11 @@ struct App {
     last_list_start: Cell<usize>,
     /// Monotonic clock origin for the ambient corner wireframe cube.
     corner_anim_started: Instant,
+    /// The `CDH_CORNER_3D` opt-out, read once at startup. Environment cannot
+    /// change under a running process, and resolving it here keeps `env::var`
+    /// out of the layout and render paths -- which run every animation frame --
+    /// and lets tests exercise the opt-out without mutating process state.
+    corner_3d_env: bool,
 }
 
 impl App {
@@ -1245,6 +1244,7 @@ impl App {
             last_list_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_list_start: Cell::new(0),
             corner_anim_started: Instant::now(),
+            corner_3d_env: env_flag_enabled("CDH_CORNER_3D", true),
         };
         app.notice = loaded.warning.map(|warning| {
             format!(
@@ -1298,6 +1298,14 @@ impl App {
         self.page_size = page_size;
         self.restore_selected_path(selected_path.as_deref());
         true
+    }
+
+    /// The ambient cube is opt-out, color-only chrome: it needs both an
+    /// environment that has not switched it off and a palette to draw with.
+    /// Colorless mode has no accent to shade against, so the cube would be a
+    /// featureless smudge rather than a depth cue.
+    fn corner_3d_enabled(&self) -> bool {
+        self.color_enabled && self.corner_3d_env
     }
 
     fn corner_anim_angle(&self, now: Instant) -> f32 {
@@ -1823,7 +1831,7 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
         if app.set_page_size(page_size_for(
             terminal_area,
             app.preview_visible,
-            corner_3d_enabled(app.color_enabled),
+            app.corner_3d_enabled(),
         )) {
             dirty = true;
         }
@@ -1842,7 +1850,7 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
             continue;
         }
 
-        let animating = corner_3d_enabled(app.color_enabled) && matches!(app.mode, Mode::Normal);
+        let animating = app.corner_3d_enabled() && matches!(app.mode, Mode::Normal);
         let timeout = if animating {
             CORNER_3D_FRAME.min(app.preview_wait_timeout(now))
         } else {
@@ -2241,11 +2249,7 @@ fn draw(frame: &mut Frame, app: &App, theme: &Theme, corner_angle: f32) {
 
     // The gutter is reserved for the whole session, not per mode: opening help
     // or settings must not reflow the list underneath the overlay.
-    if let Some(layout) = screen_layout(
-        full,
-        app.preview_visible,
-        corner_3d_enabled(app.color_enabled),
-    ) {
+    if let Some(layout) = screen_layout(full, app.preview_visible, app.corner_3d_enabled()) {
         // Flat main chrome: solid surface fill, no outer box border. Hierarchy
         // comes from dividers, spacing, and the elevated panel overlays.
         frame.render_widget(Clear, full);
@@ -4685,14 +4689,64 @@ mod tests {
 
     #[test]
     fn env_truthy_treats_common_falsey_spellings_as_off() {
-        assert!(!corner_3d_enabled(false));
+        // A set env var that is empty means "present but unset" -- fall back to
+        // the default rather than reading it as off.
         assert!(env_truthy("", true));
+        assert!(!env_truthy("", false));
         assert!(env_truthy("1", true));
         assert!(env_truthy("yes", true));
+        assert!(env_truthy(" 1 ", true));
         assert!(!env_truthy("0", true));
         assert!(!env_truthy("false", true));
         assert!(!env_truthy("OFF", true));
         assert!(!env_truthy("No", true));
+        assert!(!env_truthy(" off ", true));
+    }
+
+    #[test]
+    fn corner_3d_needs_both_color_and_the_environment_opt_in() {
+        // Previously untestable: the gate read `env::var` inline, so the only
+        // reachable case was the colorless one and `CDH_CORNER_3D=0` was never
+        // exercised at all. Resolving the flag onto `App` makes every
+        // combination assertable without touching process state.
+        let mut app = app_with_paths(&[("/tmp/cdh-corner-gate", 0.9)]);
+        for (color, env, expected) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            app.color_enabled = color;
+            app.corner_3d_env = env;
+            assert_eq!(app.corner_3d_enabled(), expected, "color={color} env={env}");
+        }
+    }
+
+    #[test]
+    fn corner_3d_opt_out_removes_both_the_cube_and_its_gutter() {
+        // The opt-out must give the width back, not just stop drawing -- a
+        // reserved-but-empty gutter would silently cost columns forever.
+        let full = Rect::new(0, 0, 100, 24);
+        let mut app = corner_overlap_app(30);
+        app.corner_3d_env = false;
+        assert!(!app.corner_3d_enabled());
+
+        let layout = screen_layout(full, false, app.corner_3d_enabled()).unwrap();
+        assert!(layout.corner.is_none(), "no gutter when opted out");
+        assert_eq!(
+            layout.list.width,
+            screen_layout(full, false, false).unwrap().list.width,
+            "opting out must return the full list width"
+        );
+
+        app.set_page_size(page_size_for(full, false, app.corner_3d_enabled()));
+        let buffer = settings_panel_buffer(&app, full.width, full.height, true);
+        let text = settings_panel_text(&buffer);
+        assert!(text.contains("cdh"));
+        assert!(
+            !text.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+            "CDH_CORNER_3D=0 must draw no cube: {text:?}"
+        );
     }
 
     #[test]
