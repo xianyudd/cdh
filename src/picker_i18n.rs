@@ -33,6 +33,7 @@ pub(super) enum TextKey {
     HistoryWriteUnavailable,
     DeleteFailedPrefix,
     NoDeletableHistory,
+    DiscoveredNotDeletable,
     MissingDeleteHint,
     NoJumpTarget,
     TerminalTooSmall,
@@ -143,6 +144,10 @@ impl Language {
             ),
             DeleteFailedPrefix => self.pick("删除失败: ", "Delete failed: "),
             NoDeletableHistory => self.pick("没有可删除的历史记录", "No history entry to delete"),
+            DiscoveredNotDeletable => self.pick(
+                "该目录来自目录树，没有历史记录可删",
+                "This directory came from the tree scan; no history entry to delete",
+            ),
             MissingDeleteHint => self.pick(
                 "目录已失效，按 Ctrl+D 删除历史记录",
                 "Directory is missing; press Ctrl+D to delete its history entry",

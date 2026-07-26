@@ -10,9 +10,11 @@ mod i18n;
 mod settings;
 
 use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -43,6 +45,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::discover;
 use crate::recommend::Recommendation;
 use crate::{history, AppContext, Paths};
 #[cfg(test)]
@@ -626,12 +629,13 @@ pub fn pick(items: &[Recommendation]) -> io::Result<Option<String>> {
 }
 
 pub fn pick_with_history(ctx: &AppContext, items: &[Recommendation]) -> io::Result<Option<String>> {
-    if items.is_empty() {
-        return Ok(None);
-    }
+    // Non-interactive callers keep the established contract: the top
+    // recommendation, or nothing when history is empty.
     if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
         return Ok(items.first().map(|item| item.path.clone()));
     }
+    // Interactive: open the picker even with an empty history. The directory-tree
+    // discovery layer -- and the $PWD bootstrap -- give it candidates to show.
     run_ui(items, Some(ctx))
 }
 
@@ -908,13 +912,40 @@ fn take_char_indices_back(chars: &[char], max_width: usize) -> Vec<usize> {
     indices
 }
 
+/// 候选来源。发现层的唯一结构改动：用来在同一模糊分档内让历史候选排在目录树
+/// 候选之前（历史是用户真实去过的地方，权重更高），且用来禁用发现行的 Ctrl+D。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateSource {
+    History,
+    Discovered,
+}
+
 struct Candidate {
     raw: String,
-    display: PathDisplay,
-    name: String,
     score: f32,
     exists: bool,
     last_visit: Option<i64>,
+    source: CandidateSource,
+}
+
+impl Candidate {
+    /// Directory name (the last path segment), borrowed from `raw`.
+    ///
+    /// Deliberately not a stored field: it is read only by the preview header,
+    /// i.e. for the single selected row, while storing it would cost a `String`
+    /// per candidate (~55 bytes with header and allocator overhead, ~2.7 MB
+    /// across a full 50k discovery pool). Same reasoning as `PathDisplay` below.
+    fn name(&self) -> &str {
+        directory_name_str(&self.raw)
+    }
+
+    /// Build the abbreviated display form on demand. `PathDisplay` is heavy
+    /// (a `Range` per character for highlight mapping), so it is never stored on
+    /// the candidate -- only the ~20 visible rows and the delete confirmation
+    /// materialize it, which keeps a 50k-candidate pool well under budget.
+    fn display(&self, home: Option<&str>) -> PathDisplay {
+        PathDisplay::from_path(&self.raw, home)
+    }
 }
 
 #[cfg(test)]
@@ -926,26 +957,91 @@ fn build_candidates_with_visits(
     items: &[Recommendation],
     last_visits: &HashMap<String, i64>,
 ) -> Vec<Candidate> {
-    let home = env::var("HOME").ok().filter(|home| !home.is_empty());
     items
         .iter()
         .map(|item| Candidate {
             raw: item.path.clone(),
-            name: directory_name(&item.path),
-            display: PathDisplay::from_path(&item.path, home.as_deref()),
             score: item.score.clamp(0.0, 1.0) as f32,
             exists: item.exists,
             last_visit: last_visits.get(&item.path).copied(),
+            source: CandidateSource::History,
         })
         .collect()
 }
 
-fn directory_name(path: &str) -> String {
+/// Sort weight for the source tiebreak: smaller ranks first, so History (0)
+/// precedes Discovered (1) whenever the fuzzy score ties.
+fn source_rank(source: CandidateSource) -> u8 {
+    match source {
+        CandidateSource::History => 0,
+        CandidateSource::Discovered => 1,
+    }
+}
+
+/// Normalize a path for dedup: drop a trailing slash (but keep root "/").
+fn normalize_path(path: &str) -> String {
+    normalized_path_str(path).to_string()
+}
+
+/// `normalize_path` 的借用版本：只做尾斜杠归一，不分配。
+fn normalized_path_str(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+/// 已入池路径的 64 位指纹，供 `App::known_paths` 去重。
+///
+/// 存指纹而不是路径本身：5 万条候选下，一份完整路径拷贝要 8–10 MB（平均路径 72
+/// 字节，加 `String` 头与哈希表开销约 8–10 倍放大），指纹只要约 0.8 MB。
+///
+/// 碰撞代价很轻：某个「发现来的」目录被误判为已在池中、这一轮不出现在列表里。
+/// 不是数据损坏，也不影响历史记录；该目录一旦被 cd 过就会经由历史进入候选池。
+/// 5 万条下的碰撞概率约 `n²/2^65` ≈ 7e-11，可以忽略。
+fn path_fingerprint(path: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    normalized_path_str(path).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The parent directory of `path`, normalized. Root has no parent.
+fn parent_dir(path: &str) -> Option<String> {
+    Path::new(path)
+        .parent()
+        .map(|parent| normalize_path(&parent.to_string_lossy()))
+        .filter(|parent| !parent.is_empty())
+}
+
+/// Last path segment, borrowed from `path`. `path` is already UTF-8, so the
+/// segment is too and `to_str` cannot fail; paths without one (`/`) yield the
+/// whole input, matching the previous owned implementation.
+fn directory_name_str(path: &str) -> &str {
     Path::new(path)
         .file_name()
+        .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
+        .unwrap_or(path)
+}
+
+/// Build the discovery layer's ordering key: parent directory -> best history
+/// score in that directory. A discovered candidate looks up its own parent, so
+/// siblings of a hot history entry inherit that entry's heat, while directories
+/// in corners history never touched map to 0. Keyed on the parent (not the path
+/// itself) precisely so the level-1 siblings the scan surfaces get a signal.
+fn build_score_map(items: &[Recommendation]) -> HashMap<String, f32> {
+    let mut map: HashMap<String, f32> = HashMap::new();
+    for item in items {
+        let score = item.score.clamp(0.0, 1.0) as f32;
+        if let Some(parent) = parent_dir(&item.path) {
+            map.entry(parent)
+                .and_modify(|existing| *existing = existing.max(score))
+                .or_insert(score);
+        }
+    }
+    map
 }
 
 fn load_last_visits(ctx: Option<&AppContext>) -> HashMap<String, i64> {
@@ -967,7 +1063,6 @@ fn load_last_visits(ctx: Option<&AppContext>) -> HashMap<String, i64> {
 
 struct Match {
     idx: usize,
-    highlights: Vec<u32>,
 }
 
 struct Filter {
@@ -983,19 +1078,23 @@ impl Filter {
         }
     }
 
-    /// An empty query preserves recommendation order. Fuzzy matches rank by
-    /// matcher quality, then the existing recommendation score; stale paths
-    /// remain after valid paths so they can be cleaned up without competing
-    /// with jump targets.
+    /// An empty query preserves recommendation order (history first, then the
+    /// discovered tree). Fuzzy matches rank by matcher quality, then by source
+    /// (History before Discovered -- a place the user actually visited outranks
+    /// a merely-existing sibling at the same fuzzy score), then by the existing
+    /// recommendation score; stale paths remain after valid paths so they can be
+    /// cleaned up without competing with jump targets.
+    ///
+    /// Only the *ranking* score is computed here -- one `pattern.score` pass per
+    /// candidate. Match highlight indices are deliberately NOT computed: a query
+    /// can hit tens of thousands of candidates while only ~20 rows are ever on
+    /// screen, so highlighting is deferred to the render path and run for visible
+    /// rows only (see `compute_row_highlights`). Dropping the second per-match
+    /// pass roughly halves filter cost on wide result sets.
     fn run(&mut self, candidates: &[Candidate], query: &str) -> Vec<Match> {
         let query = query.trim();
         if query.is_empty() {
-            return (0..candidates.len())
-                .map(|idx| Match {
-                    idx,
-                    highlights: Vec::new(),
-                })
-                .collect();
+            return (0..candidates.len()).map(|idx| Match { idx }).collect();
         }
 
         let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
@@ -1003,48 +1102,61 @@ impl Filter {
         let mut missing = Vec::new();
 
         for (idx, candidate) in candidates.iter().enumerate() {
-            let mut highlight_buffer = Vec::new();
             let haystack = Utf32Str::new(&candidate.raw, &mut self.buffer);
             let Some(score) = pattern.score(haystack, &mut self.matcher) else {
                 continue;
             };
 
-            let mut highlights = Vec::new();
-            let match_haystack = Utf32Str::new(&candidate.raw, &mut highlight_buffer);
-            let _ = self.matcher.fuzzy_indices(
-                match_haystack,
-                Utf32Str::new(query, &mut Vec::new()),
-                &mut highlights,
-            );
-            highlights.sort_unstable();
-            highlights.dedup();
-
             if candidate.exists {
-                valid.push((score, idx, highlights));
+                valid.push((score, idx));
             } else {
-                missing.push((idx, highlights));
+                missing.push(idx);
             }
         }
 
         valid.sort_by(|left, right| {
-            right.0.cmp(&left.0).then_with(|| {
-                candidates[right.1]
-                    .score
-                    .partial_cmp(&candidates[left.1].score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| {
+                    source_rank(candidates[left.1].source)
+                        .cmp(&source_rank(candidates[right.1].source))
+                })
+                .then_with(|| {
+                    candidates[right.1]
+                        .score
+                        .partial_cmp(&candidates[left.1].score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
         });
 
         valid
             .into_iter()
-            .map(|(_, idx, highlights)| Match { idx, highlights })
-            .chain(
-                missing
-                    .into_iter()
-                    .map(|(idx, highlights)| Match { idx, highlights }),
-            )
+            .map(|(_, idx)| Match { idx })
+            .chain(missing.into_iter().map(|idx| Match { idx }))
             .collect()
     }
+}
+
+/// Compute raw match-highlight indices for a single path, on demand. Run only
+/// for on-screen rows (see `Filter::run`'s note), so the O(pool) filter never
+/// pays for highlighting candidates the user will not see.
+fn compute_row_highlights(matcher: &mut Matcher, raw: &str, query: &str) -> Vec<u32> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut haystack_buffer = Vec::new();
+    let mut needle_buffer = Vec::new();
+    let mut highlights = Vec::new();
+    let _ = matcher.fuzzy_indices(
+        Utf32Str::new(raw, &mut haystack_buffer),
+        Utf32Str::new(query, &mut needle_buffer),
+        &mut highlights,
+    );
+    highlights.sort_unstable();
+    highlights.dedup();
+    highlights
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1151,6 +1263,28 @@ struct App {
     /// out of the layout and render paths -- which run every animation frame --
     /// and lets tests exercise the opt-out without mutating process state.
     corner_3d_env: bool,
+    /// Streamed batches from the directory-tree discovery worker. `None` when
+    /// discovery is disabled (`CDH_DISCOVER=0`), non-interactive, or finished
+    /// (the channel disconnects and we drop the receiver).
+    discover_rx: Option<mpsc::Receiver<Vec<String>>>,
+    /// Parent directory -> best recommendation score. A discovered candidate
+    /// inherits the score of the neighborhood it sits in (a sibling of a hot
+    /// history entry ranks with that entry's heat); parents unknown to history
+    /// map to 0. This is the internal ordering key for the discovery layer --
+    /// no fabricated frecency, just "how hot is this corner of the tree".
+    discover_score_map: HashMap<String, f32>,
+    /// `$HOME` for abbreviating paths at render time, captured once.
+    home: Option<String>,
+    /// Fingerprints (see `path_fingerprint`) of the normalized raw paths already
+    /// present, so streamed discoveries dedup against history (history wins) and
+    /// against each other. Storing hashes rather than the paths keeps this off the
+    /// per-candidate memory bill — see `path_fingerprint` for the trade-off.
+    known_paths: HashSet<u64>,
+    /// Index where the discovered slice begins in `candidates` (== the history
+    /// count). The prefix `[0, discovered_start)` is history in frecency order
+    /// and never reordered; the suffix is the discovery layer, kept sorted by
+    /// (score desc, path asc) so the empty-query view is deterministic.
+    discovered_start: usize,
 }
 
 impl App {
@@ -1213,6 +1347,11 @@ impl App {
         let language = resolve_language_preference(effective.language, locale_language);
         let mut filter = Filter::new();
         let filtered_results = filter.run(&candidates, "");
+        let known_paths = candidates
+            .iter()
+            .map(|candidate| path_fingerprint(&candidate.raw))
+            .collect::<HashSet<_>>();
+        let discovered_start = candidates.len();
         let mut app = Self {
             settings: loaded.settings,
             language,
@@ -1245,6 +1384,11 @@ impl App {
             last_list_start: Cell::new(0),
             corner_anim_started: Instant::now(),
             corner_3d_env: env_flag_enabled("CDH_CORNER_3D", true),
+            discover_rx: None,
+            discover_score_map: HashMap::new(),
+            home: env::var("HOME").ok().filter(|home| !home.is_empty()),
+            known_paths,
+            discovered_start,
         };
         app.notice = loaded.warning.map(|warning| {
             format!(
@@ -1337,6 +1481,80 @@ impl App {
                 .min(self.filtered_results.len().saturating_sub(1));
         }
         self.sync_pagination();
+    }
+
+    /// Merge streamed discovery batches into the candidate pool. Called once per
+    /// event-loop drain with every pending batch, so the O(pool) refilter runs a
+    /// single time no matter how many batches arrived -- the reason we drain-all
+    /// before refiltering is that not doing so would smear ~100 batches x a
+    /// ~25k-deep pool of rescoring across the fill window and stutter typing.
+    /// Returns whether anything changed (and the view needs a redraw).
+    fn ingest_discovered(&mut self, batches: Vec<Vec<String>>) -> bool {
+        let selected_path = self.selected_raw();
+        let mut added = false;
+        for batch in batches {
+            for raw in batch {
+                if !self.known_paths.insert(path_fingerprint(&raw)) {
+                    // History or an earlier discovery already owns this path.
+                    continue;
+                }
+                let score = parent_dir(&raw)
+                    .and_then(|parent| self.discover_score_map.get(&parent).copied())
+                    .unwrap_or(0.0);
+                self.candidates.push(Candidate {
+                    raw,
+                    score,
+                    exists: true,
+                    last_visit: None,
+                    source: CandidateSource::Discovered,
+                });
+                added = true;
+            }
+        }
+        if !added {
+            return false;
+        }
+        // Keep the discovered suffix ordered by (score desc, path asc): the empty
+        // query renders candidates in vec order and the history prefix must stay
+        // untouched, so only the suffix is (re)sorted.
+        self.candidates[self.discovered_start..].sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.raw.cmp(&right.raw))
+        });
+        self.filtered_results = self.filter.run(&self.candidates, &self.query);
+        self.restore_selected_path(selected_path.as_deref());
+        true
+    }
+
+    /// Empty-history bootstrap: synchronously seed the pool from `$PWD` -- its
+    /// ancestor chain plus one level of children -- so an interactive picker with
+    /// no history still has something to jump to on the first frame. Pure string
+    /// splitting plus a single `read_dir`; the full tree scan streams in behind.
+    fn bootstrap_from_pwd(&mut self, pwd: &str) {
+        let mut seeds: Vec<String> = Vec::new();
+        let mut current = normalize_path(pwd);
+        loop {
+            seeds.push(current.clone());
+            match parent_dir(&current) {
+                Some(parent) if parent != current => current = parent,
+                _ => break,
+            }
+        }
+        if let Ok(entries) = fs::read_dir(pwd) {
+            for entry in entries.flatten() {
+                let is_dir = entry
+                    .file_type()
+                    .map(|file_type| file_type.is_dir() && !file_type.is_symlink())
+                    .unwrap_or(false);
+                if is_dir {
+                    seeds.push(entry.path().to_string_lossy().into_owned());
+                }
+            }
+        }
+        self.ingest_discovered(vec![seeds]);
     }
 
     fn recompute_after_query_change(&mut self) {
@@ -1491,6 +1709,14 @@ impl App {
         }
         let selected = self.selected_index;
         self.candidates.remove(idx);
+        // Keep `discovered_start` pointing at the first discovered candidate.
+        // Removing anything in the history prefix shifts the whole discovered
+        // suffix left by one; forgetting this leaves the start stale-high, which
+        // both drops the leading discovered rows out of the sort window and, once
+        // the start exceeds the pool length, panics the next `[start..]` slice.
+        if idx < self.discovered_start {
+            self.discovered_start -= 1;
+        }
         self.filtered_results = self.filter.run(&self.candidates, &self.query);
         self.selected_index = selected.min(self.filtered_results.len().saturating_sub(1));
         self.sync_pagination();
@@ -1828,12 +2054,49 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
         loaded,
         locale_language,
     );
+
+    // Wire up the directory-tree discovery layer. The score map orders the
+    // discovered candidates; the scan worker streams new paths in on a channel.
+    app.discover_score_map = build_score_map(items);
+    app.discover_rx = discover::spawn(items.iter().map(|item| item.path.clone()).collect());
+    // Empty-history bootstrap: seed from $PWD before the loop so the first frame
+    // isn't blank while the full scan spins up.
+    if app.candidates.is_empty() {
+        if let Ok(pwd) = env::current_dir() {
+            app.bootstrap_from_pwd(&pwd.to_string_lossy());
+        }
+    }
+
     let mut guard = TermGuard::enter(initial_mouse)?;
     let backend = CrosstermBackend::new(io::stderr());
     let mut terminal = Terminal::new(backend)?;
     let mut dirty = true;
 
     loop {
+        // Drain every pending discovery batch, then merge and refilter once.
+        if app.discover_rx.is_some() {
+            let mut batches = Vec::new();
+            let mut disconnected = false;
+            if let Some(rx) = &app.discover_rx {
+                loop {
+                    match rx.try_recv() {
+                        Ok(batch) => batches.push(batch),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !batches.is_empty() && app.ingest_discovered(batches) {
+                dirty = true;
+            }
+            if disconnected {
+                app.discover_rx = None;
+            }
+        }
+
         let terminal_size = terminal.size()?;
         let terminal_area = Rect::new(0, 0, terminal_size.width, terminal_size.height);
         if app.set_page_size(page_size_for(
@@ -1859,11 +2122,16 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
         }
 
         let animating = app.corner_3d_enabled() && matches!(app.mode, Mode::Normal);
-        let timeout = if animating {
+        let mut timeout = if animating {
             CORNER_3D_FRAME.min(app.preview_wait_timeout(now))
         } else {
             app.preview_wait_timeout(now)
         };
+        // While the scan streams, wake often enough to drain batches promptly so
+        // the pool fills visibly instead of in one late lurch.
+        if app.discover_rx.is_some() {
+            timeout = timeout.min(Duration::from_millis(50));
+        }
         if !event::poll(timeout)? {
             // Keep the ambient cube moving while idle in Normal mode.
             if animating {
@@ -2004,13 +2272,26 @@ fn handle_key_normal(
         KeyCode::Char('u') if ctrl => {
             app.clear_query();
         }
-        KeyCode::Char('d') if ctrl => {
-            if let Some(candidate_idx) = app.selected_candidate_idx() {
-                app.mode = Mode::ConfirmDelete { candidate_idx };
-            } else {
+        KeyCode::Char('d') if ctrl => match app.selected_candidate() {
+            // Discovered rows have no history entry; deleting would only rewrite
+            // the history files for a path that isn't there. Disable it outright
+            // rather than risk corrupting history.
+            Some(candidate) if candidate.source == CandidateSource::Discovered => {
+                app.notice = Some(
+                    app.language
+                        .text(TextKey::DiscoveredNotDeletable)
+                        .to_string(),
+                );
+            }
+            Some(_) => {
+                if let Some(candidate_idx) = app.selected_candidate_idx() {
+                    app.mode = Mode::ConfirmDelete { candidate_idx };
+                }
+            }
+            None => {
                 app.notice = Some(app.language.text(TextKey::NoDeletableHistory).to_string());
             }
-        }
+        },
         KeyCode::Enter => match app.selected_candidate() {
             Some(candidate) if candidate.exists => return Some(Some(candidate.raw.clone())),
             Some(_) => {
@@ -3075,15 +3356,27 @@ fn render_list(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         return;
     }
 
+    // Highlights and the abbreviated display are built here, for visible rows
+    // only -- one throwaway matcher for the page instead of a stored index per
+    // candidate. See `Filter::run` and `Candidate::display`.
+    let home = app.home.as_deref();
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
     let mut lines = Vec::with_capacity(page.end - page.start);
     for (offset, matched) in app.filtered_results[page.start..page.end]
         .iter()
         .enumerate()
     {
         let index = page.start + offset;
+        let candidate = &app.candidates[matched.idx];
+        let highlights = if candidate.exists {
+            compute_row_highlights(&mut matcher, &candidate.raw, &app.query)
+        } else {
+            Vec::new()
+        };
         lines.push(list_row_line(
-            &app.candidates[matched.idx],
-            &matched.highlights,
+            candidate,
+            home,
+            &highlights,
             ListRowOptions {
                 index,
                 total: app.filtered_results.len(),
@@ -3108,10 +3401,12 @@ struct ListRowOptions {
 
 fn list_row_line(
     candidate: &Candidate,
+    home: Option<&str>,
     highlights: &[u32],
     options: ListRowOptions,
     theme: &Theme,
 ) -> Line<'static> {
+    let display = candidate.display(home);
     let ListRowOptions {
         index,
         total,
@@ -3180,7 +3475,7 @@ fn list_row_line(
         Span::styled(index_label, row_style),
     ];
     spans.extend(list_path_spans(
-        &candidate.display,
+        &display,
         highlights,
         available,
         path_style,
@@ -3315,7 +3610,7 @@ fn render_preview(
     let width = inner.width as usize;
     let mut lines = vec![
         Line::from(Span::styled(
-            trim_end(&candidate.name, width),
+            trim_end(candidate.name(), width),
             theme.title(),
         )),
         Line::from(Span::styled(
@@ -3736,7 +4031,7 @@ fn render_confirm_delete(
     let path = app
         .candidates
         .get(candidate_idx)
-        .map(|candidate| candidate.display.text.clone())
+        .map(|candidate| candidate.display(app.home.as_deref()).text)
         .unwrap_or_else(|| app.language.text(TextKey::UnknownDirectory).to_string());
     let message = confirm_delete_message(&path, width.saturating_sub(2) as usize, app.language);
     let lines = vec![
@@ -3879,6 +4174,32 @@ fn take_width_back(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_name_borrows_the_last_segment() {
+        // `name` is derived from `raw` rather than stored, so the derivation is
+        // what needs pinning: trailing slashes normalize away and rootless paths
+        // fall back to the whole input.
+        // (Mutation check: return `path` unconditionally and the first case fails.)
+        let cases = [
+            ("/home/jason/workspace/cdh", "cdh"),
+            ("/home/jason/workspace/cdh/", "cdh"),
+            ("/", "/"),
+            ("relative", "relative"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(directory_name_str(raw), want, "directory_name_str({raw:?})");
+            let candidate = Candidate {
+                raw: raw.to_string(),
+                score: 0.0,
+                exists: true,
+                last_visit: None,
+                source: CandidateSource::Discovered,
+            };
+            assert_eq!(candidate.name(), want, "Candidate::name() for {raw:?}");
+        }
+    }
+
     use crate::{EffectiveConfig, Paths};
     use ratatui::{backend::TestBackend, buffer::Buffer};
     use settings::{LanguagePreference, SettingKey, UiEnvironment, UiSettings};
@@ -5821,19 +6142,20 @@ mod tests {
         let raw = "/home/jason/workspace/api-client";
         let candidate = Candidate {
             raw: raw.to_string(),
-            display: PathDisplay::from_path(raw, Some("/home/jason")),
-            name: "api-client".to_string(),
             score: 1.0,
             exists: true,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let mut filter = Filter::new();
         let matches = filter.run(std::slice::from_ref(&candidate), "/home/jason");
         assert_eq!(matches.len(), 1);
-        assert!(candidate
-            .display
-            .display_highlight_indices(&matches[0].highlights)
-            .contains(&0));
+        // Highlights are computed at render time (deferred to visible rows);
+        // rebuild them here and confirm they still map onto the "~" display char.
+        let display = candidate.display(Some("/home/jason"));
+        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+        let highlights = compute_row_highlights(&mut matcher, &candidate.raw, "/home/jason");
+        assert!(display.display_highlight_indices(&highlights).contains(&0));
     }
 
     #[test]
@@ -6369,14 +6691,19 @@ mod tests {
         let raw = "/home/jason/workspace/repos/easy_proxies";
         let candidate = Candidate {
             raw: raw.to_string(),
-            display: PathDisplay::from_path(raw, Some("/home/jason")),
-            name: "easy_proxies".to_string(),
             score: 1.0,
             exists: true,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let theme = Theme::new(true);
-        let line = list_row_line(&candidate, &[], row_options(1, 10, false, 80), &theme);
+        let line = list_row_line(
+            &candidate,
+            Some("/home/jason"),
+            &[],
+            row_options(1, 10, false, 80),
+            &theme,
+        );
         let rendered = line_text(&line);
 
         assert!(rendered.contains("~/workspace/repos/easy_proxies"));
@@ -6394,14 +6721,13 @@ mod tests {
         let raw = "/archive/old-project";
         let candidate = Candidate {
             raw: raw.to_string(),
-            display: PathDisplay::from_path(raw, None),
-            name: "old-project".to_string(),
             score: 1.0,
             exists: false,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let theme = Theme::new(true);
-        let line = list_row_line(&candidate, &[], row_options(5, 10, false, 80), &theme);
+        let line = list_row_line(&candidate, None, &[], row_options(5, 10, false, 80), &theme);
         let rendered = line_text(&line);
         let status = line
             .spans
@@ -6419,15 +6745,15 @@ mod tests {
         let raw = "/home/jason/workspace/repos/github.com/jasonwong1991/easy_proxies";
         let candidate = Candidate {
             raw: raw.to_string(),
-            display: PathDisplay::from_path(raw, Some("/home/jason")),
-            name: "easy_proxies".to_string(),
             score: 1.0,
             exists: true,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let theme = Theme::new(true);
-        let wide = list_row_line(&candidate, &[], row_options(0, 1, false, 80), &theme);
-        let narrow = list_row_line(&candidate, &[], row_options(0, 1, false, 24), &theme);
+        let home = Some("/home/jason");
+        let wide = list_row_line(&candidate, home, &[], row_options(0, 1, false, 80), &theme);
+        let narrow = list_row_line(&candidate, home, &[], row_options(0, 1, false, 24), &theme);
         let wide_text = line_text(&wide);
         let narrow_text = line_text(&narrow);
 
@@ -6453,15 +6779,15 @@ mod tests {
     fn search_match_in_selected_row_keeps_the_same_background() {
         let candidate = Candidate {
             raw: "/projects/api-client".to_string(),
-            display: PathDisplay::from_path("/projects/api-client", None),
-            name: "api-client".to_string(),
             score: 1.0,
             exists: true,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let theme = Theme::new(true);
         let line = list_row_line(
             &candidate,
+            None,
             &[10, 11, 12],
             row_options(0, 1, true, 80),
             &theme,
@@ -6480,15 +6806,15 @@ mod tests {
     fn colorless_selected_row_keeps_one_continuous_reverse_style() {
         let candidate = Candidate {
             raw: "/projects/api-client".to_string(),
-            display: PathDisplay::from_path("/projects/api-client", None),
-            name: "api-client".to_string(),
             score: 1.0,
             exists: true,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let theme = Theme::new(false);
         let line = list_row_line(
             &candidate,
+            None,
             &[10, 11, 12],
             row_options(0, 1, true, 40),
             &theme,
@@ -6504,11 +6830,10 @@ mod tests {
         let raw = "/home/jason/workspace/api-client";
         let candidate = Candidate {
             raw: raw.to_string(),
-            display: PathDisplay::from_path(raw, Some("/home/jason")),
-            name: "api-client".to_string(),
             score: 1.0,
             exists: true,
             last_visit: None,
+            source: CandidateSource::History,
         };
         let theme = Theme::new(true);
         let highlights = (raw[..raw.find("api-client").unwrap()].chars().count() as u32
@@ -6516,6 +6841,7 @@ mod tests {
             .collect::<Vec<_>>();
         let line = list_row_line(
             &candidate,
+            Some("/home/jason"),
             &highlights,
             row_options(0, 1, false, 80),
             &theme,
@@ -6632,5 +6958,219 @@ mod tests {
         fs::write(repo.join("note.txt"), "dirty").unwrap();
         assert_eq!(read_git_info(&repo).unwrap().dirty, Some(true));
         let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- Directory-tree discovery layer ----
+
+    fn discovered_cand(raw: &str, score: f32) -> Candidate {
+        Candidate {
+            raw: raw.to_string(),
+            score,
+            exists: true,
+            last_visit: None,
+            source: CandidateSource::Discovered,
+        }
+    }
+
+    fn history_cand(raw: &str, score: f32) -> Candidate {
+        Candidate {
+            source: CandidateSource::History,
+            ..discovered_cand(raw, score)
+        }
+    }
+
+    #[test]
+    fn filter_ranks_history_before_discovered_at_equal_fuzzy_score() {
+        // Same raw path => identical fuzzy score and identical recommendation
+        // score, so only the source tiebreak can order them. Discovered is listed
+        // first to prove the sort actively reorders. (Mutation check: drop the
+        // source clause and Rust's stable sort leaves Discovered first -> fails.)
+        let candidates = vec![discovered_cand("/a/b", 0.5), history_cand("/a/b", 0.5)];
+        let mut filter = Filter::new();
+        let matches = filter.run(&candidates, "b");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(candidates[matches[0].idx].source, CandidateSource::History);
+        assert_eq!(
+            candidates[matches[1].idx].source,
+            CandidateSource::Discovered
+        );
+    }
+
+    #[test]
+    fn ingest_dedups_against_history_and_within_itself() {
+        // History owns /a/b. The batch re-offers /a/b (must lose) and /a/c twice
+        // (once with a trailing slash, which normalizes equal). (Mutation check:
+        // remove the known_paths dedup and this becomes 4 candidates -> fails.)
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/a/b", 0.9)])), None, false);
+        app.ingest_discovered(vec![vec![
+            "/a/b".to_string(),
+            "/a/c".to_string(),
+            "/a/c/".to_string(),
+        ]]);
+        assert_eq!(app.candidates.len(), 2);
+        assert_eq!(app.candidates[0].source, CandidateSource::History);
+        let discovered: Vec<_> = app
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.source == CandidateSource::Discovered)
+            .map(|candidate| candidate.raw.clone())
+            .collect();
+        assert_eq!(discovered, vec!["/a/c".to_string()]);
+    }
+
+    #[test]
+    fn empty_query_keeps_history_first_then_sorted_discovery() {
+        let mut app = App::with_preview_worker(
+            build_candidates(&recs(&[("/hist1", 0.9), ("/hist2", 0.8)])),
+            None,
+            false,
+        );
+        app.ingest_discovered(vec![vec!["/disc/z".to_string(), "/disc/a".to_string()]]);
+        let order: Vec<_> = app
+            .filtered_results
+            .iter()
+            .map(|matched| app.candidates[matched.idx].raw.clone())
+            .collect();
+        // History prefix unchanged (frecency order); discovered suffix sorted by
+        // (score desc, path asc) -- both score 0 here, so path ascending.
+        assert_eq!(
+            order,
+            vec![
+                "/hist1".to_string(),
+                "/hist2".to_string(),
+                "/disc/a".to_string(),
+                "/disc/z".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_inherits_parent_neighborhood_score_for_ordering() {
+        // /hot has a high score, so its parent /p maps hot; a discovered sibling
+        // /p/cold under the same parent inherits that heat and sorts ahead of a
+        // discovered dir in a cold corner.
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/p/hot", 0.9)])), None, false);
+        app.discover_score_map = build_score_map(&recs(&[("/p/hot", 0.9)]));
+        app.ingest_discovered(vec![vec!["/z/cold".to_string(), "/p/sibling".to_string()]]);
+        let discovered: Vec<_> = app.candidates[app.discovered_start..]
+            .iter()
+            .map(|candidate| candidate.raw.clone())
+            .collect();
+        assert_eq!(
+            discovered,
+            vec!["/p/sibling".to_string(), "/z/cold".to_string()]
+        );
+    }
+
+    #[test]
+    fn ingest_preserves_selected_path() {
+        let mut app = App::with_preview_worker(
+            build_candidates(&recs(&[("/hist1", 0.9), ("/hist2", 0.8)])),
+            None,
+            false,
+        );
+        app.set_selected(1);
+        let before = app.selected_raw();
+        assert_eq!(before.as_deref(), Some("/hist2"));
+        app.ingest_discovered(vec![vec!["/disc/a".to_string(), "/disc/b".to_string()]]);
+        assert_eq!(app.selected_raw(), before);
+    }
+
+    #[test]
+    fn ctrl_d_on_discovered_row_is_disabled_and_never_confirms() {
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/hist", 0.9)])), None, false);
+        app.ingest_discovered(vec![vec!["/disc/a".to_string()]]);
+        app.set_selected(1);
+        assert_eq!(
+            app.selected_candidate().unwrap().source,
+            CandidateSource::Discovered
+        );
+        let result = handle_key_normal(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(result.is_none());
+        // Must not arm the delete confirmation for a path that has no history.
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.notice.is_some());
+    }
+
+    #[test]
+    fn ctrl_d_on_history_row_still_arms_confirmation() {
+        // Guard the mutation the other way: History rows keep the delete flow.
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/hist", 0.9)])), None, false);
+        let result = handle_key_normal(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(result.is_none());
+        assert!(matches!(app.mode, Mode::ConfirmDelete { .. }));
+    }
+
+    #[test]
+    fn bootstrap_seeds_pwd_ancestors_and_children() {
+        let tree = {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            std::env::temp_dir().join(format!("cdh-bootstrap-{}-{stamp}", std::process::id()))
+        };
+        fs::create_dir_all(tree.join("child_a")).unwrap();
+        fs::create_dir_all(tree.join("child_b")).unwrap();
+        let mut app = App::with_preview_worker(Vec::new(), None, false);
+        app.bootstrap_from_pwd(&tree.to_string_lossy());
+        let raws: HashSet<String> = app.candidates.iter().map(|c| c.raw.clone()).collect();
+        // $PWD itself, its children, and at least one ancestor are present.
+        assert!(raws.contains(&tree.to_string_lossy().into_owned()));
+        assert!(raws.contains(&tree.join("child_a").to_string_lossy().into_owned()));
+        assert!(raws.contains(&tree.join("child_b").to_string_lossy().into_owned()));
+        assert!(app
+            .candidates
+            .iter()
+            .all(|c| c.source == CandidateSource::Discovered));
+        let _ = fs::remove_dir_all(&tree);
+    }
+
+    #[test]
+    fn ingest_after_deleting_all_history_does_not_panic() {
+        // Repro: delete every history row (Ctrl+D's main use), then a small
+        // discovery batch arrives. If `discovered_start` isn't decremented on
+        // removal it stays stale-high and `candidates[discovered_start..]` panics
+        // once the start exceeds the pool length.
+        let mut app = App::with_preview_worker(
+            build_candidates(&recs(&[("/h1", 0.9), ("/h2", 0.8)])),
+            None,
+            false,
+        );
+        assert_eq!(app.discovered_start, 2);
+        app.remove_candidate(0); // delete /h1
+        app.remove_candidate(0); // delete /h2
+        assert!(app.candidates.is_empty());
+        // Must not panic on the slice inside ingest.
+        app.ingest_discovered(vec![vec!["/d/a".to_string()]]);
+        assert_eq!(app.candidates.len(), 1);
+        assert_eq!(app.candidates[0].source, CandidateSource::Discovered);
+    }
+
+    #[test]
+    fn ingest_after_deleting_history_keeps_discovered_suffix_sorted() {
+        // Deleting a history row must shift `discovered_start` so the whole
+        // discovered suffix stays in the sort window; otherwise the leading
+        // discovered rows freeze in insertion order.
+        let mut app = App::with_preview_worker(
+            build_candidates(&recs(&[("/h1", 0.9), ("/h2", 0.8)])),
+            None,
+            false,
+        );
+        app.ingest_discovered(vec![vec!["/d/z".to_string()]]);
+        app.remove_candidate(0); // delete /h1 (history prefix)
+        app.ingest_discovered(vec![vec!["/d/a".to_string()]]);
+        let discovered: Vec<_> = app
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.source == CandidateSource::Discovered)
+            .map(|candidate| candidate.raw.clone())
+            .collect();
+        // Both score 0 -> path ascending across the whole suffix.
+        assert_eq!(discovered, vec!["/d/a".to_string(), "/d/z".to_string()]);
     }
 }

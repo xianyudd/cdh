@@ -3,6 +3,7 @@
 pub mod app;
 pub mod config;
 pub mod controller;
+pub mod discover;
 pub mod frecency;
 pub mod history;
 pub mod paths;
