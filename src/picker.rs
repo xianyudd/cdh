@@ -1305,9 +1305,6 @@ struct App {
     /// ones in `ingest_discovered`, and the scan worker takes the same set as a
     /// prune set so the subtree is never even `read_dir`'d.
     excludes: Excludes,
-    /// Where the exclusion list lives. `None` without an `AppContext` (no disk
-    /// to write to), in which case Ctrl+D reports instead of pretending.
-    excludes_path: Option<PathBuf>,
     /// `CDH_IGNORE_RE`. History candidates were already filtered by it inside
     /// the recommend pipeline, but discovered ones are pushed straight into
     /// `ingest_discovered` and bypass that pipeline entirely -- without this
@@ -1418,7 +1415,6 @@ impl App {
             known_paths,
             discovered_start,
             excludes: Excludes::default(),
-            excludes_path: None,
             ignore_re: None,
         };
         app.notice = loaded.warning.map(|warning| {
@@ -1749,9 +1745,14 @@ impl App {
     ///
     /// Subtree rather than single row, because that is what the exclusion list
     /// stores: excluding `~/miniforge3` while its 6,000 children stayed on
-    /// screen would read as a broken delete. Fingerprints stay in `known_paths`
-    /// — the excluded paths can no longer be produced anyway, so removing them
-    /// would only cost hashing.
+    /// screen would read as a broken delete.
+    ///
+    /// Fingerprints have to leave `known_paths` with the rows. They used to
+    /// stay -- an excluded path could not be produced again, so dropping them
+    /// only cost hashing -- but `unexclude` now re-scans the subtree, and every
+    /// re-emitted path would dedup away against its own stale fingerprint. The
+    /// undo would silently restore nothing, in exactly the "I just excluded the
+    /// wrong row" case the panel exists for.
     fn exclude_subtree(&mut self, root: &str) {
         let selected = self.selected_index;
         // Keep `discovered_start` pointing at the first discovered candidate.
@@ -1762,14 +1763,21 @@ impl App {
         let discovered_start = self.discovered_start;
         let mut removed_from_history = 0;
         let mut idx = 0;
+        let mut orphaned = Vec::new();
         self.candidates.retain(|candidate| {
             let keep = !discover::under_prefix(&candidate.raw, root);
-            if !keep && idx < discovered_start {
-                removed_from_history += 1;
+            if !keep {
+                if idx < discovered_start {
+                    removed_from_history += 1;
+                }
+                orphaned.push(path_fingerprint(&candidate.raw));
             }
             idx += 1;
             keep
         });
+        for fingerprint in orphaned {
+            self.known_paths.remove(&fingerprint);
+        }
         self.discovered_start -= removed_from_history;
         self.filtered_results = self.filter.run(&self.candidates, &self.query);
         self.selected_index = selected.min(self.filtered_results.len().saturating_sub(1));
@@ -1801,12 +1809,27 @@ impl App {
         match excludes::remove(&ctx.paths.excludes, &root) {
             Ok(excludes) => {
                 self.excludes = excludes;
-                self.discover_rx
-                    .extend(discover::spawn_subtree(root, self.excludes.prune_set()));
+                let rescanning = match discover::spawn_subtree(root, self.excludes.prune_set()) {
+                    Some(rx) => {
+                        self.discover_rx.push(rx);
+                        true
+                    }
+                    // `CDH_DISCOVER=0`: there is no scan to run, so the
+                    // directory only returns if it is still in history.
+                    None => false,
+                };
                 self.mode = Mode::Excludes {
                     selected: selected.min(self.excludes.roots().len().saturating_sub(1)),
                 };
-                self.notice = Some(self.language.text(TextKey::ExcludeRemoved).to_string());
+                self.notice = Some(
+                    self.language
+                        .text(if rescanning {
+                            TextKey::ExcludeRemoved
+                        } else {
+                            TextKey::ExcludeRemovedNoRescan
+                        })
+                        .to_string(),
+                );
             }
             Err(error) => {
                 self.notice = Some(format!(
@@ -2161,7 +2184,6 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
         locale_language,
     );
     app.excludes = excludes;
-    app.excludes_path = ctx.map(|context| context.paths.excludes.clone());
     app.ignore_re = ctx.and_then(|context| context.config.ignore_re.clone());
 
     // Wire up the directory-tree discovery layer. The score map orders the
@@ -4085,6 +4107,25 @@ fn render_settings(frame: &mut Frame, app: &App, theme: &Theme, full: Rect, sele
     }
 }
 
+/// How many entry rows the exclusion panel can show, and whether the footer
+/// fits below them.
+///
+/// Layout is title(0), blank(1), entries(2..), footer(last). Below four rows
+/// there is no room for both an entry and the footer, and an entry is the more
+/// useful of the two -- forcing one row anyway would just let the footer
+/// overwrite it.
+fn excludes_layout(height: u16) -> (usize, bool) {
+    if height >= 4 {
+        (height.saturating_sub(3) as usize, true)
+    } else {
+        (height.saturating_sub(2) as usize, false)
+    }
+}
+
+fn excludes_visible_rows(height: u16) -> usize {
+    excludes_layout(height).0
+}
+
 /// First visible row of the exclusion panel.
 ///
 /// The cursor drags the window rather than the window paging: the list has no
@@ -4148,7 +4189,7 @@ fn render_excludes(frame: &mut Frame, app: &App, theme: &Theme, full: Rect, sele
         // Scroll the window with the cursor: the list is unbounded in principle
         // and a fixed top would strand entries below the panel with no way to
         // reach them.
-        let rows = inner.height.saturating_sub(3).max(1) as usize;
+        let rows = excludes_visible_rows(inner.height);
         let selected = selected.min(roots.len() - 1);
         let start = excludes_window_start(roots.len(), rows, selected);
         for (offset, root) in roots[start..].iter().take(rows).enumerate() {
@@ -4172,7 +4213,7 @@ fn render_excludes(frame: &mut Frame, app: &App, theme: &Theme, full: Rect, sele
         }
     }
 
-    if inner.height > 1 {
+    if excludes_layout(inner.height).1 {
         let footer = trim_end(
             app.language.text(TextKey::ExcludesFooter),
             inner.width as usize,
@@ -6977,6 +7018,58 @@ mod tests {
         assert!(!app
             .known_paths
             .contains(&path_fingerprint("/keep/target/debug")));
+    }
+
+    #[test]
+    fn excluding_then_unexcluding_in_one_session_brings_the_subtree_back() {
+        // The case the F4 panel exists for: excluded the wrong row, undo it now.
+        // `unexclude` re-scans the subtree, so every path is re-emitted -- if
+        // `exclude_subtree` left the fingerprints in `known_paths`, all of them
+        // dedup away and the undo silently restores nothing.
+        // (Mutation check: drop the `known_paths.remove` loop in
+        // `exclude_subtree` and this lands back at 1 candidate.)
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/h", 0.9)])), None, false);
+        app.ingest_discovered(vec![vec!["/noise".to_string(), "/noise/deep".to_string()]]);
+        assert_eq!(app.candidates.len(), 3);
+
+        app.exclude_subtree("/noise");
+        assert_eq!(app.candidates.len(), 1);
+        // While still excluded the pool must stay clean even if a batch arrives.
+        app.excludes = crate::excludes::Excludes::from_paths(["/noise"]);
+        app.ingest_discovered(vec![vec!["/noise/deep".to_string()]]);
+        assert_eq!(
+            app.candidates.len(),
+            1,
+            "exclusion still filters in-flight batches"
+        );
+
+        // Undo: the list no longer covers it, and the top-up scan re-emits.
+        app.excludes = crate::excludes::Excludes::default();
+        app.ingest_discovered(vec![vec!["/noise".to_string(), "/noise/deep".to_string()]]);
+        let raws: Vec<_> = app.candidates.iter().map(|c| c.raw.as_str()).collect();
+        assert_eq!(app.candidates.len(), 3, "subtree must come back: {raws:?}");
+        assert!(raws.contains(&"/noise"));
+        assert!(raws.contains(&"/noise/deep"));
+    }
+
+    #[test]
+    fn exclusion_panel_drops_the_footer_before_it_covers_an_entry() {
+        // Layout is title / blank / entries / footer. Below four rows only one
+        // of the last two fits, and an entry beats the key hint.
+        assert_eq!(excludes_layout(12), (9, true));
+        assert_eq!(excludes_layout(4), (1, true));
+        assert_eq!(excludes_layout(3), (1, false));
+        assert_eq!(excludes_layout(2), (0, false));
+        assert_eq!(excludes_layout(0), (0, false));
+        // Rows must never reach the footer row.
+        for height in 4..40u16 {
+            let (rows, _) = excludes_layout(height);
+            assert!(
+                2 + rows <= (height - 1) as usize,
+                "overlap at height {height}"
+            );
+        }
     }
 
     #[test]
