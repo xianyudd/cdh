@@ -692,6 +692,48 @@ pub(crate) fn spawn(
     Some(rx)
 }
 
+/// 补扫单棵子树，用于「取消排除」后把该目录立刻找回来。
+///
+/// 不重跑整轮扫描：启动那轮的剪枝集合在 spawn 时就定死了，取消排除并不会让它回头
+/// 补上；而整轮重扫要花掉又一个 5 秒预算，只为了找回用户刚点名的一棵树。这里就以
+/// 该目录为唯一根、不限深度地跑一遍，走同一个 `run`，结果并入同一条并入路径。
+pub(crate) fn spawn_subtree(
+    root: String,
+    excluded: HashSet<String>,
+) -> Option<mpsc::Receiver<Vec<String>>> {
+    if !discover_enabled() {
+        return None;
+    }
+    let (tx, rx) = mpsc::channel::<Vec<String>>();
+    let home = env::var("HOME").ok().filter(|home| !home.is_empty());
+
+    thread::Builder::new()
+        .name("cdh-discover-topup".to_string())
+        .spawn(move || {
+            let mut prune_abs = prune_abs_set(home.as_deref());
+            prune_abs.extend(excluded);
+            let slow = is_slow_mount(&root);
+            let job = ScanJob {
+                roots: vec![RootSpec {
+                    path: PathBuf::from(root),
+                    eff_depth: 0,
+                    remaining: UNLIMITED,
+                    slow,
+                }],
+                cap: CANDIDATE_CAP,
+                deadline: Some(Instant::now() + TIME_BUDGET),
+                prune_abs,
+                slow_prefixes: default_slow_prefixes(),
+                // 单根扫描没有「本地被慢挂载饿死」的问题：配额留了也没人跟它抢。
+                slow_reserve: 0,
+            };
+            run(job, |batch| tx.send(batch).is_ok());
+        })
+        .ok()?;
+
+    Some(rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

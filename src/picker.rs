@@ -1224,8 +1224,18 @@ fn env_truthy(value: &str, default: bool) -> bool {
 enum Mode {
     Normal,
     Help,
-    Settings { selected: usize },
-    ConfirmDelete { candidate_idx: usize },
+    Settings {
+        selected: usize,
+    },
+    ConfirmDelete {
+        candidate_idx: usize,
+    },
+    /// The exclusion list: the only place an exclusion can be undone, since an
+    /// excluded directory is by definition absent from the candidate pool and
+    /// so can never be selected to un-exclude it.
+    Excludes {
+        selected: usize,
+    },
 }
 
 struct App {
@@ -1266,10 +1276,12 @@ struct App {
     /// out of the layout and render paths -- which run every animation frame --
     /// and lets tests exercise the opt-out without mutating process state.
     corner_3d_env: bool,
-    /// Streamed batches from the directory-tree discovery worker. `None` when
-    /// discovery is disabled (`CDH_DISCOVER=0`), non-interactive, or finished
-    /// (the channel disconnects and we drop the receiver).
-    discover_rx: Option<mpsc::Receiver<Vec<String>>>,
+    /// Streamed batches from directory-tree discovery workers. Empty when
+    /// discovery is disabled (`CDH_DISCOVER=0`), non-interactive, or every scan
+    /// has finished (a disconnected channel is dropped). A list rather than one
+    /// slot because un-excluding a directory starts a top-up scan of just that
+    /// subtree, which can overlap the still-running startup scan.
+    discover_rx: Vec<mpsc::Receiver<Vec<String>>>,
     /// Parent directory -> best recommendation score. A discovered candidate
     /// inherits the score of the neighborhood it sits in (a sibling of a hot
     /// history entry ranks with that entry's heat); parents unknown to history
@@ -1400,7 +1412,7 @@ impl App {
             last_list_start: Cell::new(0),
             corner_anim_started: Instant::now(),
             corner_3d_env: env_flag_enabled("CDH_CORNER_3D", true),
-            discover_rx: None,
+            discover_rx: Vec::new(),
             discover_score_map: HashMap::new(),
             home: env::var("HOME").ok().filter(|home| !home.is_empty()),
             known_paths,
@@ -1766,6 +1778,45 @@ impl App {
         self.invalidate_preview_selection();
     }
 
+    /// Drop one entry from the exclusion list and bring its subtree straight
+    /// back into the pool.
+    ///
+    /// The top-up scan matters: the startup scan's prune set was fixed when it
+    /// spawned and will not revisit the subtree, so without this the undo would
+    /// only take effect on the next launch -- which is the exact
+    /// "it worked, but not until tomorrow" behaviour that made the old delete
+    /// semantics confusing in the first place.
+    fn unexclude(&mut self, selected: usize, ctx: Option<&AppContext>) {
+        let Some(root) = self.excludes.roots().get(selected).cloned() else {
+            return;
+        };
+        let Some(ctx) = ctx else {
+            self.notice = Some(
+                self.language
+                    .text(TextKey::HistoryWriteUnavailable)
+                    .to_string(),
+            );
+            return;
+        };
+        match excludes::remove(&ctx.paths.excludes, &root) {
+            Ok(excludes) => {
+                self.excludes = excludes;
+                self.discover_rx
+                    .extend(discover::spawn_subtree(root, self.excludes.prune_set()));
+                self.mode = Mode::Excludes {
+                    selected: selected.min(self.excludes.roots().len().saturating_sub(1)),
+                };
+                self.notice = Some(self.language.text(TextKey::ExcludeRemoved).to_string());
+            }
+            Err(error) => {
+                self.notice = Some(format!(
+                    "{}{error}",
+                    self.language.text(TextKey::ExcludeFailedPrefix)
+                ));
+            }
+        }
+    }
+
     fn toggle_preview(&mut self) {
         self.preview_visible = !self.preview_visible;
         if self.preview_visible && self.preview_worker.is_none() {
@@ -2118,10 +2169,10 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
     // and takes the exclusion list as a prune set, so excluded subtrees cost no
     // I/O at all rather than being filtered out after the fact.
     app.discover_score_map = build_score_map(&items);
-    app.discover_rx = discover::spawn(
+    app.discover_rx.extend(discover::spawn(
         items.iter().map(|item| item.path.clone()).collect(),
         app.excludes.prune_set(),
-    );
+    ));
     // Empty-history bootstrap: seed from $PWD before the loop so the first frame
     // isn't blank while the full scan spins up.
     if app.candidates.is_empty() {
@@ -2137,26 +2188,17 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
 
     loop {
         // Drain every pending discovery batch, then merge and refilter once.
-        if app.discover_rx.is_some() {
+        if !app.discover_rx.is_empty() {
             let mut batches = Vec::new();
-            let mut disconnected = false;
-            if let Some(rx) = &app.discover_rx {
-                loop {
-                    match rx.try_recv() {
-                        Ok(batch) => batches.push(batch),
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            disconnected = true;
-                            break;
-                        }
-                    }
+            app.discover_rx.retain(|rx| loop {
+                match rx.try_recv() {
+                    Ok(batch) => batches.push(batch),
+                    Err(mpsc::TryRecvError::Empty) => return true,
+                    Err(mpsc::TryRecvError::Disconnected) => return false,
                 }
-            }
+            });
             if !batches.is_empty() && app.ingest_discovered(batches) {
                 dirty = true;
-            }
-            if disconnected {
-                app.discover_rx = None;
             }
         }
 
@@ -2192,7 +2234,7 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
         };
         // While the scan streams, wake often enough to drain batches promptly so
         // the pool fills visibly instead of in one late lurch.
-        if app.discover_rx.is_some() {
+        if !app.discover_rx.is_empty() {
             timeout = timeout.min(Duration::from_millis(50));
         }
         if !event::poll(timeout)? {
@@ -2244,7 +2286,36 @@ fn handle_key(
         Mode::ConfirmDelete { candidate_idx } => {
             handle_key_confirm_delete(app, code, modifiers, ctx, candidate_idx)
         }
+        Mode::Excludes { selected } => handle_key_excludes(app, code, modifiers, ctx, selected),
     }
+}
+
+fn handle_key_excludes(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    ctx: Option<&AppContext>,
+    selected: usize,
+) -> Option<Option<String>> {
+    let len = app.excludes.roots().len();
+    match code {
+        KeyCode::F(4) | KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Up => {
+            app.mode = Mode::Excludes {
+                selected: selected.saturating_sub(1),
+            };
+        }
+        KeyCode::Down => {
+            app.mode = Mode::Excludes {
+                selected: selected.saturating_add(1).min(len.saturating_sub(1)),
+            };
+        }
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.unexclude(selected, ctx);
+        }
+        _ => {}
+    }
+    None
 }
 
 fn handle_key_help(app: &mut App, code: KeyCode) -> Option<Option<String>> {
@@ -2374,6 +2445,7 @@ fn handle_key_normal(
         }
         KeyCode::F(1) | KeyCode::Char('?') | KeyCode::Char('？') => app.mode = Mode::Help,
         KeyCode::F(2) => app.mode = Mode::Settings { selected: 0 },
+        KeyCode::F(4) => app.mode = Mode::Excludes { selected: 0 },
         KeyCode::F(3) => {
             app.cycle_theme(1);
         }
@@ -2637,6 +2709,7 @@ fn draw(frame: &mut Frame, app: &App, theme: &Theme, corner_angle: f32) {
         Mode::Normal => {}
         Mode::Help => render_help(frame, app.language, theme, full),
         Mode::Settings { selected } => render_settings(frame, app, theme, full, selected),
+        Mode::Excludes { selected } => render_excludes(frame, app, theme, full, selected),
         Mode::ConfirmDelete { candidate_idx } => {
             render_confirm_delete(frame, app, theme, full, candidate_idx)
         }
@@ -3932,6 +4005,7 @@ fn help_lines(language: Language, theme: &Theme) -> Vec<Line<'static>> {
         help_row("Ctrl+D", language.text(TextKey::DeleteHistoryEntry), theme),
         help_row("F1 / ? / ？", language.text(TextKey::OpenHelp), theme),
         help_row("F2", language.text(TextKey::OpenSettings), theme),
+        help_row("F4", language.text(TextKey::OpenExcludes), theme),
         help_row("Ctrl+T / F3", language.text(TextKey::SettingTheme), theme),
         help_row(
             "↑↓  ←→  Enter/Space  Esc",
@@ -4005,6 +4079,102 @@ fn render_settings(frame: &mut Frame, app: &App, theme: &Theme, full: Rect, sele
     if inner.height > 1 {
         let footer = trim_end(
             app.language.text(TextKey::SettingsFooter),
+            inner.width as usize,
+        );
+        render_settings_line(frame, inner, inner.height - 1, &footer, theme.dim());
+    }
+}
+
+/// First visible row of the exclusion panel.
+///
+/// The cursor drags the window rather than the window paging: the list has no
+/// fixed bound, and anchoring the top would strand later entries below the panel
+/// with no key that reaches them. Clamped so a short list never scrolls and the
+/// last page is always full.
+fn excludes_window_start(len: usize, rows: usize, selected: usize) -> usize {
+    if len <= rows {
+        return 0;
+    }
+    selected
+        .saturating_sub(rows.saturating_sub(1))
+        .min(len - rows)
+}
+
+fn render_excludes(frame: &mut Frame, app: &App, theme: &Theme, full: Rect, selected: usize) {
+    let width = 72u16.min(full.width.saturating_sub(2));
+    let height = 14u16.min(full.height);
+    if width < 2 || height < 2 {
+        return;
+    }
+
+    let area = centered(full, width, height);
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(theme.panel()), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            theme.border(),
+        ))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    if inner.is_empty() {
+        return;
+    }
+
+    render_settings_line(
+        frame,
+        inner,
+        0,
+        app.language.text(TextKey::ExcludesTitle),
+        theme.title(),
+    );
+
+    let roots = app.excludes.roots();
+    if roots.is_empty() {
+        render_settings_line(
+            frame,
+            inner,
+            2,
+            app.language.text(TextKey::ExcludesEmpty),
+            theme.dim(),
+        );
+    } else {
+        // Scroll the window with the cursor: the list is unbounded in principle
+        // and a fixed top would strand entries below the panel with no way to
+        // reach them.
+        let rows = inner.height.saturating_sub(3).max(1) as usize;
+        let selected = selected.min(roots.len() - 1);
+        let start = excludes_window_start(roots.len(), rows, selected);
+        for (offset, root) in roots[start..].iter().take(rows).enumerate() {
+            let index = start + offset;
+            let style = if index == selected {
+                theme.selected()
+            } else {
+                theme.primary()
+            };
+            let text = format!(
+                " {}",
+                PathDisplay::from_path(root, app.home.as_deref()).text
+            );
+            render_settings_line(
+                frame,
+                inner,
+                2 + offset as u16,
+                &trim_middle(&text, inner.width as usize),
+                style,
+            );
+        }
+    }
+
+    if inner.height > 1 {
+        let footer = trim_end(
+            app.language.text(TextKey::ExcludesFooter),
             inner.width as usize,
         );
         render_settings_line(frame, inner, inner.height - 1, &footer, theme.dim());
@@ -6807,6 +6977,120 @@ mod tests {
         assert!(!app
             .known_paths
             .contains(&path_fingerprint("/keep/target/debug")));
+    }
+
+    #[test]
+    fn f4_opens_the_exclusion_panel_and_esc_closes_it() {
+        // The panel is the only way back: an excluded directory is by definition
+        // absent from the pool, so there is no row to press a key on.
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, false);
+        handle_key(&mut app, KeyCode::F(4), KeyModifiers::NONE, None);
+        assert!(matches!(app.mode, Mode::Excludes { selected: 0 }));
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, None);
+        assert_eq!(app.mode, Mode::Normal);
+        // F4 also toggles closed.
+        handle_key(&mut app, KeyCode::F(4), KeyModifiers::NONE, None);
+        handle_key(&mut app, KeyCode::F(4), KeyModifiers::NONE, None);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn exclusion_panel_navigation_clamps_at_both_ends() {
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, false);
+        app.excludes = crate::excludes::Excludes::from_paths(["/x", "/y", "/z"]);
+        handle_key(&mut app, KeyCode::F(4), KeyModifiers::NONE, None);
+        for _ in 0..5 {
+            handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE, None);
+        }
+        assert!(matches!(app.mode, Mode::Excludes { selected: 2 }));
+        for _ in 0..5 {
+            handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE, None);
+        }
+        assert!(matches!(app.mode, Mode::Excludes { selected: 0 }));
+    }
+
+    #[test]
+    fn exclusion_window_follows_the_cursor_without_overscrolling() {
+        // Short list never scrolls.
+        assert_eq!(excludes_window_start(3, 8, 2), 0);
+        // Cursor drags the window down one row at a time...
+        assert_eq!(excludes_window_start(20, 5, 4), 0);
+        assert_eq!(excludes_window_start(20, 5, 5), 1);
+        // ...and the last page stays full instead of scrolling past the end.
+        assert_eq!(excludes_window_start(20, 5, 19), 15);
+        // Degenerate heights must not underflow.
+        assert_eq!(excludes_window_start(0, 1, 0), 0);
+        assert_eq!(excludes_window_start(4, 1, 3), 3);
+    }
+
+    #[test]
+    fn unexclude_rewrites_the_file_and_shrinks_the_panel() {
+        let (root, ctx) = test_ctx("unexclude");
+        crate::excludes::add(&ctx.paths.excludes, "/noise/one").unwrap();
+        crate::excludes::add(&ctx.paths.excludes, "/noise/two").unwrap();
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, false);
+        app.excludes = crate::excludes::Excludes::load(&ctx.paths.excludes);
+        assert_eq!(app.excludes.roots().len(), 2);
+
+        handle_key(&mut app, KeyCode::F(4), KeyModifiers::NONE, Some(&ctx));
+        handle_key(
+            &mut app,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            Some(&ctx),
+        );
+
+        // In memory and on disk, and the panel stays open on a valid row.
+        assert_eq!(app.excludes.roots(), ["/noise/two".to_string()]);
+        let reloaded = crate::excludes::Excludes::load(&ctx.paths.excludes);
+        assert!(!reloaded.contains("/noise/one"));
+        assert!(reloaded.contains("/noise/two"));
+        assert!(matches!(app.mode, Mode::Excludes { selected: 0 }));
+
+        // Removing the last entry must not leave the cursor past the end.
+        handle_key(
+            &mut app,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            Some(&ctx),
+        );
+        assert!(app.excludes.is_empty());
+        assert!(matches!(app.mode, Mode::Excludes { selected: 0 }));
+        // Ctrl+D on an empty list is a no-op, not a panic.
+        handle_key(
+            &mut app,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            Some(&ctx),
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exclusion_panel_renders_safely_when_empty_or_tiny() {
+        let mut app =
+            App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, false);
+        app.mode = Mode::Excludes { selected: 0 };
+        // Empty list: the panel must say so rather than render a blank box.
+        let empty = settings_panel_text(&settings_panel_buffer(&app, 60, 20, true));
+        assert!(empty.contains("排除清单"));
+        assert!(empty.contains("清单为空"));
+
+        app.excludes = crate::excludes::Excludes::from_paths(["/x/one", "/y/two", "/z/three"]);
+        app.mode = Mode::Excludes { selected: 2 };
+        let listed = settings_panel_text(&settings_panel_buffer(&app, 60, 20, true));
+        assert!(listed.contains("/x/one"));
+        assert!(listed.contains("/z/three"));
+
+        // Terminal sizes that leave no room for the panel body must not panic.
+        for (width, height) in [(24, 12), (10, 4), (3, 3), (1, 1)] {
+            let buffer = settings_panel_buffer(&app, width, height, true);
+            assert_eq!(buffer.area.width, width);
+            assert_eq!(buffer.area.height, height);
+        }
     }
 
     #[test]
