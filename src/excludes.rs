@@ -157,11 +157,37 @@ fn write(file: &Path, excludes: &Excludes) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn temp_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("cdh-excludes-{name}-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        dir.join("excludes")
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// 测试用临时目录，`Drop` 时整棵删掉。
+    ///
+    /// 此前的 `temp_file` 用 `create_dir_all` 建目录，测试却只删里面的文件，
+    /// 目录本身留在 `/tmp` 里越攒越多。名字带 pid 和序号，并行测试互不干扰。
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("cdh-excludes-{name}-{}-{seq}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        /// 本目录里的排除清单路径；只拼不建。
+        fn file(&self) -> PathBuf {
+            self.path.join("excludes")
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 
     #[test]
@@ -192,7 +218,8 @@ mod tests {
 
     #[test]
     fn load_ignores_comments_and_blank_lines() {
-        let file = temp_file("load");
+        let dir = TempDir::new("load");
+        let file = dir.file();
         fs::write(&file, "# comment\n\n/a/b\n  /c/d  \n").unwrap();
         let excludes = Excludes::load(&file);
         assert!(excludes.contains("/a/b/deep"));
@@ -202,8 +229,8 @@ mod tests {
 
     #[test]
     fn remove_drops_exactly_one_entry_and_tolerates_misses() {
-        let file = temp_file("remove");
-        let _ = fs::remove_file(&file);
+        let dir = TempDir::new("remove");
+        let file = dir.file();
         add(&file, "/a/one").unwrap();
         add(&file, "/a/two").unwrap();
 
@@ -215,7 +242,6 @@ mod tests {
         // 尾斜杠等价；不存在的条目视为已达成，不报错。
         assert!(remove(&file, "/a/two/").unwrap().is_empty());
         assert!(remove(&file, "/never/there").unwrap().is_empty());
-        let _ = fs::remove_file(&file);
     }
 
     #[test]
@@ -227,8 +253,8 @@ mod tests {
 
     #[test]
     fn add_round_trips_through_disk_and_leaves_no_temp_file() {
-        let file = temp_file("add");
-        let _ = fs::remove_file(&file);
+        let dir = TempDir::new("add");
+        let file = dir.file();
         let excludes = add(&file, "/x/y").unwrap();
         assert!(excludes.contains("/x/y/z"));
         assert!(Excludes::load(&file).contains("/x/y/z"));
@@ -238,6 +264,5 @@ mod tests {
         assert!(reloaded.contains("/x/y"));
         assert!(reloaded.contains("/p/q"));
         assert!(!file.with_extension("tmp").exists());
-        let _ = fs::remove_file(&file);
     }
 }
