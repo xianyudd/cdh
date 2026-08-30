@@ -17,6 +17,7 @@ nucleo-matcher = "0.3"
 ratatui = "0.29"
 regex = "1"
 toml = "=0.8.23"
+unicode-segmentation = "1.12"
 unicode-width = "0.2"
 
 [lib]
