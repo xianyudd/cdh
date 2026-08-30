@@ -47,6 +47,7 @@ dependencies = [
  "ratatui",
  "regex",
  "toml",
+ "unicode-segmentation",
  "unicode-width 0.2.0",
 ]
 

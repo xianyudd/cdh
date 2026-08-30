@@ -43,6 +43,7 @@ use ratatui::{
     widgets::{Block, Clear, Paragraph},
     Frame, Terminal,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use regex::Regex;
@@ -1248,7 +1249,7 @@ struct App {
     candidates: Vec<Candidate>,
     filter: Filter,
     query: String,
-    /// Unicode scalar-value offset in `query`, never a UTF-8 byte offset.
+    /// Grapheme-cluster offset in `query`, never a UTF-8 byte offset.
     query_cursor: usize,
     filtered_results: Vec<Match>,
     selected_index: usize,
@@ -1605,20 +1606,16 @@ impl App {
         self.invalidate_preview_selection();
     }
 
-    fn query_char_count(&self) -> usize {
-        self.query.chars().count()
+    fn query_grapheme_count(&self) -> usize {
+        grapheme_count(&self.query)
     }
 
     fn clamp_query_cursor(&mut self) {
-        self.query_cursor = self.query_cursor.min(self.query_char_count());
+        self.query_cursor = self.query_cursor.min(self.query_grapheme_count());
     }
 
-    fn query_byte_index(&self, char_index: usize) -> usize {
-        self.query
-            .char_indices()
-            .nth(char_index)
-            .map(|(byte_index, _)| byte_index)
-            .unwrap_or(self.query.len())
+    fn query_byte_index(&self, grapheme_index: usize) -> usize {
+        byte_index_at_grapheme(&self.query, grapheme_index)
     }
 
     fn move_query_cursor(&mut self, delta: isize) -> bool {
@@ -1628,7 +1625,7 @@ impl App {
         } else {
             self.query_cursor
                 .saturating_add(delta as usize)
-                .min(self.query_char_count())
+                .min(self.query_grapheme_count())
         };
         if next == self.query_cursor {
             return false;
@@ -1660,7 +1657,7 @@ impl App {
 
     fn delete_query_char(&mut self) -> bool {
         self.clamp_query_cursor();
-        if self.query_cursor >= self.query_char_count() {
+        if self.query_cursor >= self.query_grapheme_count() {
             return false;
         }
         let start = self.query_byte_index(self.query_cursor);
@@ -3363,8 +3360,8 @@ impl QueryViewport {
 }
 
 fn query_viewport(query: &str, cursor_index: usize, max_width: usize) -> QueryViewport {
-    let cursor_index = cursor_index.min(query.chars().count());
-    let (before, after) = split_at_char_index(query, cursor_index);
+    let cursor_index = cursor_index.min(grapheme_count(query));
+    let (before, after) = split_at_grapheme_index(query, cursor_index);
     if UnicodeWidthStr::width(query) <= max_width {
         return QueryViewport {
             before: before.to_string(),
@@ -3445,7 +3442,7 @@ fn render_input(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             theme.dim(),
         ));
     } else {
-        let cursor_index = app.query_cursor.min(app.query_char_count());
+        let cursor_index = app.query_cursor.min(app.query_grapheme_count());
         let viewport = query_viewport(
             &app.query,
             cursor_index,
@@ -4376,12 +4373,19 @@ fn centered(full: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
-fn split_at_char_index(text: &str, char_index: usize) -> (&str, &str) {
-    let byte_index = text
-        .char_indices()
-        .nth(char_index)
+fn grapheme_count(text: &str) -> usize {
+    text.graphemes(true).count()
+}
+
+fn byte_index_at_grapheme(text: &str, grapheme_index: usize) -> usize {
+    text.grapheme_indices(true)
+        .nth(grapheme_index)
         .map(|(byte_index, _)| byte_index)
-        .unwrap_or(text.len());
+        .unwrap_or(text.len())
+}
+
+fn split_at_grapheme_index(text: &str, grapheme_index: usize) -> (&str, &str) {
+    let byte_index = byte_index_at_grapheme(text, grapheme_index);
     text.split_at(byte_index)
 }
 
@@ -4424,31 +4428,37 @@ fn trim_middle(text: &str, max_width: usize) -> String {
 }
 
 fn take_width_front(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
     let mut width = 0;
     let mut result = String::new();
-    for character in text.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if width + character_width > max_width {
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > max_width {
             break;
         }
-        width += character_width;
-        result.push(character);
+        width += grapheme_width;
+        result.push_str(grapheme);
     }
     result
 }
 
 fn take_width_back(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
     let mut width = 0;
     let mut reverse = String::new();
-    for character in text.chars().rev() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if width + character_width > max_width {
+    for grapheme in text.graphemes(true).rev() {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > max_width {
             break;
         }
-        width += character_width;
-        reverse.push(character);
+        width += grapheme_width;
+        reverse.push_str(grapheme);
     }
-    reverse.chars().rev().collect()
+    reverse.graphemes(true).rev().collect()
 }
 
 #[cfg(test)]
@@ -6676,7 +6686,7 @@ mod tests {
     }
 
     #[test]
-    fn unicode_query_cursor_moves_and_deletes_by_characters() {
+    fn unicode_query_cursor_moves_and_deletes_by_graphemes() {
         let mut app = app_with_paths(&[("/中文🧭", 0.9)]);
         app.query = "中🧭文".to_string();
         app.query_cursor = 1;
@@ -6695,7 +6705,22 @@ mod tests {
     }
 
     #[test]
-    fn query_cursor_stays_within_unicode_character_boundaries() {
+    fn query_cursor_moves_by_grapheme_clusters() {
+        let mut app = app_with_paths(&[("/👩‍💻", 0.9)]);
+        app.query = "a👩‍💻b".to_string();
+        app.query_cursor = 1;
+
+        for _ in 0..3 {
+            handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE, None);
+        }
+        assert_eq!(app.query_cursor, 3);
+
+        handle_key(&mut app, KeyCode::Left, KeyModifiers::NONE, None);
+        assert_eq!(app.query_cursor, 2);
+    }
+
+    #[test]
+    fn query_cursor_stays_within_grapheme_boundaries() {
         let mut app = app_with_paths(&[("/中文🧭", 0.9)]);
         app.query = "中🧭".to_string();
         app.query_cursor = 0;
@@ -6706,7 +6731,10 @@ mod tests {
         handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE, None);
         handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE, None);
         assert_eq!(app.query_cursor, 2);
-        assert_eq!(split_at_char_index(&app.query, app.query_cursor).0, "中🧭");
+        assert_eq!(
+            split_at_grapheme_index(&app.query, app.query_cursor).0,
+            "中🧭"
+        );
     }
 
     #[test]
@@ -6742,6 +6770,54 @@ mod tests {
                 assert!(query_viewport(query, cursor, width).display_width() <= width);
             }
         }
+    }
+
+    #[test]
+    fn query_viewport_keeps_combined_graphemes_within_width() {
+        let query = "🧭‍🧭";
+        let viewport = query_viewport(query, 1, 2);
+
+        assert_eq!(viewport.before, query);
+        assert!(viewport.after.is_empty());
+        assert!(viewport.display_width() <= 2);
+    }
+
+    #[test]
+    fn query_viewport_stays_within_width_for_grapheme_boundaries() {
+        let queries = ["🧭‍🧭", "👩‍💻", "👨‍👩‍👧‍👦", "e\u{301}", "🇨🇳", "a👩‍💻b"];
+
+        for query in queries {
+            for cursor in 0..=grapheme_count(query) {
+                for width in 0..=8 {
+                    let viewport = query_viewport(query, cursor, width);
+                    assert!(
+                        viewport.display_width() <= width,
+                        "query={query:?}, cursor={cursor}, width={width}, viewport={viewport:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_input_handles_a_combined_grapheme_at_the_cursor() {
+        let mut app = app_with_paths(&[("/👩‍💻", 0.9)]);
+        app.query = "🧭‍🧭".to_string();
+        app.query_cursor = 1;
+
+        let backend = TestBackend::new(5, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_input(frame, &app, &Theme::new(true), frame.area()))
+            .unwrap();
+    }
+
+    #[test]
+    fn width_truncation_preserves_combined_graphemes() {
+        let query = "👩‍💻";
+
+        assert_eq!(take_width_front(query, 2), query);
+        assert_eq!(take_width_back(query, 2), query);
     }
 
     #[test]
