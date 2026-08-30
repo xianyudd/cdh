@@ -1150,11 +1150,11 @@ fn compute_row_highlights(matcher: &mut Matcher, raw: &str, query: &str) -> Vec<
         return Vec::new();
     }
     let mut haystack_buffer = Vec::new();
-    let mut needle_buffer = Vec::new();
     let mut highlights = Vec::new();
-    let _ = matcher.fuzzy_indices(
+    let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+    let _ = pattern.indices(
         Utf32Str::new(raw, &mut haystack_buffer),
-        Utf32Str::new(query, &mut needle_buffer),
+        matcher,
         &mut highlights,
     );
     highlights.sort_unstable();
@@ -6442,6 +6442,44 @@ mod tests {
         let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
         let highlights = compute_row_highlights(&mut matcher, &candidate.raw, "/home/jason");
         assert!(display.display_highlight_indices(&highlights).contains(&0));
+    }
+
+    #[test]
+    fn ascii_highlighting_handles_windows_paths_without_aborting() {
+        let paths = [
+            "/mnt/d/Jason/Documents/Workspace/vs2022/repo/Vela",
+            "/mnt/d/Jason/Documents/Workspace/vs2022/repo/app01",
+            "/mnt/d/Jason/Documents/Workspace/vs2022/repo/winUI-demo",
+            "/mnt/c/Users/Jason/Documents/Virtual Machines",
+            "/mnt/c/Users/Jason/Documents/Visual Studio 2022",
+            "/mnt/c/Users/Jason/Documents/Voicemeeter",
+            "/tmp/VelaShellPreview",
+            "/tmp/vela-audit",
+            "/tmp/vela-final-runtime-sizes",
+            "/tmp/vela-final-sizes",
+            "/tmp/vela-final-sizes-v2",
+            "/mnt/d/Jason/Documents/Workspace/vue-vben-admin",
+            "/home/jason/workspace/labs/python/vllm-qwen",
+        ];
+        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+
+        for path in paths {
+            let _ = compute_row_highlights(&mut matcher, path, "V");
+        }
+    }
+
+    #[test]
+    fn highlighting_uses_filter_pattern_for_case_and_fuzzy_syntax() {
+        let raw = "/tmp/VelaShellPreview/Marvel's Spider-Man 2";
+        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+        let highlights = compute_row_highlights(&mut matcher, raw, "V'");
+
+        assert!(highlights
+            .iter()
+            .any(|&index| { raw.chars().nth(index as usize) == Some('v') }));
+        assert!(highlights
+            .iter()
+            .any(|&index| { raw.chars().nth(index as usize) == Some('\'') }));
     }
 
     #[test]
