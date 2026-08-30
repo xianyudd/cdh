@@ -474,7 +474,29 @@ mod tests {
         }
     }
 
-    fn make_test_ctx(name: &str) -> (PathBuf, AppContext) {
+    /// 测试用临时根目录，`Drop` 时整棵删掉。
+    ///
+    /// 此前每个测试在末尾手写 `remove_dir_all`：断言一失败就跳过清理，
+    /// 于是 `/tmp` 里攒下一堆 `cdh_history_test_*`。RAII 让失败路径也能清干净。
+    struct TempRoot {
+        path: PathBuf,
+    }
+
+    impl std::ops::Deref for TempRoot {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn make_test_ctx(name: &str) -> (TempRoot, AppContext) {
         let uniq = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -505,7 +527,7 @@ mod tests {
         }
 
         (
-            root,
+            TempRoot { path: root },
             AppContext {
                 paths,
                 config: test_config(),
@@ -548,7 +570,7 @@ mod tests {
         let entries = load_raw(&ctx).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].ts_secs, 1_763_331_934);
-        assert_eq!(entries[0].path, root);
+        assert_eq!(entries[0].path, *root);
     }
 
     #[test]
@@ -569,8 +591,6 @@ mod tests {
             read_lines(&ctx.paths.history_uniq),
             vec![dir.to_string_lossy().to_string()]
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -592,8 +612,6 @@ mod tests {
                 dir_a.to_string_lossy().to_string(),
             ]
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -629,8 +647,6 @@ mod tests {
             read_lines(&ctx.paths.history_uniq),
             vec![keep.to_string_lossy().to_string()]
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -675,8 +691,6 @@ mod tests {
         assert!(!raw.contains(stale.to_str().unwrap()));
         assert!(raw.contains(&keep_canon));
         assert_eq!(read_lines(&ctx.paths.history_uniq), vec![keep_canon]);
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -692,8 +706,6 @@ mod tests {
 
         let result = log_visit(&ctx, dir.to_str().unwrap());
         assert!(result.is_err());
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -723,7 +735,5 @@ mod tests {
 
         assert_eq!(raw_path, expected);
         assert_eq!(read_lines(&ctx.paths.history_uniq), vec![expected]);
-
-        let _ = fs::remove_dir_all(root);
     }
 }

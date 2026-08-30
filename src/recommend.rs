@@ -587,45 +587,90 @@ fn is_match_boundary(byte: Option<u8>) -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::process;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::{env, fs};
-    fn tmp_file(name: &str) -> String {
-        let mut p = env::temp_dir();
-        p.push(format!("cdh_test_{}_{}", name, now_secs()));
-        p.to_string_lossy().to_string()
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// 一次测试的临时根目录：raw/uniq 和候选目录都放在里面，`Drop` 时整棵删掉。
+    ///
+    /// 名字带 pid 和单调序号，所以并行测试互不干扰。此前这里既有只拼路径、
+    /// 从不删除的 `tmp_file`，也有 `/tmp/cdh_test_a` 这类固定名字——后者跨进程共享，
+    /// 顺手删掉会踩到同时在跑的另一个测试进程。
+    ///
+    /// 前缀刻意不含任何测试里用到的 token（`git` / `cdh` / `workspace` / `alpha`
+    /// / `beta`）：token 过滤是对整条绝对路径做子串匹配的（见 `path_matches_tokens_lc`），
+    /// 根目录名里只要出现 token，就会让本该只命中一个 token 的候选凭空多命中一个，
+    /// 把按命中数排序的断言悄悄变成恒真。
+    struct TempCase {
+        root: PathBuf,
+    }
+
+    impl TempCase {
+        fn new(name: &str) -> Self {
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let root = env::temp_dir().join(format!(
+                "recommend-tests-{name}-{}-{}-{seq}",
+                process::id(),
+                now_secs()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        /// 根内的一个文件路径；只拼不建，交给调用方写入。
+        fn file(&self, rel: &str) -> String {
+            self.root.join(rel).to_string_lossy().into_owned()
+        }
+
+        /// 根内的一个子目录，创建后返回。
+        fn dir(&self, rel: &str) -> PathBuf {
+            let path = self.root.join(rel);
+            fs::create_dir_all(&path).unwrap();
+            path
+        }
+
+        /// 根内的一个路径；只拼不建，供调用方自行 `create_dir_all`。
+        fn join(&self, rel: &str) -> PathBuf {
+            self.root.join(rel)
+        }
+    }
+
+    impl Drop for TempCase {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 
     #[test]
     fn fusion_prefers_recent_unique_when_raw_ties() {
+        let case = TempCase::new("fusion");
+        // 候选目录必须真实存在（check_dir=true）。
+        let dir_a = case.dir("a");
+        let dir_b = case.dir("b");
+
         // 构造 raw：两个路径访问次数相同 & 接近
-        let raw = tmp_file("raw.tsv");
+        let raw = case.file("raw.tsv");
         let mut f = File::create(&raw).unwrap();
         // t, path
-        writeln!(f, "{}\t/home/user/a", 1000).unwrap();
-        writeln!(f, "{}\t/home/user/b", 1000).unwrap();
-        writeln!(f, "{}\t/home/user/a", 2000).unwrap();
-        writeln!(f, "{}\t/home/user/b", 2000).unwrap();
+        writeln!(f, "{}\t{}", 1000, dir_a.display()).unwrap();
+        writeln!(f, "{}\t{}", 1000, dir_b.display()).unwrap();
+        writeln!(f, "{}\t{}", 2000, dir_a.display()).unwrap();
+        writeln!(f, "{}\t{}", 2000, dir_b.display()).unwrap();
 
         // 构造 uniq：b 比 a 更新
-        let uniq = tmp_file("uniq.txt");
-        fs::write(&uniq, "/home/user/a\n/home/user/b\n").unwrap();
-
-        // 创建假目录（check_dir=true 时需要存在）
-        fs::create_dir_all("/tmp/cdh_test_a").ok();
-        fs::create_dir_all("/tmp/cdh_test_b").ok();
-
-        // 替换为真实存在路径以通过校验
-        let raw_fixed = tmp_file("raw_fixed.tsv");
-        let mut ff = File::create(&raw_fixed).unwrap();
-        writeln!(ff, "{}\t/tmp/cdh_test_a", 1000).unwrap();
-        writeln!(ff, "{}\t/tmp/cdh_test_b", 1000).unwrap();
-        writeln!(ff, "{}\t/tmp/cdh_test_a", 2000).unwrap();
-        writeln!(ff, "{}\t/tmp/cdh_test_b", 2000).unwrap();
-        let uniq_fixed = tmp_file("uniq_fixed.txt");
-        fs::write(&uniq_fixed, "/tmp/cdh_test_a\n/tmp/cdh_test_b\n").unwrap();
+        let uniq = case.file("uniq.txt");
+        fs::write(&uniq, format!("{}\n{}\n", dir_a.display(), dir_b.display())).unwrap();
 
         let opt = RecommendOpt {
-            raw: raw_fixed,
-            uniq: uniq_fixed,
+            raw,
+            uniq,
             limit: Some(2),
             half_life: 24.0 * 3600.0,
             threshold: 0.0,
@@ -641,23 +686,24 @@ mod tests {
         let out = recommend_with_now(&opt, 3000);
         assert_eq!(out.len(), 2);
         // b 更新更近，应优于 a
-        assert_eq!(out[0].path, "/tmp/cdh_test_b");
+        assert_eq!(out[0].path, dir_b.to_string_lossy());
         assert!(out[0].score >= out[1].score);
     }
 
     #[test]
     fn token_and_regex_filtering() {
         // raw + uniq 混合，只有包含 token 的且不匹配 ignore_re 的应留下
-        let raw = tmp_file("raw2.tsv");
+        let case = TempCase::new("token_regex");
+        let keep = case.dir("keep_alpha");
+        let skip = case.dir("skip_beta");
+
+        let raw = case.file("raw2.tsv");
         let mut f = File::create(&raw).unwrap();
-        writeln!(f, "{}\t/tmp/keep_alpha", 1).unwrap();
-        writeln!(f, "{}\t/tmp/skip_beta", 2).unwrap();
+        writeln!(f, "{}\t{}", 1, keep.display()).unwrap();
+        writeln!(f, "{}\t{}", 2, skip.display()).unwrap();
 
-        let uniq = tmp_file("uniq2.txt");
-        fs::write(&uniq, "/tmp/keep_alpha\n/tmp/skip_beta\n").unwrap();
-
-        fs::create_dir_all("/tmp/keep_alpha").ok();
-        fs::create_dir_all("/tmp/skip_beta").ok();
+        let uniq = case.file("uniq2.txt");
+        fs::write(&uniq, format!("{}\n{}\n", keep.display(), skip.display())).unwrap();
 
         let ignore_re = Regex::new("skip_").ok();
         let opt = RecommendOpt {
@@ -675,21 +721,19 @@ mod tests {
             ..RecommendOpt::default()
         };
         let paths = recommend_paths(&opt);
-        assert_eq!(paths, vec!["/tmp/keep_alpha"]);
+        assert_eq!(paths, vec![keep.to_string_lossy().to_string()]);
     }
 
     #[test]
     fn default_limit_does_not_truncate_candidates() {
-        let raw = tmp_file("raw_unlimited.tsv");
-        let uniq = tmp_file("uniq_unlimited.txt");
-        let base = env::temp_dir().join(format!("cdh_test_unlimited_{}", now_secs()));
-        fs::create_dir_all(&base).unwrap();
+        let case = TempCase::new("unlimited");
+        let raw = case.file("raw_unlimited.tsv");
+        let uniq = case.file("uniq_unlimited.txt");
 
         let mut raw_file = File::create(&raw).unwrap();
         let mut uniq_body = String::new();
         for i in 0..25 {
-            let dir = base.join(format!("dir_{i:02}"));
-            fs::create_dir_all(&dir).unwrap();
+            let dir = case.dir(&format!("dir_{i:02}"));
             writeln!(raw_file, "{}\t{}", 1_000 + i, dir.display()).unwrap();
             uniq_body.push_str(&format!("{}\n", dir.display()));
         }
@@ -712,15 +756,14 @@ mod tests {
 
         let out = recommend_with_now(&opt, 2_000);
         assert_eq!(out.len(), 25);
-
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
     fn recommend_normalizes_millisecond_timestamps() {
-        let raw = tmp_file("raw_millis.tsv");
-        let uniq = tmp_file("uniq_millis.txt");
-        let base = env::temp_dir().join(format!("cdh_test_millis_{}", now_secs()));
+        let case = TempCase::new("millis");
+        let raw = case.file("raw_millis.tsv");
+        let uniq = case.file("uniq_millis.txt");
+        let base = case.root().to_path_buf();
         let older = base.join("older");
         let newer = base.join("newer");
         fs::create_dir_all(&older).unwrap();
@@ -751,15 +794,14 @@ mod tests {
         let out = recommend_with_now(&opt, 1_000_000_200);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].path, newer.to_string_lossy());
-
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
     fn keyword_quality_prefers_segment_exact_over_plain_substring() {
-        let raw = tmp_file("raw_keyword_exact.tsv");
-        let uniq = tmp_file("uniq_keyword_exact.txt");
-        let base = env::temp_dir().join(format!("cdh_test_keyword_exact_{}", now_secs()));
+        let case = TempCase::new("keyword_exact");
+        let raw = case.file("raw_keyword_exact.tsv");
+        let uniq = case.file("uniq_keyword_exact.txt");
+        let base = case.root().to_path_buf();
         let exact = base.join("git");
         let weak = base.join("digital-archive");
         fs::create_dir_all(&exact).unwrap();
@@ -789,15 +831,14 @@ mod tests {
 
         let out = recommend_with_now(&opt, 3000);
         assert_eq!(out[0].path, exact.to_string_lossy());
-
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
     fn keyword_quality_prefers_paths_matching_more_tokens() {
-        let raw = tmp_file("raw_keyword_multi.tsv");
-        let uniq = tmp_file("uniq_keyword_multi.txt");
-        let base = env::temp_dir().join(format!("rank_multi_{}", now_secs()));
+        let case = TempCase::new("keyword_multi");
+        let raw = case.file("raw_keyword_multi.tsv");
+        let uniq = case.file("uniq_keyword_multi.txt");
+        let base = case.root().to_path_buf();
         let one_token = base.join("git-only");
         let two_tokens = base.join("cdh-git");
         fs::create_dir_all(&one_token).unwrap();
@@ -831,15 +872,16 @@ mod tests {
 
         let out = recommend_with_now(&opt, 3000);
         assert_eq!(out[0].path, two_tokens.to_string_lossy());
-
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
     fn keyword_filter_keeps_parent_substring_but_ranks_path_match_first() {
-        let raw = tmp_file("raw_keyword_parent.tsv");
-        let uniq = tmp_file("uniq_keyword_parent.txt");
-        let base = env::temp_dir().join(format!("github_parent_{}", now_secs()));
+        let case = TempCase::new("keyword_parent");
+        let raw = case.file("raw_keyword_parent.tsv");
+        let uniq = case.file("uniq_keyword_parent.txt");
+        // token 必须落在**祖先目录名**里：`unrelated` 自己的名字不含 `git`，
+        // 只能靠父目录 `github` 命中，这正是本用例要测的路径。
+        let base = case.dir("github");
         let unrelated = base.join("plain-project");
         let target = base.join("git-tools");
         fs::create_dir_all(&unrelated).unwrap();
@@ -872,16 +914,15 @@ mod tests {
         let paths = recommend_paths(&opt);
         assert_eq!(paths[0], target.to_string_lossy().to_string());
         assert!(paths.contains(&unrelated.to_string_lossy().to_string()));
-
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
     fn keyword_filter_keeps_grandparent_substring_matches() {
-        let raw = tmp_file("raw_keyword_grandparent.tsv");
-        let uniq = tmp_file("uniq_keyword_grandparent.txt");
-        let base = env::temp_dir().join(format!("workspace_parent_{}", now_secs()));
-        let target = base.join("repos").join("cdh");
+        let case = TempCase::new("keyword_grandparent");
+        let raw = case.file("raw_keyword_grandparent.tsv");
+        let uniq = case.file("uniq_keyword_grandparent.txt");
+        // token 只出现在祖父目录名里，末段和父段都不含它——这正是本例要覆盖的情形。
+        let target = case.join("workspace/repos/cdh");
         fs::create_dir_all(&target).unwrap();
 
         let mut raw_file = File::create(&raw).unwrap();
@@ -905,15 +946,14 @@ mod tests {
 
         let paths = recommend_paths(&opt);
         assert_eq!(paths, vec![target.to_string_lossy().to_string()]);
-
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
     fn token_filtering_keeps_or_semantics() {
-        let raw = tmp_file("raw_keyword_or.tsv");
-        let uniq = tmp_file("uniq_keyword_or.txt");
-        let base = env::temp_dir().join(format!("cdh_test_keyword_or_{}", now_secs()));
+        let case = TempCase::new("keyword_or");
+        let raw = case.file("raw_keyword_or.tsv");
+        let uniq = case.file("uniq_keyword_or.txt");
+        let base = case.root().to_path_buf();
         let alpha = base.join("alpha-project");
         let beta = base.join("beta-project");
         let gamma = base.join("gamma-project");
@@ -955,17 +995,16 @@ mod tests {
         assert!(paths.contains(&alpha.to_string_lossy().to_string()));
         assert!(paths.contains(&beta.to_string_lossy().to_string()));
         assert!(!paths.contains(&gamma.to_string_lossy().to_string()));
-
-        let _ = fs::remove_dir_all(base);
     }
 
-    /// 辅助：写 raw/uniq 并构造仅设置必要字段的 opt。
-    fn setup(name: &str) -> (String, String, std::path::PathBuf) {
-        let raw = tmp_file(&format!("{name}_raw"));
-        let uniq = tmp_file(&format!("{name}_uniq"));
-        let base = env::temp_dir().join(format!("cdh_{name}_{}", now_secs()));
-        fs::create_dir_all(&base).unwrap();
-        (raw, uniq, base)
+    /// 辅助：在一个自清理的临时根里备好 raw/uniq 路径。
+    ///
+    /// 返回的 `TempCase` 必须被绑定住：一旦提前 drop，整棵目录就没了。
+    fn setup(name: &str) -> (String, String, TempCase) {
+        let case = TempCase::new(name);
+        let raw = case.file(&format!("{name}_raw"));
+        let uniq = case.file(&format!("{name}_uniq"));
+        (raw, uniq, case)
     }
 
     #[test]
@@ -1010,7 +1049,6 @@ mod tests {
             fresh.to_string_lossy(),
             "fresh 应排第一, got {out:?}"
         );
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1057,7 +1095,6 @@ mod tests {
             genuine.to_string_lossy(),
             "genuine 应排第一, got {out:?}"
         );
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1086,7 +1123,6 @@ mod tests {
             "pwd 应被排除"
         );
         assert!(paths.contains(&other.to_string_lossy().to_string()));
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1134,7 +1170,6 @@ mod tests {
             target.to_string_lossy(),
             "转移目标应排第一, got {out:?}"
         );
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1192,7 +1227,6 @@ mod tests {
         // 中部两项分数应明显区分（差值 > 0.05），而非被 whale 压成并列。
         let gap = score_of(&mid_hi) - score_of(&mid_lo);
         assert!(gap > 0.05, "中部区分度不足: mid_hi-mid_lo={gap}");
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1264,8 +1298,6 @@ mod tests {
                 item.path
             );
         }
-
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1313,7 +1345,5 @@ mod tests {
         assert!(unfiltered[0].exists);
         assert_eq!(unfiltered[1].path, missing.to_string_lossy());
         assert!(!unfiltered[1].exists);
-
-        let _ = fs::remove_dir_all(base);
     }
 }
