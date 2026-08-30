@@ -33,7 +33,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -169,6 +169,17 @@ pub(crate) fn under_prefix(path: &str, prefix: &str) -> bool {
     let root = prefix.strip_suffix('/').unwrap_or(prefix);
     path.strip_prefix(root)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Whether a directory path contains a Unix-style hidden component.
+///
+/// The candidate pool stores absolute paths, including paths under `/mnt` on
+/// WSL. Checking normal path components rather than the whole string keeps
+/// `/.config` hidden while leaving names such as `/workspace/project` alone.
+pub(crate) fn path_has_hidden_component(path: &str) -> bool {
+    Path::new(path).components().any(|component| {
+        matches!(component, Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+    })
 }
 
 fn is_slow_mount(path: &str) -> bool {
@@ -832,6 +843,14 @@ mod tests {
         // node_modules / .git 本身与其子树都不出现。
         assert!(!found.iter().any(|p| p.contains("node_modules")));
         assert!(!found.iter().any(|p| p.contains(".git")));
+    }
+
+    #[test]
+    fn hidden_path_detection_checks_components_not_substrings() {
+        assert!(path_has_hidden_component("/home/jason/.cache/project"));
+        assert!(path_has_hidden_component("/workspace/project/.git"));
+        assert!(!path_has_hidden_component("/workspace/project"));
+        assert!(!path_has_hidden_component("/workspace/dot.config/project"));
     }
 
     #[test]

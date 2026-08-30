@@ -1072,6 +1072,7 @@ struct Match {
 struct Filter {
     matcher: Matcher,
     buffer: Vec<char>,
+    hide_hidden: bool,
 }
 
 impl Filter {
@@ -1079,7 +1080,17 @@ impl Filter {
         Self {
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             buffer: Vec::new(),
+            hide_hidden: false,
         }
+    }
+
+    fn toggle_hidden(&mut self) -> bool {
+        self.hide_hidden = !self.hide_hidden;
+        self.hide_hidden
+    }
+
+    fn accepts(&self, candidate: &Candidate) -> bool {
+        !self.hide_hidden || !discover::path_has_hidden_component(&candidate.raw)
     }
 
     /// An empty query preserves recommendation order (history first, then the
@@ -1098,7 +1109,12 @@ impl Filter {
     fn run(&mut self, candidates: &[Candidate], query: &str) -> Vec<Match> {
         let query = query.trim();
         if query.is_empty() {
-            return (0..candidates.len()).map(|idx| Match { idx }).collect();
+            return candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| self.accepts(candidate))
+                .map(|(idx, _)| Match { idx })
+                .collect();
         }
 
         let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
@@ -1106,6 +1122,9 @@ impl Filter {
         let mut missing = Vec::new();
 
         for (idx, candidate) in candidates.iter().enumerate() {
+            if !self.accepts(candidate) {
+                continue;
+            }
             let haystack = Utf32Str::new(&candidate.raw, &mut self.buffer);
             let Some(score) = pattern.score(haystack, &mut self.matcher) else {
                 continue;
@@ -1676,6 +1695,23 @@ impl App {
         self.query_cursor = 0;
         self.recompute_after_query_change();
         true
+    }
+
+    fn toggle_hidden_directories(&mut self) {
+        let selected_path = self.selected_raw();
+        let hidden = self.filter.toggle_hidden();
+        self.filtered_results = self.filter.run(&self.candidates, &self.query);
+        self.restore_selected_path(selected_path.as_deref());
+        self.notice = Some(
+            self.language
+                .text(if hidden {
+                    TextKey::HiddenDirectoriesFiltered
+                } else {
+                    TextKey::HiddenDirectoriesShown
+                })
+                .to_string(),
+        );
+        self.invalidate_preview_selection();
     }
 
     fn selected_candidate_idx(&self) -> Option<usize> {
@@ -2451,6 +2487,12 @@ fn handle_key_normal(
                 app.notice = Some(app.language.text(TextKey::NoDeletableHistory).to_string());
             }
         },
+        KeyCode::F(5) => {
+            app.toggle_hidden_directories();
+        }
+        KeyCode::Char('h') | KeyCode::Char('H') if ctrl => {
+            app.toggle_hidden_directories();
+        }
         KeyCode::Enter => match app.selected_candidate() {
             Some(candidate) if candidate.exists => return Some(Some(candidate.raw.clone())),
             Some(_) => {
@@ -2512,6 +2554,9 @@ fn handle_key_normal(
         }
         KeyCode::End => {
             app.move_end();
+        }
+        KeyCode::Backspace if ctrl => {
+            app.toggle_hidden_directories();
         }
         KeyCode::Backspace => {
             app.backspace_query();
@@ -4022,6 +4067,11 @@ fn help_lines(language: Language, theme: &Theme) -> Vec<Line<'static>> {
         help_row("Enter", language.text(TextKey::JumpToDirectory), theme),
         help_row("Tab", language.text(TextKey::TogglePreview), theme),
         help_row("Ctrl+D", language.text(TextKey::DeleteHistoryEntry), theme),
+        help_row(
+            "Ctrl+H / F5",
+            language.text(TextKey::ToggleHiddenDirectories),
+            theme,
+        ),
         help_row("F1 / ? / ？", language.text(TextKey::OpenHelp), theme),
         help_row("F2", language.text(TextKey::OpenSettings), theme),
         help_row("F4", language.text(TextKey::OpenExcludes), theme),
@@ -6183,7 +6233,7 @@ mod tests {
         assert_eq!(Language::En.text(TextKey::MissingStatus), "missing");
         assert_eq!(
             Language::En.text(TextKey::FooterPrimary),
-            "↑↓ Select · Ctrl+↑↓ Page · Enter Jump · Tab Preview · F1 Help · F2 Settings · Esc Exit"
+            "↑↓ Select · Ctrl+↑↓ Page · Ctrl+H Hidden dirs · Enter Jump · Tab Preview · F1 Help · F2 Settings · Esc Exit"
         );
     }
 
@@ -6237,7 +6287,10 @@ mod tests {
         let full = Language::En.text(TextKey::FooterPrimary);
         let compact = Language::En.text(TextKey::FooterCompact);
         let short = Language::En.text(TextKey::FooterShort);
-        assert_eq!(fit_footer(full, compact, short, 80), compact);
+        assert_eq!(
+            fit_footer(full, compact, short, 80),
+            "Ctrl+H Hidden dirs · Enter Jump · F1 Help · F2 Settings · Esc Exit"
+        );
 
         let mut app = App::with_preview_worker_language(
             build_candidates(&recs_with_exists(&[("/gone", 0.9, false)])),
@@ -6825,7 +6878,7 @@ mod tests {
         let hint = Language::ZhCn.text(TextKey::FooterPrimary);
         assert_eq!(
             hint,
-            "↑↓ 选择 · Ctrl+↑↓ 翻页 · Enter 跳转 · Tab 预览 · F1 帮助 · F2 设置 · Esc 退出"
+            "↑↓ 选择 · Ctrl+↑↓ 翻页 · Ctrl+H 隐藏目录 · Enter 跳转 · Tab 预览 · F1 帮助 · F2 设置 · Esc 退出"
         );
         assert!(!hint.contains("PgUp"));
         assert!(!hint.contains('←'));
@@ -6874,6 +6927,7 @@ mod tests {
             "← / →",
             "Backspace",
             "Delete",
+            "Ctrl+H / F5",
             "F1 / ? / ？",
         ] {
             assert!(text.contains(required), "missing help text: {required}");
@@ -6941,6 +6995,28 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_h_and_f5_toggle_hidden_directories() {
+        let mut app = app_with_paths(&[
+            ("/workspace/visible", 0.9),
+            ("/workspace/.cache/project", 0.8),
+        ]);
+        assert_eq!(app.filtered_results.len(), 2);
+
+        handle_key(&mut app, KeyCode::Char('h'), KeyModifiers::CONTROL, None);
+        assert_eq!(app.filtered_results.len(), 1);
+        assert_eq!(app.selected_raw().as_deref(), Some("/workspace/visible"));
+        assert_eq!(app.notice.as_deref(), Some("已过滤隐藏目录"));
+
+        handle_key(&mut app, KeyCode::F(5), KeyModifiers::NONE, None);
+        assert_eq!(app.filtered_results.len(), 2);
+        assert_eq!(app.notice.as_deref(), Some("已显示隐藏目录"));
+
+        // Some terminals encode Ctrl+H as Ctrl+Backspace instead of Char('h').
+        handle_key(&mut app, KeyCode::Backspace, KeyModifiers::CONTROL, None);
+        assert_eq!(app.filtered_results.len(), 1);
+    }
+
+    #[test]
     fn resize_page_size_keeps_current_directory_selected() {
         let mut app = app_with_paths(&[("/a", 0.9), ("/b", 0.8), ("/c", 0.7), ("/d", 0.6)]);
         app.set_selected(3);
@@ -6979,6 +7055,29 @@ mod tests {
         let matches = filter.run(&candidates, "api");
         assert_eq!(candidates[matches[0].idx].raw, "/live/api");
         assert_eq!(candidates[matches[1].idx].raw, "/missing/api");
+    }
+
+    #[test]
+    fn hidden_directory_toggle_filters_every_hidden_path_component() {
+        let candidates = build_candidates(&recs(&[
+            ("/workspace/visible", 0.9),
+            ("/workspace/.cache/project", 0.8),
+            ("/workspace/project/.git", 0.7),
+            ("/workspace/project/deep", 0.6),
+        ]));
+        let mut filter = Filter::new();
+
+        assert_eq!(filter.run(&candidates, "").len(), 4);
+        assert!(filter.toggle_hidden());
+        let visible = filter
+            .run(&candidates, "")
+            .into_iter()
+            .map(|matched| candidates[matched.idx].raw.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(visible, ["/workspace/visible", "/workspace/project/deep"]);
+
+        assert!(!filter.toggle_hidden());
+        assert_eq!(filter.run(&candidates, "").len(), 4);
     }
 
     #[test]
