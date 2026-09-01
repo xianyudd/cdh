@@ -94,6 +94,20 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
+          # 原生 ARM runner（ubuntu-24.04-arm 已 GA，与 ubuntu-latest 同为
+          # Ubuntu 24.04，只是 arm64），比过去的 cross 交叉编译省事。
+          # 已知取舍：24.04 的 glibc 是 2.39，所以这份产物要求目标机 glibc ≥ 2.39
+          # ——和 x86_64-gnu 那行的处境一致（它也在 ubuntu-latest 上构建）。
+          # 树莓派 OS Bookworm 是 glibc 2.36，装不上这份。给旧 glibc 的 ARM 机器
+          # 兜底需要 aarch64-unknown-linux-musl，那是本 PR 范围外的一行。
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          # musl：静态链接，一份产物覆盖所有 glibc 版本的 x86_64 Linux。
+          # 刻意不装 musl-tools —— 已验证不需要，见 ci.yml 里 cross job 的注释。
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
           - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
@@ -121,14 +135,75 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       # 可执行文件瘦身（Linux）
+      # 判据用 runner.os 而不是 matrix.os：矩阵里的 Linux runner 现在有两个
+      # （ubuntu-latest 与 ubuntu-24.04-arm），写死 == 'ubuntu-latest' 会让 ARM
+      # 那行的 if 为假 —— 而 if 为假不报错，结果是静默跳过瘦身却全绿。
       - name: Strip binary (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: strip "target/${{ matrix.target }}/release/cdh" || true
 
       # 可执行文件瘦身（macOS）
       - name: Strip binary (macOS)
-        if: matrix.os == 'macos-latest'
+        if: runner.os == 'macOS'
         run: strip -x "target/${{ matrix.target }}/release/cdh" || true
+
+      # 产物形状自检。跨编译矩阵最常见的错不是「编译不过」，而是「编译过了但产物
+      # 不对」：架构串了、musl 那份其实动态链接了、或者根本没瘦身（上面两步都带
+      # `|| true`，失败也不会报出来）。file 的输出一次能抓住这三种。
+      #
+      # 兜底的 `*)` 分支是这一步的要点：将来给矩阵加 target 却忘了在这里登记预期
+      # 形状，它会**失败**而不是安静放过。
+      #
+      # 只覆盖 Linux：darwin 两行的 file 输出格式不同，而这里没有 macOS 机器可以
+      # 先把预期字符串核准，写一个没验过的断言比不写更糟。
+      - name: Verify artifact shape (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/cdh"
+          desc="$(file -b "${bin}")"
+          echo "file: ${desc}"
+
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              want_arch='x86-64'
+              want_link='dynamically linked'
+              ;;
+            x86_64-unknown-linux-musl)
+              want_arch='x86-64'
+              want_link='static'
+              ;;
+            aarch64-unknown-linux-gnu)
+              want_arch='ARM aarch64'
+              want_link='dynamically linked'
+              ;;
+            *)
+              echo "::error::矩阵新增了 target 却没在这里登记预期产物形状：${{ matrix.target }}"
+              exit 1
+              ;;
+          esac
+
+          status=0
+          for want in "${want_arch}" "${want_link}"; do
+            if [ "${desc#*"${want}"}" != "${desc}" ]; then
+              echo "OK   产物包含 '${want}'"
+            else
+              echo "::error::产物形状不符：期望包含 '${want}'，实际是 ${desc}"
+              status=1
+            fi
+          done
+
+          # 瘦身单独判：file 对未瘦身的二进制输出的是 "not stripped"，直接用
+          # "stripped" 做子串匹配会把它也算通过 —— 那种恒真断言等于没有断言。
+          if [ "${desc#*not stripped}" != "${desc}" ]; then
+            echo "::error::产物没有瘦身（Cargo.toml 的 [profile.release] strip 被去掉了？）"
+            status=1
+          else
+            echo "OK   产物已瘦身"
+          fi
+
+          exit "${status}"
 
       # 打包构建产物
       - name: Package artifacts
