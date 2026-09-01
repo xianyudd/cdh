@@ -16,7 +16,7 @@ crossterm = "0.28"
 nucleo-matcher = "0.3"
 ratatui = "0.29"
 regex = "1"
-toml = "=0.8.23"
+toml = "0.8"                         # 停在 0.8 线：toml >= 0.9.7 要求 rustc 1.76，越过上面的 MSRV
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 
