@@ -41,6 +41,54 @@
 两个已确认无事，剩下的不确定性几乎全集中在 #3 的 macOS 那一项上。这个批次的作用恰恰是把之前
 看不见的失败变成可见的红叉，而红叉数量在动手时仍然是未知的。
 
+## PR 与依赖图
+
+2026-09-01 决定：从现在起每项走独立分支 + PR 合并。仓库历史里 `#5`–`#9` 本来就是
+`Merge pull request` 提交，最近 6 个提交才转成直接推 main，所以这是恢复旧习惯而非新增约束。
+
+一旦每项都是独立 PR，决定顺序的就不再是逻辑先后，而是**文件争用**——三个 PR 同改 `ci.yml`
+就要处理三次 rebase 冲突。争用情况：
+
+| 文件 | 争用它的任务 |
+| --- | --- |
+| `src/picker.rs` | #1、#4.1、#4.2、#4.3、#4.4 |
+| `.github/workflows/ci.yml` | #2、#3、#5、#8 |
+| `.github/workflows/release.yml` | #3、#6、#7 |
+| `Justfile` | #2 |
+| 只新增文件 | #9、#10a、#10b、#10c |
+
+于是形成两条互不相交的串行链加一个自由节点。两条链碰的文件完全不重叠，可以真并行：
+
+| PR | 分支 | 内容 | 改哪些文件 | 前置 |
+| --- | --- | --- | --- | --- |
+| PR-1 | `tui-panic-hook` | #1 | `src/picker.rs` | 无 |
+| PR-2 | `docs-chores` | #9 + #10a + #10b | `Cargo.toml` + 新文件 | 无 |
+| PR-3 | `ci-hardening` | #2 + #3 + #5 + #6 | `ci.yml`、`release.yml`、`Justfile` | 无 |
+| PR-4 | `ci-supply-chain` | #7 + #8 | `release.yml`、`ci.yml` + 新文件 | PR-3 |
+| PR-5 | `tui-render-snapshots` | #4.1 | `src/picker.rs` | PR-1 |
+| PR-6 | `tui-extract-cube` | #4.2 | `src/picker.rs` + 新模块 | PR-5 |
+| PR-7 | 待定 | #4.3 | `src/picker.rs` + 新模块 | PR-6 |
+| PR-8 | 待定 | #4.4 | `src/picker.rs` | PR-7 |
+| PR-9 | 待定 | #10c | 新文件 | 无（可选） |
+
+这套划分与上一节的批次一一对应：批次 0 → PR-1，批次 1 → PR-2，批次 2 → PR-3，
+批次 3 → PR-4，批次 4 → PR-5 至 PR-8。只有 #10c 两边都没排进去，单独作 PR-9。
+
+**关键路径**：PR-1 → PR-3 → PR-5 → PR-6 → PR-7 → PR-8。PR-2 随时插空，PR-4 等 PR-3 合完。
+
+**一条软依赖**：PR-3 要在 4.1 之前落地。它们不碰同一个文件，所以不是冲突问题——理由是
+4.1 到 4.4 是 1-2 周的连续改动，全压在全仓风险最高的文件上。先把 macOS job 和 1.74 job
+装好，这一路重构从第一天起就在三个平台上被验证；反过来做，两周后才发现某处改动在 macOS 上
+不成立，回溯成本高得多。
+
+**分支命名**沿用仓库惯例的裸 slug（`tui-unexclude-panel`、`fix-unexclude-same-session`），
+不加斜杠前缀——`feat/install-ui-progress` 是历史上唯一的例外。合并沿用 merge commit，不 squash。
+
+**提交信息要过 `scripts/tools/commit-msg-check.sh` 的硬校验**，这里有个坑：scope 是白名单
+强制（`install|bash|fish|zsh|history|paths|recommend|controller|readme|release|ci|tui`），
+不在表里的一律拒。提示语写的是「推荐的 scope」，实际行为是强制，所以 `docs(roadmap):` 会被拒，
+无 scope 的 `docs:` 才通过。另外标题上限 72 字符、结尾不能有句号或感叹号。
+
 ## P0：会直接伤到用户
 
 ### - [ ] 1. panic 后终端卡在 raw mode
@@ -152,8 +200,8 @@ frecency / history / recommend——**缺陷最密集的文件恰好是没有护
       选中行、高亮位置、分页边界、三个浮层各一组。不改任何生产代码，风险为零，交付后立刻有价值
       （此后每个 picker 修复都有回归保护）。
       验收：`cargo test` 里存在覆盖上述五类场景的渲染断言，且故意改坏渲染逻辑时它们会红。
-- [ ] **4.2 摘装饰性模块**（半天）—— 3D 立方体及其光照/次像素渲染与主状态几乎无耦合，最容易切干净，
-      适合当拆分的第一刀练手。**动手前先决定 `tui-cube-polish` 分支的去向**，否则冲突面很大。
+- [ ] **4.2 摘装饰性模块**（半天）—— 3D 立方体及其光照/次像素渲染与主状态几乎无耦合，
+      最容易切干净，适合当拆分的第一刀练手。
       验收：立方体代码移出 `picker.rs`，`CDH_CORNER_3D=0/1` 行为不变，4.1 的快照全绿。
 - [ ] **4.3 浮层各自独立**（3-5 天）—— help / settings / excludes 三个浮层逐个搬出去，
       一个浮层一个提交，每步都有 4.1 的快照兜底。
@@ -284,8 +332,10 @@ glibc 偏旧的发行版装上也跑不起来。
 
 ## 未纳入清单的观察
 
-- `feat/install-ui-progress`（`de43348`）和 `tui-cube-polish`（`b045851`）两条分支已于 2026-09-01
-  推到远端备份，但都还没有开 PR。`tui-cube-polish` 与 4.2 直接冲突，动 4.2 前要先决定它的去向。
+- `feat/install-ui-progress`（`de43348`）和 `tui-cube-polish`（`b045851`）是合并后遗留的分支指针：
+  两个提交都已是 main 的祖先，`git log main..<branch>` 为空，diff 也为空，没有任何未合并的工作。
+  **因此 4.2 没有前置阻塞**——本清单初版误判为与 `tui-cube-polish` 冲突，2026-09-01 已更正。
+  陈旧指针本身是有害的（它正是那次误判的来源），建议连远端一并删除。
 - 远端有个 `backup-main-20251109` 标签指向 `3d4f7f7`，是历史上的一次 main 备份，与当前发布线无关。
 - 版本序列从 `v0.1.1` 开始，远端没有 `v0.1.0`。
 - `v0.1.1`–`v0.2.8` 是轻量标签，`v0.3.0` 起改为附注标签，看起来是有意的切换。
