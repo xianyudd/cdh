@@ -212,6 +212,7 @@ cdh -h
 
 核心参数：
 
+* `-v, --version`：显示版本并退出；
 * `-l, --limit <N>`：限制最大候选数（默认不截断，让 TUI 搜索覆盖完整历史候选；也可用 `CDH_LIMIT` 设置）；
 * `--half-life <sec>`：半衰期（秒）（默认取环境变量 `CDH_HALF_LIFE` 或 7 天）；
 * `--threshold <f64>`：评分阈值（低于阈值的条目被过滤，默认 0 不启用）；
@@ -280,7 +281,8 @@ cargo install just
 just fmt          # 格式化 Rust + shell 脚本
 just fmt-check    # 检查格式是否符合要求
 just shell-lint   # bash -n 检查脚本语法
-just lint         # cargo clippy -- -D warnings
+just lint         # cargo clippy（warning 不算失败）
+just lint-strict  # cargo clippy -- -D warnings
 just test         # cargo test --locked --all
 just check        # fmt-check + shell-lint + lint + test
 just build-release
