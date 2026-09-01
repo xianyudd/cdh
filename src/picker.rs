@@ -4885,7 +4885,10 @@ mod tests {
         app.mode = Mode::Settings { selected };
     }
 
-    fn settings_panel_buffer(app: &App, width: u16, height: u16, color: bool) -> Buffer {
+    /// One full frame of `draw` on a `TestBackend`, for assertions that need the
+    /// composed screen rather than a single widget's `Line`s. The cube angle is
+    /// pinned (see `TEST_CUBE_ANGLE`) so a frame is reproducible.
+    fn render_buffer(app: &App, width: u16, height: u16, color: bool) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -4894,15 +4897,19 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
-    fn settings_panel_text(buffer: &Buffer) -> String {
+    /// The whole buffer as text, one line per row.
+    fn buffer_text(buffer: &Buffer) -> String {
         let area = buffer.area;
         (area.y..area.y + area.height)
-            .map(|y| settings_panel_buffer_row(buffer, y))
+            .map(|y| buffer_row(buffer, y))
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    fn settings_panel_buffer_row(buffer: &Buffer, y: u16) -> String {
+    /// One buffer row as text. A double-width symbol occupies two cells and
+    /// ratatui leaves the second one blank, so that filler is dropped to keep the
+    /// string aligned with what the terminal shows.
+    fn buffer_row(buffer: &Buffer, y: u16) -> String {
         let area = buffer.area;
         let mut text = String::new();
         let mut previous_was_wide = false;
@@ -4918,10 +4925,12 @@ mod tests {
         text
     }
 
-    fn settings_panel_row(buffer: &Buffer, needle: &str) -> u16 {
+    /// Row index of the first row containing `needle`. Panics rather than
+    /// returning an `Option` so a missing row fails at the assertion site.
+    fn buffer_row_containing(buffer: &Buffer, needle: &str) -> u16 {
         let area = buffer.area;
         (area.y..area.y + area.height)
-            .find(|y| settings_panel_buffer_row(buffer, *y).contains(needle))
+            .find(|y| buffer_row(buffer, *y).contains(needle))
             .unwrap_or_else(|| panic!("missing rendered row containing {needle:?}"))
     }
 
@@ -4988,9 +4997,7 @@ mod tests {
                     settings_mode_app(name, contents, UiEnvironment::default(), language);
                 app.language = language;
                 settings_mode_select(&mut app, 0);
-                text.push_str(&settings_panel_text(&settings_panel_buffer(
-                    &app, 80, 24, true,
-                )));
+                text.push_str(&buffer_text(&render_buffer(&app, 80, 24, true)));
                 roots.push(root);
             }
             for expected in required {
@@ -5014,7 +5021,7 @@ mod tests {
         let (root, mut app) = settings_mode_app("panel-lock", None, environment, Language::En);
         settings_mode_select(&mut app, 2);
 
-        let text = settings_panel_text(&settings_panel_buffer(&app, 80, 24, true));
+        let text = buffer_text(&render_buffer(&app, 80, 24, true));
 
         assert!(text.contains("Preview on startup"));
         assert!(text.contains("Environment controlled/read-only"));
@@ -5063,8 +5070,8 @@ mod tests {
         );
         settings_mode_select(&mut app, 2);
         let theme = Theme::new(true);
-        let buffer = settings_panel_buffer(&app, 80, 24, true);
-        let y = settings_panel_row(&buffer, "Preview on startup");
+        let buffer = render_buffer(&app, 80, 24, true);
+        let y = buffer_row_containing(&buffer, "Preview on startup");
         let selected_background = theme.selected().bg.unwrap();
         let selected_x = (0..buffer.area.width)
             .filter(|x| buffer[(*x, y)].bg == selected_background)
@@ -5084,8 +5091,8 @@ mod tests {
             Language::En,
         );
         settings_mode_select(&mut app, 3);
-        let buffer = settings_panel_buffer(&app, 80, 24, false);
-        let y = settings_panel_row(&buffer, "Color");
+        let buffer = render_buffer(&app, 80, 24, false);
+        let y = buffer_row_containing(&buffer, "Color");
         let reversed_x = (0..buffer.area.width)
             .filter(|x| buffer[(*x, y)].modifier.contains(Modifier::REVERSED))
             .collect::<Vec<_>>();
@@ -5106,11 +5113,11 @@ mod tests {
         settings_mode_select(&mut app, 3);
 
         for (width, height) in [(24, 12), (8, 8), (3, 3), (1, 1)] {
-            let buffer = settings_panel_buffer(&app, width, height, true);
+            let buffer = render_buffer(&app, width, height, true);
             assert_eq!(buffer.area.width, width);
             assert_eq!(buffer.area.height, height);
         }
-        let narrow = settings_panel_text(&settings_panel_buffer(&app, 24, 12, true));
+        let narrow = buffer_text(&render_buffer(&app, 24, 12, true));
         assert!(narrow.contains("设置"));
         let _ = fs::remove_dir_all(root);
     }
@@ -5728,8 +5735,8 @@ mod tests {
         );
 
         app.set_page_size(page_size_for(full, false, app.corner_3d_enabled()));
-        let buffer = settings_panel_buffer(&app, full.width, full.height, true);
-        let text = settings_panel_text(&buffer);
+        let buffer = render_buffer(&app, full.width, full.height, true);
+        let text = buffer_text(&buffer);
         assert!(text.contains("cdh"));
         assert!(
             !text.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
@@ -6197,7 +6204,7 @@ mod tests {
         let layout = screen_layout(full, false, true).unwrap();
         let mut app = corner_overlap_app(30);
         app.set_page_size(page_size_for(full, false, true));
-        let buffer = settings_panel_buffer(&app, full.width, full.height, true);
+        let buffer = render_buffer(&app, full.width, full.height, true);
 
         // Every visible row is truncated by the same list width, so rows beside
         // the cube read exactly like the rows above them -- no silent clipping.
@@ -6235,7 +6242,7 @@ mod tests {
         app.set_page_size(page_size_for(full, false, true));
 
         let bar_run = |app: &App| -> (u16, u16) {
-            let buffer = settings_panel_buffer(app, full.width, full.height, true);
+            let buffer = render_buffer(app, full.width, full.height, true);
             let y = layout.list.y + app.selected_index as u16;
             let bg = buffer[(layout.list.x, y)].bg;
             let end = (layout.list.x..layout.list.x + layout.list.width)
@@ -6264,8 +6271,8 @@ mod tests {
     fn corner_3d_render_is_a_no_op_when_colorless() {
         let mut app = app_with_paths(&[("/tmp/cdh-corner-alpha", 0.9)]);
         app.color_enabled = false;
-        let buffer = settings_panel_buffer(&app, 60, 16, false);
-        let text = settings_panel_text(&buffer);
+        let buffer = render_buffer(&app, 60, 16, false);
+        let text = buffer_text(&buffer);
         // Main UI should still render; no braille cube anywhere on screen.
         assert!(text.contains("cdh"));
         assert!(
@@ -7463,19 +7470,19 @@ mod tests {
             App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, false);
         app.mode = Mode::Excludes { selected: 0 };
         // Empty list: the panel must say so rather than render a blank box.
-        let empty = settings_panel_text(&settings_panel_buffer(&app, 60, 20, true));
+        let empty = buffer_text(&render_buffer(&app, 60, 20, true));
         assert!(empty.contains("排除清单"));
         assert!(empty.contains("清单为空"));
 
         app.excludes = crate::excludes::Excludes::from_paths(["/x/one", "/y/two", "/z/three"]);
         app.mode = Mode::Excludes { selected: 2 };
-        let listed = settings_panel_text(&settings_panel_buffer(&app, 60, 20, true));
+        let listed = buffer_text(&render_buffer(&app, 60, 20, true));
         assert!(listed.contains("/x/one"));
         assert!(listed.contains("/z/three"));
 
         // Terminal sizes that leave no room for the panel body must not panic.
         for (width, height) in [(24, 12), (10, 4), (3, 3), (1, 1)] {
-            let buffer = settings_panel_buffer(&app, width, height, true);
+            let buffer = render_buffer(&app, width, height, true);
             assert_eq!(buffer.area.width, width);
             assert_eq!(buffer.area.height, height);
         }
