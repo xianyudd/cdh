@@ -89,3 +89,30 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all
+
+  # 依赖审计。单独一个 job 而不是塞进 check：
+  # - 依赖图不随 runner 变化，跟着 os 矩阵跑两遍纯属浪费；
+  # - 它是唯一会因**仓库外部状态**变红的检查（RustSec 出了新通告、某个 crate 被
+  #   yank），混进 check 里会让「我们的代码坏了」和「外面出了事」两种红叉分不清。
+  # 策略与每条豁免的理由写在仓库根的 deny.toml，本地复现：
+  #   cargo install cargo-deny --locked && cargo deny --locked check
+  deny:
+    name: Audit dependencies (cargo-deny)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 刻意钉到精确版本，而不是像本文件其他 action 那样用浮动大版本。
+      # 理由：这个 action 消费我们自己写的 deny.toml，cargo-deny 改配置 schema 时
+      # 浮动的 @v2 会让某个毫不相关的 PR 突然变红。钉住之后 schema 变化只会以
+      # dependabot 的 github-actions PR 形式到来，红也只红它自己。
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          # --locked：不许 cargo-deny 顺手重写 Cargo.lock。本仓 lock 是
+          # version = 3（MSRV 1.74 决定的），被升到 4 就会在 msrv job 上炸。
+          # 这也替换掉 action 默认的 --all-features，让 deny.toml 里的
+          # all-features 设置成为唯一事实来源（本 crate 没有 feature，等价）。
+          arguments: --locked
