@@ -585,12 +585,16 @@ mod tests {
         let raw_line = raw.trim();
         let (ts, path) = raw_line.split_once('\t').unwrap();
 
+        // 期望值必须过 canonicalize：log_visit 会解析软链接，而 macOS 的临时目录
+        // 在 /var/folders/... 下，/var 本身是 /private/var 的软链接。
+        let expected = fs::canonicalize(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
         assert!(ts.parse::<i64>().is_ok());
-        assert_eq!(path, dir.to_string_lossy());
-        assert_eq!(
-            read_lines(&ctx.paths.history_uniq),
-            vec![dir.to_string_lossy().to_string()]
-        );
+        assert_eq!(path, expected);
+        assert_eq!(read_lines(&ctx.paths.history_uniq), vec![expected]);
     }
 
     #[test]
@@ -605,12 +609,19 @@ mod tests {
         log_visit(&ctx, dir_b.to_str().unwrap()).unwrap();
         log_visit(&ctx, dir_a.to_str().unwrap()).unwrap();
 
+        // 同上，比对的是解析过软链接的路径
+        let expected_a = fs::canonicalize(&dir_a)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let expected_b = fs::canonicalize(&dir_b)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
         assert_eq!(
             read_lines(&ctx.paths.history_uniq),
-            vec![
-                dir_b.to_string_lossy().to_string(),
-                dir_a.to_string_lossy().to_string(),
-            ]
+            vec![expected_b, expected_a]
         );
     }
 
