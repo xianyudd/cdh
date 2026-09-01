@@ -37,6 +37,42 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
+      # 发布前置检查：放在编译之前，否则要等三个平台编译完十几分钟，
+      # 才在最后一步 body_path 上炸掉。
+      # 只在 tag 触发时检查 —— workflow_dispatch 时 GITHUB_REF_NAME 是分支名，
+      # 硬查必然误报。
+      - name: Release preflight (tag only)
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_REF_TYPE:-}" != "tag" ]; then
+            echo "ref_type=${GITHUB_REF_TYPE:-unset}（不是 tag），跳过发布前置检查。"
+            echo "release notes 与版本号一致性只对 v* tag 推送有意义。"
+            exit 0
+          fi
+
+          tag="${GITHUB_REF_NAME}"
+          notes="scripts/release_notes/${tag}.md"
+          expected="${tag#v}"
+          manifest="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          status=0
+
+          if [ -f "${notes}" ]; then
+            echo "OK   release notes 存在：${notes}"
+          else
+            echo "::error::缺少 release notes：${notes}（softprops/action-gh-release 的 body_path 硬依赖它）"
+            status=1
+          fi
+
+          if [ "${manifest}" = "${expected}" ]; then
+            echo "OK   版本号与 tag 一致：Cargo.toml=${manifest} tag=${tag}"
+          else
+            echo "::error::版本号与 tag 不一致：Cargo.toml=${manifest}，tag=${tag}（应为 ${expected}）"
+            status=1
+          fi
+
+          exit "${status}"
+
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
