@@ -11,8 +11,14 @@ permissions:
 
 jobs:
   check:
-    name: Format, lint, and test
-    runs-on: ubuntu-latest
+    name: Format, lint, and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # macOS 上的失败是本来就存在的 Mac 用户 bug，不该连带取消 Linux 的结果
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - name: Checkout code
@@ -29,8 +35,15 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@v3
 
-      - name: Install shfmt
-        run: sudo apt-get update && sudo apt-get install -y shfmt
+      # shell-lint 需要 fish 与 zsh 才能检查 installer payload；
+      # CI 上工具缺失会硬失败（见 Justfile 的 shell-lint），所以这一步必须成功
+      - name: Install shell tooling (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y shfmt fish zsh
+
+      - name: Install shell tooling (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shfmt fish
 
       - name: Run format and test checks
         run: |
@@ -40,3 +53,39 @@ jobs:
 
       - name: Run strict clippy
         run: just lint-strict
+
+  # MSRV 固化：Cargo.toml 声明 rust-version = "1.74"，但这个数字从没被构建检验过。
+  # 跑完整 cargo test（不是只 build），因为这样才能同时守住 Cargo.lock 的格式：
+  # lock version 4 需要 Cargo 1.78+，谁哪天 cargo update 升了 lock，这个 job 当场抓住。
+  # 刻意不跑 clippy —— 旧版 lint 集不同，只会制造噪音。
+  msrv:
+    name: Build and test on MSRV
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (MSRV)
+        uses: dtolnay/rust-toolchain@1.74
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Assert toolchain matches Cargo.toml rust-version
+        run: |
+          set -euo pipefail
+          declared="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')"
+          actual="$(rustc --version | awk '{print $2}')"
+          echo "Cargo.toml rust-version : ${declared}"
+          echo "job toolchain rustc     : ${actual}"
+          case "${actual}" in
+            "${declared}" | "${declared}".*) ;;
+            *)
+              echo "::error::MSRV job 用的是 ${actual}，与 Cargo.toml 声明的 ${declared} 不一致"
+              exit 1
+              ;;
+          esac
+
+      - name: Run tests
+        run: cargo test --locked --all
