@@ -17,11 +17,18 @@ permissions:
 
 jobs:
   # ==========================
-  # 1. 测试阶段（仅在 Linux）
+  # 1. 测试阶段（Linux + macOS）
   # ==========================
   test:
-    name: Test (ubuntu)
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # 构建矩阵里有两个 darwin target，测试必须覆盖到；
+      # 一边红了也要看到另一边的结论
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - name: Checkout code
