@@ -654,6 +654,9 @@ trait MouseCaptureControl {
 
 impl TermGuard {
     fn enter(mouse: bool) -> io::Result<Self> {
+        // Before any terminal mutation, so the hook is already in place if the
+        // setup sequence below is itself what panics.
+        install_terminal_panic_hook();
         enable_raw_mode()?;
         let mut stderr = io::stderr();
         if let Err(error) = execute!(stderr, EnterAlternateScreen) {
@@ -739,13 +742,55 @@ fn mouse_event_enabled<C: MouseCaptureControl>(mouse: &C, mode: Mode) -> bool {
     mouse.mouse_capture_enabled() && mode == Mode::Normal
 }
 
+/// Undo `TermGuard::enter`'s screen changes: mouse reporting off, cursor back,
+/// then back to the primary screen.
+///
+/// Split out of `Drop` so the panic hook can share it, and generic over the
+/// writer so the ordering can be asserted in tests. Leaving the alternate screen
+/// must be the *last* thing written -- the panic hook prints the panic message
+/// afterwards, and anything printed before this point would land on the screen
+/// that is about to be discarded.
+fn restore_screen<W: io::Write>(writer: &mut W, mouse: bool) -> io::Result<()> {
+    // Best-effort, not fail-fast: a failed mouse-disable must not stop the
+    // alternate-screen exit. The panic hook always passes `true` here, so
+    // propagating that error would leave the terminal in the exact broken
+    // state this function exists to prevent.
+    if mouse {
+        let _ = execute!(writer, DisableMouseCapture);
+    }
+    execute!(writer, Show, LeaveAlternateScreen)
+}
+
+/// Restore the terminal before a panic kills the process.
+///
+/// Release builds set `panic = "abort"`, so nothing unwinds and
+/// `TermGuard::drop` never runs. Debug builds unwind and `Drop` covers them,
+/// which is why this failure never shows up locally -- only on users' machines.
+/// Panic hooks still run before the abort, so this is the only place the restore
+/// can happen.
+///
+/// Chains to the previous hook so the default message and `RUST_BACKTRACE`
+/// handling stay intact. This also covers the preview and discovery worker
+/// threads: a panic on either aborts the whole process, and the main thread's
+/// guard never gets a chance to drop.
+fn install_terminal_panic_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Unconditionally disabling mouse capture: the hook cannot see the
+            // guard's current flag, and telling a terminal to stop reporting
+            // mouse events it never started reporting is a no-op.
+            let _ = restore_screen(&mut io::stderr(), true);
+            let _ = disable_raw_mode();
+            previous(info);
+        }));
+    });
+}
+
 impl Drop for TermGuard {
     fn drop(&mut self) {
-        let mut stderr = io::stderr();
-        if self.mouse {
-            let _ = execute!(stderr, DisableMouseCapture);
-        }
-        let _ = execute!(stderr, Show, LeaveAlternateScreen);
+        let _ = restore_screen(&mut io::stderr(), self.mouse);
         let _ = disable_raw_mode();
     }
 }
@@ -4740,6 +4785,43 @@ mod tests {
 
         control.set_mouse_capture(false).unwrap();
         assert!(!mouse_event_enabled(&control, Mode::Normal));
+    }
+
+    #[test]
+    fn restore_screen_emits_mouse_cleanup_before_leaving_the_alternate_screen() {
+        // The panic hook passes `true` unconditionally because it cannot see the
+        // guard; `Drop` passes the real flag. The mouse bytes must be the only
+        // difference, and they must come first -- if they trailed the screen
+        // exit they would be written to the primary screen instead.
+        let mut with_mouse = Vec::new();
+        let mut without_mouse = Vec::new();
+        restore_screen(&mut with_mouse, true).unwrap();
+        restore_screen(&mut without_mouse, false).unwrap();
+
+        assert!(!without_mouse.is_empty());
+        assert!(with_mouse.len() > without_mouse.len());
+        assert!(
+            with_mouse.ends_with(&without_mouse),
+            "mouse cleanup must precede the screen restore"
+        );
+    }
+
+    #[test]
+    fn restore_screen_returns_to_the_primary_screen_last() {
+        // The panic message is printed after `restore_screen` returns, so the
+        // alternate-screen exit has to be the final thing written or the message
+        // is discarded along with the screen.
+        // (Mutation check: move `LeaveAlternateScreen` ahead of `Show` and this fails.)
+        let mut emitted = Vec::new();
+        restore_screen(&mut emitted, false).unwrap();
+
+        let mut leave = Vec::new();
+        crossterm::queue!(leave, LeaveAlternateScreen).unwrap();
+
+        assert!(
+            emitted.ends_with(&leave),
+            "expected the output to end with LeaveAlternateScreen"
+        );
     }
 
     fn recs(paths: &[(&str, f64)]) -> Vec<Recommendation> {
