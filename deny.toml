@@ -1,0 +1,159 @@
+# cargo-deny 配置 —— 依赖审计策略
+#
+# cdh 通过 `curl | bash` 装进别人的 shell，供应链上的问题会直接落到用户机器上，
+# 所以门槛按「发布物」而不是「内部工具」来定。
+#
+# 编写规则：**每条豁免都要写清三件事** —— 豁免的是什么、为什么可以接受、
+# 什么条件下应该撤掉。只为了让 CI 变绿而加的 allow 等于把检查关掉，不算修复。
+#
+# 本地复现 CI：`cargo install cargo-deny --locked` 之后 `cargo deny check`。
+
+[graph]
+# 刻意留空 = 审计全部 target，包括我们并不发布的 windows。
+#
+# 看起来更「精确」的做法是把 release 矩阵的五个 target 列在这里，把 windows-only
+# 的依赖从图里滤掉。不这么做的理由是漏检方向不对称：一旦 release.yml 新增 target
+# 而忘了同步这里，cargo-deny 会安静地少查一个平台且仍然全绿——正是「条件为假 →
+# 静默跳过 → 全绿」那类失败。留空则永远不会少查，代价只是多一条针对 windows 依赖
+# 的重复版本豁免（见 bans.skip 的 windows-sys），很便宜。
+targets = []
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# advisories —— RustSec 通告
+# ---------------------------------------------------------------------------
+[advisories]
+# 被 yank 的依赖直接失败，而不是只警告（默认是 warn）。
+# 这会让 CI 受仓库外部状态影响，但 advisories 检查本来就有这个性质（新通告一样会
+# 让无关 PR 变红），所以不引入新的不确定性类别；而「我们锁定的某个 crate 被作者
+# 撤下了」对一个装进别人 shell 的工具来说确实算新闻。
+yanked = "deny"
+
+# 下面三条全部来自 `ratatui 0.29`。0.29 被 MSRV 钉住：ratatui 0.30 的
+# rust-version 是 1.86（0.30.2 是 1.88），而本仓 Cargo.toml 声明 1.74 且 CI 有
+# 一个 1.74 的 job 在守。所以三条的撤掉条件都包含「抬 MSRV + 升 ratatui」，
+# 那是一次独立的决定，不属于本次供应链 PR 的范围。
+# 已核：ratatui 0.30 拆成了子 crate，`ratatui-core 0.1.2` 依赖 `lru ^0.18`
+# 且不再依赖 `paste`，即升级确实同时解掉这三条。
+ignore = [
+  # paste 1.0.15 —— 作者归档了仓库并标记 unmaintained。
+  # 路径：cdh → ratatui 0.29 → paste。
+  # 可接受：paste 是 proc-macro，只在编译期为 ratatui 的
+  #   src/style/stylize.rs 拼接标识符，不进入发布二进制；unmaintained 描述的是
+  #   维护状态而非漏洞，这份代码已冻结且没有已知缺陷。
+  # 撤掉条件：升级到 ratatui 0.30+（其 ratatui-core 已不依赖 paste）；
+  #   或 paste 出现真正的漏洞通告——那时这条必须立刻重审而不是继续 ignore。
+  { id = "RUSTSEC-2024-0436", reason = "paste 是 ratatui 0.29 的编译期 proc-macro，不进二进制；仅 unmaintained，无漏洞。升级 ratatui 0.30+（需 MSRV ≥1.86）后撤掉" },
+
+  # lru 0.12.5 —— IterMut::next / next_back 违反 Stacked Borrows（unsound）。
+  # 路径：cdh → ratatui 0.29 → lru。
+  # 可接受：缺陷路径不可达。ratatui 0.29 对 lru 的全部用法都在
+  #   src/layout/layout.rs：一个 thread-local 的
+  #   LruCache<(Rect, Layout), (Segments, Spacers)>，只调用 get_or_insert 与
+  #   resize，从不构造 IterMut（已逐一核过 0.29.0 源码）。cdh 自身没有对 lru 的
+  #   直接依赖，拿不到那个 cache。
+  # 撤掉条件：升级 ratatui（ratatui-core 要求 lru ^0.18，满足通告要求的
+  #   >= 0.16.3）；或 cdh 自己开始直接用 lru——那时这条立即失效。
+  { id = "RUSTSEC-2026-0002", reason = "ratatui 0.29 只对 lru 用 get_or_insert/resize，从不构造 IterMut，缺陷路径不可达。升级 ratatui 到依赖 lru>=0.16.3 的版本后撤掉" },
+
+  # lru 0.12.5 —— LruCache::pop() 不是 panic-safe，key 的 Drop 在 pop 中 panic
+  # 会留下悬挂指针，后续淘汰时 UAF。
+  # 路径：cdh → ratatui 0.29 → lru。
+  # 可接受：通告要求的三个前提在本仓一个都不成立——
+  #   (1) ratatui 从不调用 pop()（只有 get_or_insert / resize）；
+  #   (2) key 类型 (Rect, Layout) 全是 derive 出来的普通数据类型，没有自定义
+  #       Drop，drop 时不可能 panic；
+  #   (3) 通告原文限定「只在启用 unwinding 且使用 catch_unwind 时可触发」，而
+  #       Cargo.toml 的 [profile.release] 是 panic = "abort"，发布二进制里没有
+  #       unwinding，且全仓没有任何 catch_unwind。
+  # 撤掉条件：升级 ratatui 到依赖 lru >= 0.18.2 的版本；或上面三个前提中任何一条
+  #   变化（例如 release profile 改回 unwind、或 cdh 直接用上 lru）。
+  { id = "RUSTSEC-2026-0253", reason = "ratatui 0.29 从不调用 LruCache::pop，key 类型无自定义 Drop，且 release profile 是 panic=abort 无 unwinding，通告的三个前提均不成立。升级 ratatui 到依赖 lru>=0.18.2 后撤掉" },
+]
+
+# ---------------------------------------------------------------------------
+# licenses —— 许可证
+# ---------------------------------------------------------------------------
+[licenses]
+# 这份 allow 比 `cargo deny list` 的输出短，是刻意的：树里还出现 Unlicense
+# （aho-corasick、memchr）、BSL-1.0（ryu）、Apache-2.0 WITH LLVM-exception
+# （rustix、linux-raw-sys、wasi）三种，但它们都是 `X OR MIT` / `X OR Apache-2.0`
+# 的一支，允许 MIT 与 Apache-2.0 已经把这些 crate 全部覆盖。多列一条就等于多批准
+# 一类将来可能只以该许可证单独出现的依赖，所以不列。
+allow = [
+  "MIT",          # cdh 自身的许可证，依赖里 83 个 crate 用它
+  "Apache-2.0",   # 65 个 crate 的另一支（多为 `MIT OR Apache-2.0` 双授权）
+  "Unicode-3.0",  # unicode-ident 是 `(MIT OR Apache-2.0) AND Unicode-3.0`，
+                  # AND 意味着这条是必需项而非可选项，不允许它这棵树根本装不上
+  "Zlib",         # foldhash（← hashbrown ← indexmap / lru）的唯一许可证；宽松，
+                  # 义务仅为保留声明
+]
+confidence-threshold = 0.8
+
+# MPL-2.0 —— 整棵树里唯一的非宽松许可证。
+# 豁免的是：nucleo-matcher 0.3.1（模糊匹配算法，cdh 的直接依赖），纯 MPL-2.0。
+# 为什么可接受：MPL-2.0 是文件级弱 copyleft，义务只附着在 MPL 覆盖的那些文件上，
+#   不会传染到 cdh 的 MIT 代码。我们不修改它，静态链接进二进制后的义务就是「让这些
+#   文件的源码可获得」，crates.io 上的原始 crate 已经满足。
+# 为什么写成 exceptions 而不是塞进 allow：放进 allow 会连带批准将来任何新的
+#   MPL-2.0 依赖；scope 到这一个 crate，新出现的 MPL-2.0 会让检查变红并交人类判断。
+# 撤掉条件：不再依赖 nucleo-matcher，或它改了许可证。
+exceptions = [
+  { allow = ["MPL-2.0"], crate = "nucleo-matcher" },
+]
+
+[licenses.private]
+ignore = false
+
+# ---------------------------------------------------------------------------
+# bans —— 重复版本与通配符依赖
+# ---------------------------------------------------------------------------
+[bans]
+# 设成 deny 而不是默认的 warn：[profile.release] 是 opt-level = "z" +
+# lto = "fat" + strip = true，体积是这个项目明确在优化的东西，而重复版本会整份进
+# 二进制。87 个 crate 的树里新增一个重复值得人看一眼；warn 在 CI 上等于没有检查。
+multiple-versions = "deny"
+# 我们没有 `*` 版本依赖，这条是白拿的防线。
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+
+skip = [
+  # unicode-width 同时存在 0.1.14 与 0.2.0。
+  # 豁免的是 0.1.14：来自 unicode-truncate 1.1 ← ratatui 0.29。cdh 与 ratatui
+  #   本体用的都是 0.2。
+  # 为什么可接受：不在我们手里——unicode-truncate 1.x 的上界卡住了它，改不动除非
+  #   动 ratatui；两份加起来的体积代价是几 KB 的查表数据。
+  # 撤掉条件：升级 ratatui 后 unicode-truncate 2.x 要求 unicode-width >= 0.2，
+  #   届时这条会变成多余项（cargo-deny 不会因为多余的 skip 报错，所以升级时要主动
+  #   删掉再跑一遍确认）。
+  { crate = "unicode-width@0.1.14", reason = "ratatui 0.29 → unicode-truncate 1.1 钉住的旧版；cdh 自己用 0.2。升级 ratatui 后撤掉" },
+
+  # windows-sys 同时存在 0.59.0（← rustix）与 0.61.2（← errno / mio）。
+  # 豁免的是 0.59.0。
+  # 为什么可接受：两份都只在 cfg(windows) 下链接，而 release 矩阵没有 windows
+  #   target，对发布物零影响。这条正是上面 graph.targets 留空的代价，是有意付的。
+  # 撤掉条件：rustix 升级后与 errno / mio 收敛到同一个 windows-sys；或者哪天真的
+  #   开始发布 windows 产物——那时它就不再是零影响，必须重新判断。
+  { crate = "windows-sys@0.59.0", reason = "仅 cfg(windows) 下链接，release 矩阵无 windows target，对发布物零影响。rustix 与 errno/mio 收敛后撤掉" },
+]
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# sources —— 依赖来源
+# ---------------------------------------------------------------------------
+# 对 `curl | bash` 的工具，「依赖从哪来」比「依赖是什么许可证」更要紧。当前 87 个
+# crate 全部来自 crates.io，所以这里一条豁免都没有：任何 git 依赖或私有 registry
+# 溜进来都应该当场变红。
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
