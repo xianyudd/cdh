@@ -29,8 +29,10 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@v3
 
-      - name: Install shfmt
-        run: sudo apt-get update && sudo apt-get install -y shfmt
+      # shell-lint 需要 fish 与 zsh 才能检查 installer payload；
+      # CI 上工具缺失会硬失败（见 Justfile 的 shell-lint），所以这一步必须成功
+      - name: Install shell tooling
+        run: sudo apt-get update && sudo apt-get install -y shfmt fish zsh
 
       - name: Run format and test checks
         run: |
