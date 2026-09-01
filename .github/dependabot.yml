@@ -1,0 +1,62 @@
+# Dependabot 配置
+#
+# 重要（合入后仍需人类操作）：这个文件**不会**打开仓库的 Dependabot security
+# updates 开关。那是仓库设置（Settings → Code security），与配置文件是两件事；
+# 写这份文件的时候 `gh api repos/xianyudd/cdh/dependabot_security_updates`
+# 仍返回 disabled。version updates（本文件描述的定期升级 PR）与 security
+# updates（有通告时的即时修复 PR）要分别启用。
+#
+# Cargo.lock 的格式风险：本仓 Cargo.lock 是 `version = 3`，而 lock version 4
+# 需要 Cargo 1.78+，本仓 MSRV 是 1.74。cargo 在增量更新时会保留原有 lock 版本，
+# 所以正常情况下 dependabot 不会把它升上去；万一升了，ci.yml 的 msrv job
+# （1.74 上跑 `cargo test --locked`）会在读 lock 的阶段就抓住，这是兜底。
+
+version: 2
+
+updates:
+  # ------------------------------------------------------------------
+  # Rust 依赖
+  # ------------------------------------------------------------------
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    # 87 个 crate 的树，逐个开 PR 会淹掉仓库。把 minor/patch 合成一个 PR，
+    # major 仍然单独开——major 需要人读 changelog，不该和别人捆在一起。
+    groups:
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    open-pull-requests-limit: 3
+    # 仓库的提交信息受 scripts/tools/commit-msg-check.sh 约束：
+    # `<type>(<scope>): <summary>`，scope 是白名单强制，里面没有适合 cargo 依赖的
+    # 词，所以用无 scope 的 `chore:`（校验脚本允许省略 scope）。
+    # 刻意不设 `include: "scope"`——那会生成 `chore(deps):`，deps 不在白名单里。
+    commit-message:
+      prefix: "chore"
+    # 刻意不 ignore ratatui。它会开一个升到 0.30+ 的 PR，而 0.30 的 rust-version
+    # 是 1.86（0.30.2 是 1.88），必然在 msrv job 上变红。那个红叉是**想要的信号**：
+    # deny.toml 里三条 advisory 豁免（paste unmaintained、lru 两条 unsound）的撤掉
+    # 条件正是「抬 MSRV + 升 ratatui」，让 PR 一直挂在那儿提醒比 ignore 掉更好。
+    # ignore 会让这个信号安静消失，那是这一轮反复踩到的失败模式。
+
+  # ------------------------------------------------------------------
+  # GitHub Actions
+  # ------------------------------------------------------------------
+  # 频率比 cargo 低：action 的版本变动稀疏，weekly 只会制造空转。
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 2
+    # `ci` 在 scope 白名单里。
+    commit-message:
+      prefix: "chore(ci)"
