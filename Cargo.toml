@@ -16,7 +16,11 @@ crossterm = "0.28"
 nucleo-matcher = "0.3"
 ratatui = "0.29"
 regex = "1"
-toml = "0.8"                         # 停在 0.8 线：toml >= 0.9.7 要求 rustc 1.76，越过上面的 MSRV
+# 停在 0.8 线：toml >= 0.9.7 声明 rust-version 1.76、toml 1.x 要 1.76 / 1.85，都越过上面的
+# MSRV 1.74。0.9.0–0.9.6 声明的是 1.66，其实塞得进 MSRV，但那只是六个 patch 版本宽的窗口，
+# 而 0.9 之后的每个新 patch 都要 1.76，窗口不会再长——为这六个版本维护 ">=0.8, <0.9.7"
+# 这种复合要求不划算。真要跨到 0.9 以上，等 MSRV 抬到 1.76 时连带一起动。
+toml = "0.8"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 
