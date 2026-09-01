@@ -116,3 +116,45 @@ jobs:
           # 这也替换掉 action 默认的 --all-features，让 deny.toml 里的
           # all-features 设置成为唯一事实来源（本 crate 没有 feature，等价）。
           arguments: --locked
+
+  # 交叉编译接线检查。release.yml 的矩阵有 aarch64-gnu 与 x86_64-musl 两行，
+  # 但那个 workflow 只在推 tag 时跑——真要出问题（某个新依赖不支持 musl、
+  # 某处 cfg 在 aarch64 上不成立），发现的时机就是发版当天，正是最糟的时刻。
+  # 这个 job 把接线正确性提前到每个 PR，代价是几分钟 CI 时间。
+  #
+  # 用 debug 而不是 release：debug 没有 lto = "fat"，快得多，而链接器路径与
+  # release 完全一样——这个 job 要抓的是「编译/链接不通」，不是产物形状。
+  # 产物形状（架构对不对、musl 那份是不是真静态）在 release.yml 里单独断言。
+  cross:
+    name: Cross-build Linux targets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable) with Linux cross targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu, x86_64-unknown-linux-musl
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # aarch64 需要一个能产出 aarch64 目标的链接器；x86_64-musl **不需要**
+      # musl-tools —— 已在本地验证：把 musl-gcc / x86_64-linux-musl-gcc 换成
+      # 必然失败的 stub 后 `cargo build --release --target x86_64-unknown-linux-musl`
+      # 依然成功，rustc 用的是宿主 cc 加 rustup 自带的 self-contained musl 目标
+      # 文件。本项目依赖树里没有 cc-rs / pkg-config，不编译任何 C 代码。
+      - name: Install aarch64 cross linker
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      # 真链接，不是 cargo check —— check 不跑链接器，会把「链接器没配对」这类
+      # 错误一路放到发版当天。
+      - name: Build for aarch64-unknown-linux-gnu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --locked --target aarch64-unknown-linux-gnu
+
+      - name: Build for x86_64-unknown-linux-musl
+        run: cargo build --locked --target x86_64-unknown-linux-musl
