@@ -32,7 +32,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -118,7 +118,7 @@ jobs:
     steps:
       # 拉取代码
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # 安装 Rust
       - name: Install Rust (stable)
@@ -233,14 +233,14 @@ jobs:
 
       # 上传到 CI Artifact（用于调试）
       - name: Upload artifacts for inspection
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: dist/*
 
       # 发布到 GitHub Release
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           # 上传所有 tar.gz 和校验文件
           files: |

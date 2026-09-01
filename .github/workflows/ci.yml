@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -33,7 +33,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
 
       # shell-lint 需要 fish 与 zsh 才能检查 installer payload；
       # CI 上工具缺失会硬失败（见 Justfile 的 shell-lint），所以这一步必须成功
@@ -64,10 +64,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust (MSRV)
-        uses: dtolnay/rust-toolchain@1.74
+        uses: dtolnay/rust-toolchain@1.100
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -104,7 +104,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # 刻意钉到精确版本，而不是像本文件其他 action 那样用浮动大版本。
       # 理由：这个 action 消费我们自己写的 deny.toml，cargo-deny 改配置 schema 时
@@ -136,7 +136,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust (stable) with Linux cross targets
         uses: dtolnay/rust-toolchain@stable
