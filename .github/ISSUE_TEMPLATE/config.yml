@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 私下上报安全漏洞 / Report a vulnerability privately
+    url: https://github.com/xianyudd/cdh/security/advisories/new
+    about: 安全问题走私有 advisory，不要开公开 issue（见 SECURITY.md）
+  - name: 先搜已有 issue / Search existing issues
+    url: https://github.com/xianyudd/cdh/issues?q=is%3Aissue
+    about: 同样的问题可能已经报过或已修复
