@@ -1,0 +1,42 @@
+name: 功能建议 / Feature request
+description: 提议一个新功能或改进 / Propose a feature or improvement
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决什么问题 / Problem
+      description: 先说场景和痛点，别直接跳到实现方案
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及范围 / Area
+      options:
+        - TUI / picker
+        - 排序与推荐 / ranking
+        - 历史记录 / history
+        - 安装与 shell 集成 / install
+        - 文档 / docs
+        - 其它 / other
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 设想的做法 / Proposal
+      description: 有具体方案就写；没有也可以只提问题
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 现有能力能否绕过 / Alternatives already tried
+      description: 例如 `Ctrl+D` 排除清单、`CDH_IGNORE_RE`、`CDH_SCAN_ROOTS`、`F2` 设置面板
+    validations:
+      required: false

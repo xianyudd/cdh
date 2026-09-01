@@ -1,0 +1,105 @@
+name: Bug 报告 / Bug report
+description: 报告一个可复现的问题 / Report a reproducible problem
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **安全漏洞请勿在此提交**，走
+        [私有 advisory](https://github.com/xianyudd/cdh/security/advisories/new)（见 `SECURITY.md`）。
+
+        历史文件 `history_raw` / `history_uniq` 记录了你 cd 过的全部路径，贴之前请脱敏。
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题描述 / What happened
+      description: 实际发生了什么，你期望发生什么
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤 / Steps to reproduce
+      description: 能稳定复现就写步骤；只是偶发也请写清触发条件与出现频率
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: cdh 版本 / cdh version
+      description: 粘贴 `cdh --version` 的输出（它打到 stderr，直接在终端里看即可）
+      placeholder: cdh 0.3.2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: shell
+    attributes:
+      label: Shell
+      description: 出问题时使用的 shell
+      options:
+        - bash
+        - zsh
+        - fish
+        - 其它 / other（请在「其它信息」里说明）
+    validations:
+      required: true
+
+  - type: input
+    id: shell-version
+    attributes:
+      label: Shell 版本 / Shell version
+      description: "`bash --version` / `zsh --version` / `fish --version` 的首行"
+      placeholder: fish, version 3.7.1
+    validations:
+      required: false
+
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统 / OS
+      description: 发行版与版本；WSL 请注明 WSL1 / WSL2 以及 `uname -r`
+      placeholder: Ubuntu 24.04（WSL2，6.6.87.2-microsoft-standard-WSL2）/ macOS 15.1 arm64
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: 终端 / Terminal
+      description: 终端程序与 `$TERM`；用了 tmux / screen 也请写上
+      placeholder: Windows Terminal + tmux，TERM=xterm-256color
+    validations:
+      required: true
+
+  - type: input
+    id: install-method
+    attributes:
+      label: 安装方式 / Install method
+      description: 一键脚本、release tarball，还是自己 cargo 编译
+      placeholder: curl … | bash ／ release tarball v0.3.2 ／ cargo build --release
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: 相关环境变量 / Relevant env vars
+      description: 粘贴 `env | grep '^CDH_'` 的输出；没设置就写「无」
+      render: shell
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其它信息 / Anything else
+      description: 日志、截图、终端宽高、是否只在特定目录出现、是否与某个环境变量相关
+    validations:
+      required: false
