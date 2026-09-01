@@ -6,7 +6,12 @@
 # 编写规则：**每条豁免都要写清三件事** —— 豁免的是什么、为什么可以接受、
 # 什么条件下应该撤掉。只为了让 CI 变绿而加的 allow 等于把检查关掉，不算修复。
 #
-# 本地复现 CI：`cargo install cargo-deny --locked` 之后 `cargo deny check`。
+# 本地复现 CI 请**对齐版本**：ci.yml 用 `cargo-deny-action@v2.1.1`，它内置的是
+# cargo-deny 0.20.2。版本要紧不是洁癖 —— 见下面 advisories 里 unsound 的注释，
+# 0.19 改过默认值，用旧版本在本地验会得出比 CI 更强的结论。
+#   cargo install cargo-deny --locked --version 0.20.2 && cargo deny --locked check
+# 装了 0.19 以前的版本会直接报 `error[deprecated]` 指向本文件的 `unsound` 那一行
+# （那个键名在 0.19 之前是别的含义，被移除过）—— 响亮地失败，不会静默给出不同结论。
 
 [graph]
 # 刻意留空 = 审计全部 target，包括我们并不发布的 windows。
@@ -32,6 +37,21 @@ feature-depth = 1
 # 让无关 PR 变红），所以不引入新的不确定性类别；而「我们锁定的某个 crate 被作者
 # 撤下了」对一个装进别人 shell 的工具来说确实算新闻。
 yanked = "deny"
+
+# 这两条是**显式写死默认值之外的选择**，不是照抄模板，删掉会静默削弱检查。
+#
+# unsound：cargo-deny 0.19.0（PR#826）新增了这个开关，默认 "workspace" ——
+# 只对本 workspace 的 crate 报 unsound 通告，传递依赖的 unsound **一条都不报**。
+# 本仓的 workspace 只有 cdh 自己，86 个依赖全是传递的，所以默认值等于把 unsound
+# 这一类彻底关掉。实测：默认值下 CI 的 cargo-deny 输出两条
+# `warning[advisory-not-detected] … no crate matched advisory criteria`，指的正是
+# 下面两条 lru 豁免 —— 通告没被检测到，豁免因此空转，而检查依然全绿。
+# 那不是「没问题」，是「没检查」。写成 "all" 之后两条通告真的被检测到，
+# 再由下面的 ignore 明确豁免掉，红/绿的含义才是我们审过的结论。
+unsound = "all"
+# unmaintained：0.20 的默认值恰好也是 "all"，这里显式写出来是因为上面那条就是
+# 「依赖默认值」踩的坑 —— 默认值会随版本变，而变化不会让 CI 变红，只会让它变松。
+unmaintained = "all"
 
 # 下面三条全部来自 `ratatui 0.29`。0.29 被 MSRV 钉住：ratatui 0.30 的
 # rust-version 是 1.86（0.30.2 是 1.88），而本仓 Cargo.toml 声明 1.74 且 CI 有

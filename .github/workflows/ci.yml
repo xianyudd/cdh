@@ -94,8 +94,10 @@ jobs:
   # - 依赖图不随 runner 变化，跟着 os 矩阵跑两遍纯属浪费；
   # - 它是唯一会因**仓库外部状态**变红的检查（RustSec 出了新通告、某个 crate 被
   #   yank），混进 check 里会让「我们的代码坏了」和「外面出了事」两种红叉分不清。
-  # 策略与每条豁免的理由写在仓库根的 deny.toml，本地复现：
-  #   cargo install cargo-deny --locked && cargo deny --locked check
+  # 策略与每条豁免的理由写在仓库根的 deny.toml，本地复现**要对齐版本**
+  # （v2.1.1 内置 cargo-deny 0.20.2，旧版本对 advisories 的结论不同，见 deny.toml
+  # 里 unsound 那段注释）：
+  #   cargo install cargo-deny --locked --version 0.20.2 && cargo deny --locked check
   deny:
     name: Audit dependencies (cargo-deny)
     runs-on: ubuntu-latest
@@ -108,6 +110,9 @@ jobs:
       # 理由：这个 action 消费我们自己写的 deny.toml，cargo-deny 改配置 schema 时
       # 浮动的 @v2 会让某个毫不相关的 PR 突然变红。钉住之后 schema 变化只会以
       # dependabot 的 github-actions PR 形式到来，红也只红它自己。
+      # 附带效果同样重要：action 的 tag 也就钉住了 cargo-deny 的版本（v2.1.1 =
+      # 0.20.2），而 deny.toml 的结论对版本敏感 —— 0.19 改了 advisories.unsound
+      # 的默认值。deny.toml 里记的 0.20.2 与这一行是一对，改一处要改两处。
       - name: Run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
