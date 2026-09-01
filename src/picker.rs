@@ -4911,9 +4911,18 @@ mod tests {
     /// string aligned with what the terminal shows.
     fn buffer_row(buffer: &Buffer, y: u16) -> String {
         let area = buffer.area;
+        buffer_row_in(buffer, y, area.x, area.x + area.width)
+    }
+
+    /// `buffer_row` restricted to the columns `x0..x1`, so an assertion can read
+    /// the list or an overlay without picking up the chrome beside it.
+    ///
+    /// Contrast `buffer_row_range`, which keeps one entry per cell: use that one
+    /// for geometry (widths, truncation), this one for text.
+    fn buffer_row_in(buffer: &Buffer, y: u16, x0: u16, x1: u16) -> String {
         let mut text = String::new();
         let mut previous_was_wide = false;
-        for x in area.x..area.x + area.width {
+        for x in x0..x1 {
             let symbol = buffer[(x, y)].symbol();
             if previous_was_wide && symbol == " " {
                 previous_was_wide = false;
@@ -4925,6 +4934,14 @@ mod tests {
         text
     }
 
+    /// The text inside a rectangle, one line per row.
+    fn box_text(buffer: &Buffer, area: Rect) -> String {
+        (area.y..area.y + area.height)
+            .map(|y| buffer_row_in(buffer, y, area.x, area.x + area.width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Row index of the first row containing `needle`. Panics rather than
     /// returning an `Option` so a missing row fails at the assertion site.
     fn buffer_row_containing(buffer: &Buffer, needle: &str) -> u16 {
@@ -4932,6 +4949,64 @@ mod tests {
         (area.y..area.y + area.height)
             .find(|y| buffer_row(buffer, *y).contains(needle))
             .unwrap_or_else(|| panic!("missing rendered row containing {needle:?}"))
+    }
+
+    /// Bounding box of the overlay panel on screen, found by its elevated fill.
+    ///
+    /// All four overlays open the same way -- `centered`, then `Clear`, then a
+    /// `theme.panel()`-styled `Block` -- and nothing else on screen uses that
+    /// background, so the panel-filled cells are exactly the panel. Deriving the
+    /// box from the pixels rather than recomputing `centered` is deliberate: a
+    /// renderer that swapped `centered` for fixed coordinates would still agree
+    /// with a recomputed expectation.
+    fn panel_box(buffer: &Buffer, theme: &Theme) -> Rect {
+        let panel_bg = theme.panel().bg.expect("panel fill needs a color");
+        let area = buffer.area;
+        let filled = (area.y..area.y + area.height)
+            .flat_map(|y| (area.x..area.x + area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buffer[(*x, *y)].bg == panel_bg)
+            .collect::<Vec<_>>();
+        assert!(!filled.is_empty(), "no panel-filled cell on screen");
+        let x0 = filled.iter().map(|(x, _)| *x).min().unwrap();
+        let x1 = filled.iter().map(|(x, _)| *x).max().unwrap();
+        let y0 = filled.iter().map(|(_, y)| *y).min().unwrap();
+        let y1 = filled.iter().map(|(_, y)| *y).max().unwrap();
+        Rect::new(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    }
+
+    /// The 1-based result number a rendered list row shows, read back out of its
+    /// index column. Rows are numbered across the whole result set rather than
+    /// per page, which is what makes this worth asserting.
+    fn row_result_number(row: &str) -> Option<usize> {
+        row.trim_start_matches(['›', ' '])
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    }
+
+    /// A main-screen app pinned for full-frame assertions: a fixed candidate set,
+    /// a fixed `$HOME` instead of the ambient one, and the page size the real
+    /// layout would pick for `full`.
+    ///
+    /// The cube is switched off because `draw` paints it only in `Mode::Normal`:
+    /// leaving it on would make a normal frame and an overlay frame differ in the
+    /// gutter for reasons that have nothing to do with the overlay.
+    fn list_render_app(full: Rect, count: usize) -> App {
+        let paths = (0..count)
+            .map(|index| format!("/home/jason/workspace/project-{index:02}"))
+            .collect::<Vec<_>>();
+        let records = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.as_str(), 0.9 - index as f64 * 0.001))
+            .collect::<Vec<_>>();
+        let mut app = app_with_paths(&records);
+        app.color_enabled = true;
+        app.corner_3d_env = false;
+        app.home = Some("/home/jason".to_string());
+        app.set_page_size(page_size_for(full, false, app.corner_3d_enabled()));
+        app
     }
 
     #[test]
@@ -7696,6 +7771,311 @@ mod tests {
 
         assert!(highlighted.style.add_modifier.contains(Modifier::BOLD));
         assert!(highlighted.style.bg.is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // Full-frame render assertions (roadmap 4.1).
+    //
+    // Everything above this point asserts on what a *helper* returns: a
+    // `Line`'s spans, a `PageWindow`'s arithmetic, a `ScreenLayout`'s rects.
+    // Those stay green when `draw` wires the helpers together wrongly, which is
+    // precisely the failure mode splitting this file can introduce. The tests
+    // below therefore go through `draw` onto a `TestBackend` and assert on the
+    // cells: which row is highlighted, which columns are underlined, which
+    // results are on the page, and where an overlay lands.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn selected_row_is_the_only_highlighted_row_and_carries_the_marker() {
+        let full = Rect::new(0, 0, 80, 24);
+        let list = screen_layout(full, false, false)
+            .expect("roomy terminal")
+            .list;
+        let mut app = list_render_app(full, 25);
+        app.set_selected(4);
+
+        let theme = Theme::new(true);
+        let selected_bg = theme.selected().bg.unwrap();
+        let buffer = render_buffer(&app, full.width, full.height, true);
+
+        let highlighted = (list.y..list.y + list.height)
+            .filter(|y| buffer[(list.x, *y)].bg == selected_bg)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            highlighted,
+            vec![list.y + 4],
+            "exactly one list row may carry the selection background"
+        );
+        // Edge to edge, so the eye reads one band rather than a ragged stripe.
+        assert!(
+            (list.x..list.x + list.width).all(|x| buffer[(x, list.y + 4)].bg == selected_bg),
+            "selection background must span the whole row: {:?}",
+            buffer_row_in(&buffer, list.y + 4, list.x, list.x + list.width)
+        );
+        let marked = (list.y..list.y + list.height)
+            .filter(|y| buffer[(list.x, *y)].symbol() == "›")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            marked,
+            vec![list.y + 4],
+            "the caret marker belongs to the selected row alone"
+        );
+    }
+
+    #[test]
+    fn selected_row_sits_at_its_page_offset_not_its_absolute_index() {
+        let full = Rect::new(0, 0, 80, 24);
+        let list = screen_layout(full, false, false)
+            .expect("roomy terminal")
+            .list;
+        let mut app = list_render_app(full, 60);
+        // Result 41 lives on page 3. Its absolute index is far below the bottom
+        // of the list area, so a renderer that dropped `page.start` would draw
+        // off-screen or highlight the wrong row instead of row 3 of the page.
+        app.set_selected(40);
+        let page = app.page();
+        assert_eq!((page.start, page.end, app.current_page), (38, 57, 3));
+
+        let theme = Theme::new(true);
+        let buffer = render_buffer(&app, full.width, full.height, true);
+        let highlighted = (list.y..list.y + list.height)
+            .filter(|y| buffer[(list.x, *y)].bg == theme.selected().bg.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(highlighted, vec![list.y + (40 - page.start) as u16]);
+
+        let row = buffer_row_in(&buffer, highlighted[0], list.x, list.x + list.width);
+        assert_eq!(row_result_number(&row), Some(41), "row was {row:?}");
+        assert!(row.contains("project-40"), "row was {row:?}");
+    }
+
+    #[test]
+    fn search_highlight_underlines_exactly_the_matched_columns() {
+        // `Modifier::UNDERLINED` is added in exactly one place -- `Theme::matched`
+        // -- so the underlined cells of a row *are* its search highlight. The
+        // assertion is set equality rather than containment: that is what makes a
+        // highlight drifting one column fail here instead of passing quietly.
+        let full = Rect::new(0, 0, 80, 24);
+        let list = screen_layout(full, false, false)
+            .expect("roomy terminal")
+            .list;
+        let theme = Theme::new(true);
+        for raw in [
+            "/home/jason/workspace/zebra-tool",
+            // A double-width component ahead of the match separates character
+            // index from screen column, which is where a mapping bug surfaces.
+            "/home/jason/工作区/zebra-tool",
+        ] {
+            let mut app = app_with_paths(&[(raw, 0.9)]);
+            app.color_enabled = true;
+            app.corner_3d_env = false;
+            app.home = Some("/home/jason".to_string());
+            app.set_page_size(page_size_for(full, false, false));
+            app.query = "zebra".to_string();
+            app.recompute_after_query_change();
+            assert_eq!(app.filtered_results.len(), 1, "{raw}");
+
+            let buffer = render_buffer(&app, full.width, full.height, true);
+            let symbols = (list.x..list.x + list.width)
+                .map(|x| buffer[(x, list.y)].symbol())
+                .collect::<Vec<_>>();
+            let start = symbols
+                .windows(5)
+                .position(|window| window.concat() == "zebra")
+                .unwrap_or_else(|| panic!("no rendered `zebra` for {raw}: {symbols:?}"));
+            let expected = (0..5)
+                .map(|offset| list.x + (start + offset) as u16)
+                .collect::<Vec<_>>();
+
+            let underlined = (list.x..list.x + list.width)
+                .filter(|x| buffer[(*x, list.y)].modifier.contains(Modifier::UNDERLINED))
+                .collect::<Vec<_>>();
+            assert_eq!(underlined, expected, "highlighted columns for {raw}");
+            assert!(
+                expected
+                    .iter()
+                    .all(|x| buffer[(*x, list.y)].fg == theme.match_color()),
+                "highlighted cells must use the match color for {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn last_page_renders_its_short_tail_and_blanks_the_remainder() {
+        let full = Rect::new(0, 0, 80, 24);
+        let list = screen_layout(full, false, false)
+            .expect("roomy terminal")
+            .list;
+        let mut app = list_render_app(full, 25);
+        assert_eq!(app.page_size, list.height as usize);
+
+        let numbers = |app: &App| -> Vec<usize> {
+            let buffer = render_buffer(app, full.width, full.height, true);
+            (list.y..list.y + list.height)
+                .filter_map(|y| {
+                    row_result_number(&buffer_row_in(&buffer, y, list.x, list.x + list.width))
+                })
+                .collect()
+        };
+
+        // A full page fills the area edge to edge...
+        assert_eq!(
+            numbers(&app),
+            (1..=list.height as usize).collect::<Vec<_>>()
+        );
+
+        // ...and the last page picks up where it left off, without repeating the
+        // boundary row and without padding the tail out to a full page. Any row
+        // left over must be blank rather than stale, so a single equality here
+        // covers the window start, the clamped end, and the numbering.
+        app.set_selected(list.height as usize);
+        assert_eq!(app.current_page, 2);
+        assert_eq!(numbers(&app), (20..=25).collect::<Vec<_>>());
+
+        // And the header spells out the same window for the user.
+        let buffer = render_buffer(&app, full.width, full.height, true);
+        assert!(
+            buffer_row(&buffer, full.y).contains("20–25 / 25 · 第 2/2 页"),
+            "header was {:?}",
+            buffer_row(&buffer, full.y)
+        );
+    }
+
+    #[test]
+    fn empty_result_notice_is_centered_in_an_otherwise_blank_list() {
+        let full = Rect::new(0, 0, 80, 24);
+        let list = screen_layout(full, false, false)
+            .expect("roomy terminal")
+            .list;
+        let mut app = list_render_app(full, 25);
+        app.query = "zzz-no-such-directory".to_string();
+        app.recompute_after_query_change();
+        assert!(app.filtered_results.is_empty());
+
+        let buffer = render_buffer(&app, full.width, full.height, true);
+        let notice = buffer_row_containing(&buffer, "未找到匹配目录");
+        assert_eq!(notice, list.y + (list.height - 1) / 2);
+        // Every other list row must be empty: a leftover row here would read as
+        // a result the filter already rejected.
+        for y in list.y..list.y + list.height {
+            if y == notice {
+                continue;
+            }
+            assert_eq!(
+                buffer_row_in(&buffer, y, list.x, list.x + list.width).trim(),
+                "",
+                "row {y} should be blank"
+            );
+        }
+        assert!(buffer_row(&buffer, full.y).contains("0 / 0 · 第 0/0 页"));
+    }
+
+    #[test]
+    fn every_overlay_is_centered_opaque_and_leaves_the_rest_of_the_frame_alone() {
+        // Tall enough that all four panels sit strictly inside the screen, so the
+        // rows above and below one are real evidence that nothing reflowed.
+        let full = Rect::new(0, 0, 100, 40);
+        let theme = Theme::new(true);
+        let panel_bg = theme.panel().bg.unwrap();
+        let surface_bg = theme.surface().bg.unwrap();
+        let mut app = list_render_app(full, 60);
+        app.excludes = crate::excludes::Excludes::from_paths(["/x/one", "/y/two"]);
+        let normal = render_buffer(&app, full.width, full.height, true);
+
+        for (mode, expected) in [
+            (Mode::Help, "快捷键"),
+            (Mode::Settings { selected: 1 }, "设置"),
+            (Mode::Excludes { selected: 1 }, "/y/two"),
+            (Mode::ConfirmDelete { candidate_idx: 3 }, "确认排除"),
+        ] {
+            app.mode = mode;
+            let buffer = render_buffer(&app, full.width, full.height, true);
+            let panel = panel_box(&buffer, &theme);
+            let label = format!("{mode:?}");
+
+            // `centered` leaves at most one column/row of rounding slack.
+            let right = full.width - (panel.x + panel.width);
+            let bottom = full.height - (panel.y + panel.height);
+            assert!(
+                panel.x.abs_diff(right) <= 1 && panel.y.abs_diff(bottom) <= 1,
+                "{label}: {panel:?} is not centered in {full:?}"
+            );
+            assert!(
+                panel.y > full.y && panel.y + panel.height < full.height,
+                "{label}: {panel:?} should not reach the top or bottom edge"
+            );
+
+            // Opaque: `Clear` plus the panel `Block` must leave no cell inside
+            // the box on the main surface, or list text bleeds through.
+            for y in panel.y..panel.y + panel.height {
+                for x in panel.x..panel.x + panel.width {
+                    assert_ne!(
+                        buffer[(x, y)].bg,
+                        surface_bg,
+                        "{label}: ({x},{y}) still shows the main surface"
+                    );
+                }
+            }
+            // The panel's frame -- side columns below the rule, plus the bottom
+            // row -- sits outside every renderer's `inner` rect, so only `Clear`
+            // can have put anything there. A stray glyph in these cells is list
+            // text showing through, which is how a dropped `Clear` reads on
+            // screen even though the fill above still looks right.
+            for y in panel.y + 1..panel.y + panel.height {
+                for x in [panel.x, panel.x + panel.width - 1] {
+                    assert_eq!(
+                        buffer[(x, y)].symbol(),
+                        " ",
+                        "{label}: ({x},{y}) is inside the panel frame, not content"
+                    );
+                }
+            }
+            assert_eq!(
+                buffer_row_in(
+                    &buffer,
+                    panel.y + panel.height - 1,
+                    panel.x,
+                    panel.x + panel.width
+                )
+                .trim(),
+                "",
+                "{label}: the panel's last row is below every renderer's content"
+            );
+            // Flat chrome: a rule across the top instead of a box border.
+            assert_eq!(
+                buffer_row_range(&buffer, panel.y, panel.x, panel.x + panel.width),
+                "─".repeat(panel.width as usize),
+                "{label}: top rule"
+            );
+            assert!(
+                buffer[(panel.x, panel.y)].bg == panel_bg,
+                "{label}: rule row must sit on the panel fill"
+            );
+            // The mode's own renderer ran, i.e. `draw` dispatched where the mode
+            // says. Searched inside the panel because some of this copy also
+            // appears in the footer hints underneath.
+            assert!(
+                box_text(&buffer, panel).contains(expected),
+                "{label}: panel is missing {expected:?}:\n{}",
+                box_text(&buffer, panel)
+            );
+
+            // Opening an overlay must not disturb anything around it: the list
+            // underneath keeps its width, contents and selection.
+            for y in full.y..full.y + full.height {
+                for x in full.x..full.x + full.width {
+                    let inside = (panel.x..panel.x + panel.width).contains(&x)
+                        && (panel.y..panel.y + panel.height).contains(&y);
+                    if inside {
+                        continue;
+                    }
+                    assert_eq!(
+                        buffer[(x, y)],
+                        normal[(x, y)],
+                        "{label}: ({x},{y}) changed outside the panel"
+                    );
+                }
+            }
+        }
     }
 
     fn preview_data(names: &[&str]) -> PreviewOutcome {
