@@ -11,8 +11,14 @@ permissions:
 
 jobs:
   check:
-    name: Format, lint, and test
-    runs-on: ubuntu-latest
+    name: Format, lint, and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # macOS 上的失败是本来就存在的 Mac 用户 bug，不该连带取消 Linux 的结果
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - name: Checkout code
@@ -31,8 +37,13 @@ jobs:
 
       # shell-lint 需要 fish 与 zsh 才能检查 installer payload；
       # CI 上工具缺失会硬失败（见 Justfile 的 shell-lint），所以这一步必须成功
-      - name: Install shell tooling
+      - name: Install shell tooling (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y shfmt fish zsh
+
+      - name: Install shell tooling (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shfmt fish
 
       - name: Run format and test checks
         run: |

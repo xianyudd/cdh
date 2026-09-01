@@ -14,20 +14,22 @@ fmt-check:
 shellfmt:
     #!/usr/bin/env bash
     set -euo pipefail
-    mapfile -t files < <(find scripts -type f -name '*.sh' | sort)
-    shfmt -w -i 2 -ci -bn -sr docs/install.sh "${files[@]}"
+    files=("docs/install.sh")
+    while IFS= read -r f; do files+=("$f"); done < <(find scripts -type f -name '*.sh' | sort)
+    shfmt -w -i 2 -ci -bn -sr "${files[@]}"
 
 shellfmt-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    mapfile -t files < <(find scripts -type f -name '*.sh' | sort)
-    shfmt -d -i 2 -ci -bn -sr docs/install.sh "${files[@]}"
+    files=("docs/install.sh")
+    while IFS= read -r f; do files+=("$f"); done < <(find scripts -type f -name '*.sh' | sort)
+    shfmt -d -i 2 -ci -bn -sr "${files[@]}"
 
 shell-lint:
     #!/usr/bin/env bash
     set -euo pipefail
-    mapfile -t files < <(find scripts -type f -name '*.sh' | sort)
-    files+=("docs/install.sh")
+    files=("docs/install.sh")
+    while IFS= read -r f; do files+=("$f"); done < <(find scripts -type f -name '*.sh' | sort)
     for f in "${files[@]}"; do
       bash -n "$f"
     done
