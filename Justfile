@@ -11,6 +11,12 @@ fmt-check:
     cargo fmt --check
     just shellfmt-check
 
+# 下面三条 shell 配方都用 `while IFS= read -r` 收集文件列表，不要「简化」回 mapfile：
+# macOS 自带的是 bash 3.2.57（Apple 因 GPLv3 停在这个版本），mapfile 是 bash 4.0 才有的
+# builtin，换回去会让 macOS 的 CI job 在第一条 just fmt-check 就死在
+# "mapfile: command not found"，一个测试都跑不到，Mac 开发者本地也跑不了 just check。
+# 同理 docs/install.sh 放在数组初值里而不是后面单独传参：这样数组恒非空，
+# 避开 bash 3.2 在 set -u 下展开空数组直接报 unbound variable 的行为。
 shellfmt:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -21,6 +27,7 @@ shellfmt:
 shellfmt-check:
     #!/usr/bin/env bash
     set -euo pipefail
+    # while read 而非 mapfile：见 shellfmt 上方注释（macOS 是 bash 3.2）
     files=("docs/install.sh")
     while IFS= read -r f; do files+=("$f"); done < <(find scripts -type f -name '*.sh' | sort)
     shfmt -d -i 2 -ci -bn -sr "${files[@]}"
@@ -28,6 +35,7 @@ shellfmt-check:
 shell-lint:
     #!/usr/bin/env bash
     set -euo pipefail
+    # while read 而非 mapfile：见 shellfmt 上方注释（macOS 是 bash 3.2）
     files=("docs/install.sh")
     while IFS= read -r f; do files+=("$f"); done < <(find scripts -type f -name '*.sh' | sort)
     for f in "${files[@]}"; do
