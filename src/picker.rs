@@ -2941,7 +2941,7 @@ fn draw(
             overlays::render_excludes(frame, view, theme, overlay_area, selected)
         }
         Mode::ConfirmDelete { candidate_idx } => {
-            render_confirm_delete(frame, view, theme, overlay_area, candidate_idx)
+            overlays::render_confirm_delete(frame, view, theme, overlay_area, candidate_idx)
         }
     }
     list_geometry
@@ -3606,53 +3606,6 @@ fn fit_footer(full: &str, compact: &str, short: &str, width: usize) -> String {
     }
 }
 
-fn render_confirm_delete(
-    frame: &mut Frame,
-    view: &FrameView,
-    theme: &Theme,
-    full: Rect,
-    candidate_idx: usize,
-) {
-    let width = 56u16.min(full.width.saturating_sub(4));
-    let path = view
-        .candidates
-        .get(candidate_idx)
-        .map(|candidate| candidate.display(view.home).text)
-        .unwrap_or_else(|| view.language.text(TextKey::UnknownDirectory).to_string());
-    let message = confirm_delete_message(&path, width.saturating_sub(2) as usize, view.language);
-    let lines = vec![
-        Line::from(Span::styled(
-            view.language.text(TextKey::ConfirmDeleteTitle),
-            theme.title(),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(message, theme.primary())),
-        Line::raw(""),
-        Line::from(Span::styled(
-            view.language.text(TextKey::ConfirmDeleteAgain),
-            theme.dim(),
-        )),
-    ];
-    let height = (lines.len() as u16 + 2).min(full.height.saturating_sub(2));
-    let area = centered(full, width, height);
-    frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(theme.panel()), area);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            theme.border(),
-        ))),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    let inner = Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
 fn confirm_delete_message(path: &str, max_width: usize, language: Language) -> String {
     let prefix = language.text(TextKey::ConfirmDeletePrefix);
     let suffix = language.text(TextKey::ConfirmDeleteSuffix);
@@ -3662,15 +3615,6 @@ fn confirm_delete_message(path: &str, max_width: usize, language: Language) -> S
     }
     let path_width = max_width - fixed_width;
     format!("{prefix}{}{suffix}", trim_middle(path, path_width))
-}
-
-fn centered(full: Rect, width: u16, height: u16) -> Rect {
-    Rect::new(
-        full.x + (full.width.saturating_sub(width)) / 2,
-        full.y + (full.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    )
 }
 
 fn grapheme_count(text: &str) -> usize {
