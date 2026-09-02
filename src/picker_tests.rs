@@ -3654,6 +3654,10 @@ fn read_git_info_reports_clean_and_modified_status() {
     if Command::new("git").arg("--version").output().is_err() {
         return;
     }
+    // Holds the same lock as the injected-GIT_DIR test in `git`: while that
+    // test mutates the process environment, its variables must not leak into
+    // this test's own `git init` (which has no hardening of its own).
+    let _guard = git::GIT_ENV_LOCK.lock().unwrap();
     let (root, _) = test_ctx("git_status");
     let repo = root.join("repo");
     fs::create_dir_all(&repo).unwrap();
