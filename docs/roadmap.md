@@ -586,3 +586,44 @@ security updates 管的是有通告时的即时修复 PR，后者只能在仓库
 - `v0.1.1`–`v0.2.8` 是轻量标签，`v0.3.0` 起改为附注标签，看起来是有意的切换。
 - 本地已装 1.74.1 工具链（2026-09-01 探 #5 时装的），写 CI job 时可以复验；不需要时
   `rustup toolchain uninstall 1.74` 可移除。
+
+## Deferred ledger 处置（2026-09-02，GATE-13）
+
+DAG 收官时在案的 11 项挂起事项，在 GATE-13 逐项裁定。**A 类是「等用户点头后建 GitHub issue」
+的候选——本节先不建，避免替用户决定 issue 的取舍。** B/C 类是明确继续挂起，不是待办。
+2026-09-02 更新：A4、A6 已随第二战役 PR #27 销账，在案剩 9 项。
+
+### A 类：转 issue 候选（技术债有明确动作）
+
+1. **`app.notice` 无过期机制** —— 转新 issue：notice 没有过期/清除路径，可能长期挂在页脚；
+   PR-8 期间发现，按「零夹带」护栏未顺手修。
+2. **34 处临时目录泄漏缺 `Drop` guard** —— 转新 issue：清理挂在成功路径上、断言一失败就泄漏，
+   每轮测试都在 `/tmp` 留目录，修法明确（换成失败路径也能清的 guard）。
+3. **`App::page` 末页 clamp 与调用处重复** —— 转新 issue：同一不变量在 `PageWindow::new` 与
+   `App::page` 各写了一遍，小重构、动作明确。
+4. **`render_confirm_delete` 未搬进 `picker_overlays.rs`** —— 已解决（PR #27，2026-09-02）：
+   `621b724` 补完 4.3 验收，浮层各自成模块。原委：4.3 验收「四个浮层各自成模块」当时实际
+   只搬了三个，roadmap 留痕由本条归口收账，现账已收。
+5. **`run_ui` 几何存回第一跳是变异幸存者** —— 转新 issue：
+   `app.last_list_start = geometry.start`（`src/picker.rs:2367`，基线 `3d3fe40`）这一步在
+   PR-10 对抗验证（P2-1）中变异全绿——跨页点击测试锁的是 `render_list` 层，没锁到这步存回，
+   补一条状态级测试即可关上。
+6. **`read_git_info` 测试 spawn 的 `git init` 应硬化子进程环境** —— 已解决（PR #27，2026-09-02）：
+   `050f5de` 的 `git_command` helper 剥 9 个 `GIT_*` 变量，配两个承重测试 + bare 诱饵仓库回归
+   测试。原委：2026-09-02 两次 `.git/config` 损坏的根因即此注入链，钩子侧 unset 已先行修过，
+   测试侧的裸 footgun 由此关上。
+
+### B 类：挂起——产品/发布决策，属用户，不是代码任务
+
+7. **`cdh -h` 输出中文-only** —— 继续挂起：要不要英文/双语是产品决策，属用户。
+8. **crates.io publish** —— 继续挂起：发布流程决策（见上面「待决问题」一节），属用户。
+9. **GitHub `automated-security-fixes` 开关** —— 继续挂起：用户在仓库设置里操作，且当前打开
+   只会复刻已挂着的 PR #21（`lru` 经 ratatui 传递进来，Dependabot 动不了 ratatui）。
+10. **Dependabot PR #19–#22 + 相关 alert 的解冻节奏** —— 继续挂起：冻结条件（PR-7、PR-8
+    完成）已满足，等用户裁定；建议序：github-actions 组 → toml → cargo-minor-patch →
+    ratatui 0.30.2 跨 minor 单独审。
+
+### C 类：挂起——低优先/不可行
+
+11. **`last_click` 双击逻辑用真实 `Instant`、不可确定性测试** —— 有据挂起：要测需时间注入
+    重构，收益低，不做。
