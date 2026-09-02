@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# 版本控制里的 commit-msg 钩子。装法：`just hooks-install`（它把 core.hooksPath
+# 指到本目录）。刻意做成薄壳 —— 真正的规则只写在 scripts/tools/commit-msg-check.sh
+# 一处，钩子不复制逻辑，否则两边会漂。
+#
+# 为什么钩子必须进版本控制：`.git/hooks` 在 linked worktree 里根本不存在（那里
+# `.git` 是文件不是目录），于是 `core.hooksPath = .git/hooks` 在每个 worktree 里都
+# 解析到一个不存在的路径，而 git 对「钩子目录不存在」是静默放过的 —— 校验从头到尾
+# 一次都没跑过，也没有任何报错。改成仓库内的相对路径后，每个 worktree 用自己那份
+# 签出的 .githooks/，主树与 linked worktree 都能触发（已实测两边都会拦）。
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+exec "$repo_root/scripts/tools/commit-msg-check.sh" "$1"
