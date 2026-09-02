@@ -36,9 +36,9 @@ if ! printf '%s' "$subject" | grep -Eq "$pattern"; then
 写无 scope 的 `docs:` 才通过。
 
 示例：
-  feat(history): 在目录访问时维护 uniq 历史
-  fix(install): 统一通过 cdh log 记录 shell 历史
-  chore(release): 准备 v0.2.0 发布
+  feat(history): maintain a uniq visit history on directory access
+  fix(install): record shell history through cdh log consistently
+  chore(release): prepare v0.2.0
 EOF
   exit 1
 fi
@@ -72,6 +72,18 @@ subject_width=$(((subject_bytes + subject_chars) / 2))
 if [[ ${subject_width} -gt 72 ]]; then
   echo "提交标题过长（约 ${subject_width} 显示列，上限 72 列）。" >&2
   echo "计量方式：ASCII 每字符算 1 列，中日韩字符每字符算 2 列，所以 72 列约等于 36 个汉字。" >&2
+  exit 1
+fi
+
+# Subject 只允许可打印 ASCII（英文）。bytes 与 chars 都在 LC_ALL=C 下取得：纯 ASCII
+# 时两者相等；一旦出现多字节字符（中文、emoji、全角标点等），bytes 必然大于 chars。
+# 这个判等与 locale 无关，也不会把控制字符误放进来——多字节判等只拦非 ASCII，
+# 控制字符等奇怪输入本来就无法通过上面的格式正则。
+# 2026-09-03 用户裁定：subject 一律英文；此前历史中的中文标题保留不改写。
+if ((subject_bytes != subject_chars)); then
+  echo "提交标题（subject）必须是可打印 ASCII（英文），当前含有非 ASCII 字符。" >&2
+  echo "说明：type/scope 本就是英文，主体混入中文会让 git log --grep 与 GitHub 检索失焦；" >&2
+  echo "正文（body）语言不限，中文详述 encouraged。2026-09-03 前的中文标题历史保留不改。" >&2
   exit 1
 fi
 
