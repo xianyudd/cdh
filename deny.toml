@@ -42,58 +42,24 @@ yanked = "deny"
 #
 # unsound：cargo-deny 0.19.0（PR#826）新增了这个开关，默认 "workspace" ——
 # 只对本 workspace 的 crate 报 unsound 通告，传递依赖的 unsound **一条都不报**。
-# 本仓的 workspace 只有 cdh 自己，86 个依赖全是传递的，所以默认值等于把 unsound
-# 这一类彻底关掉。实测：默认值下 CI 的 cargo-deny 输出两条
+# 本仓的 workspace 只有 cdh 自己，依赖全是传递的，所以默认值等于把 unsound
+# 这一类彻底关掉。实测（ratatui 0.29 时代）：默认值下 CI 的 cargo-deny 输出
 # `warning[advisory-not-detected] … no crate matched advisory criteria`，指的正是
-# 下面两条 lru 豁免 —— 通告没被检测到，豁免因此空转，而检查依然全绿。
-# 那不是「没问题」，是「没检查」。写成 "all" 之后两条通告真的被检测到，
-# 再由下面的 ignore 明确豁免掉，红/绿的含义才是我们审过的结论。
+# 当时的 lru 豁免 —— 通告没被检测到，豁免因此空转，而检查依然全绿。
+# 那不是「没问题」，是「没检查」。写成 "all" 之后通告真的被检测到，
+# 需要豁免的再由下面的 ignore 明确豁免掉，红/绿的含义才是我们审过的结论。
+# （后来升到 ratatui 0.30，那批 lru 豁免随撤掉条件达成而删除，但这条开关
+# 留着：它守的是「检查真的在跑」，不是某几条具体通告。）
 unsound = "all"
 # unmaintained：0.20 的默认值恰好也是 "all"，这里显式写出来是因为上面那条就是
 # 「依赖默认值」踩的坑 —— 默认值会随版本变，而变化不会让 CI 变红，只会让它变松。
 unmaintained = "all"
 
-# 下面三条全部来自 `ratatui 0.29`。0.29 被 MSRV 钉住：ratatui 0.30 的
-# rust-version 是 1.86（0.30.2 是 1.88），而本仓 Cargo.toml 声明 1.74 且 CI 有
-# 一个 1.74 的 job 在守。所以三条的撤掉条件都包含「抬 MSRV + 升 ratatui」，
-# 那是一次独立的决定，不属于本次供应链 PR 的范围。
-# 已核：ratatui 0.30 拆成了子 crate，`ratatui-core 0.1.2` 依赖 `lru ^0.18`
-# 且不再依赖 `paste`，即升级确实同时解掉这三条。
-ignore = [
-  # paste 1.0.15 —— 作者归档了仓库并标记 unmaintained。
-  # 路径：cdh → ratatui 0.29 → paste。
-  # 可接受：paste 是 proc-macro，只在编译期为 ratatui 的
-  #   src/style/stylize.rs 拼接标识符，不进入发布二进制；unmaintained 描述的是
-  #   维护状态而非漏洞，这份代码已冻结且没有已知缺陷。
-  # 撤掉条件：升级到 ratatui 0.30+（其 ratatui-core 已不依赖 paste）；
-  #   或 paste 出现真正的漏洞通告——那时这条必须立刻重审而不是继续 ignore。
-  { id = "RUSTSEC-2024-0436", reason = "paste 是 ratatui 0.29 的编译期 proc-macro，不进二进制；仅 unmaintained，无漏洞。升级 ratatui 0.30+（需 MSRV ≥1.86）后撤掉" },
-
-  # lru 0.12.5 —— IterMut::next / next_back 违反 Stacked Borrows（unsound）。
-  # 路径：cdh → ratatui 0.29 → lru。
-  # 可接受：缺陷路径不可达。ratatui 0.29 对 lru 的全部用法都在
-  #   src/layout/layout.rs：一个 thread-local 的
-  #   LruCache<(Rect, Layout), (Segments, Spacers)>，只调用 get_or_insert 与
-  #   resize，从不构造 IterMut（已逐一核过 0.29.0 源码）。cdh 自身没有对 lru 的
-  #   直接依赖，拿不到那个 cache。
-  # 撤掉条件：升级 ratatui（ratatui-core 要求 lru ^0.18，满足通告要求的
-  #   >= 0.16.3）；或 cdh 自己开始直接用 lru——那时这条立即失效。
-  { id = "RUSTSEC-2026-0002", reason = "ratatui 0.29 只对 lru 用 get_or_insert/resize，从不构造 IterMut，缺陷路径不可达。升级 ratatui 到依赖 lru>=0.16.3 的版本后撤掉" },
-
-  # lru 0.12.5 —— LruCache::pop() 不是 panic-safe，key 的 Drop 在 pop 中 panic
-  # 会留下悬挂指针，后续淘汰时 UAF。
-  # 路径：cdh → ratatui 0.29 → lru。
-  # 可接受：通告要求的三个前提在本仓一个都不成立——
-  #   (1) ratatui 从不调用 pop()（只有 get_or_insert / resize）；
-  #   (2) key 类型 (Rect, Layout) 全是 derive 出来的普通数据类型，没有自定义
-  #       Drop，drop 时不可能 panic；
-  #   (3) 通告原文限定「只在启用 unwinding 且使用 catch_unwind 时可触发」，而
-  #       Cargo.toml 的 [profile.release] 是 panic = "abort"，发布二进制里没有
-  #       unwinding，且全仓没有任何 catch_unwind。
-  # 撤掉条件：升级 ratatui 到依赖 lru >= 0.18.2 的版本；或上面三个前提中任何一条
-  #   变化（例如 release profile 改回 unwind、或 cdh 直接用上 lru）。
-  { id = "RUSTSEC-2026-0253", reason = "ratatui 0.29 从不调用 LruCache::pop，key 类型无自定义 Drop，且 release profile 是 panic=abort 无 unwinding，通告的三个前提均不成立。升级 ratatui 到依赖 lru>=0.18.2 后撤掉" },
-]
+# ratatui 0.29 时代这里有三条 ignore（paste unmaintained、lru 两条 unsound），
+# 升级到 ratatui 0.30 后撤掉条件全部达成（paste 已出树、lru 0.18.3 高于两条
+# 通告的修复版本），2026-09 随 `chore: bump ratatui to 0.30` 一并删除，留此存照：
+# 新增 ignore 必须写清「豁免的是什么、为什么可接受、什么条件下撤掉」。
+ignore = []
 
 # ---------------------------------------------------------------------------
 # licenses —— 许可证
@@ -105,8 +71,8 @@ ignore = [
 # 的一支，允许 MIT 与 Apache-2.0 已经把这些 crate 全部覆盖。多列一条就等于多批准
 # 一类将来可能只以该许可证单独出现的依赖，所以不列。
 allow = [
-  "MIT",          # cdh 自身的许可证，依赖里 83 个 crate 用它
-  "Apache-2.0",   # 65 个 crate 的另一支（多为 `MIT OR Apache-2.0` 双授权）
+  "MIT",          # cdh 自身的许可证，依赖里 92 个 crate 用它（多为双授权的一支）
+  "Apache-2.0",   # 67 个 crate 的另一支（多为 `MIT OR Apache-2.0` 双授权）
   "Unicode-3.0",  # unicode-ident 是 `(MIT OR Apache-2.0) AND Unicode-3.0`，
                   # AND 意味着这条是必需项而非可选项，不允许它这棵树根本装不上
   "Zlib",         # foldhash（← hashbrown ← indexmap / lru）的唯一许可证；宽松，
@@ -135,7 +101,7 @@ ignore = false
 [bans]
 # 设成 deny 而不是默认的 warn：[profile.release] 是 opt-level = "z" +
 # lto = "fat" + strip = true，体积是这个项目明确在优化的东西，而重复版本会整份进
-# 二进制。87 个 crate 的树里新增一个重复值得人看一眼；warn 在 CI 上等于没有检查。
+# 二进制。93 个 crate 的树里新增一个重复值得人看一眼；warn 在 CI 上等于没有检查。
 multiple-versions = "deny"
 # 我们没有 `*` 版本依赖，这条是白拿的防线。
 wildcards = "deny"
@@ -146,30 +112,35 @@ allow = []
 deny = []
 
 skip = [
-  # unicode-width 同时存在 0.1.14 与 0.2.0。
-  # 豁免的是 0.1.14：来自 unicode-truncate 1.1 ← ratatui 0.29。cdh 与 ratatui
-  #   本体用的都是 0.2。
-  # 为什么可接受：不在我们手里——unicode-truncate 1.x 的上界卡住了它，改不动除非
-  #   动 ratatui；两份加起来的体积代价是几 KB 的查表数据。
-  # 撤掉条件：升级 ratatui 后 unicode-truncate 2.x 要求 unicode-width >= 0.2，
-  #   届时这条会变成多余项（cargo-deny 不会因为多余的 skip 报错，所以升级时要主动
-  #   删掉再跑一遍确认）。
-  { crate = "unicode-width@0.1.14", reason = "ratatui 0.29 → unicode-truncate 1.1 钉住的旧版；cdh 自己用 0.2。升级 ratatui 后撤掉" },
+  # hashbrown 同时存在 0.16.1 与 0.17.1（ratatui 0.30 引入）。
+  # 豁免的是 0.16.1：来自 kasuari 0.4.12（约束求解器，ratatui-core 的布局后端，
+  #   要求 kasuari ^0.4）。0.17.1 的用户是 ratatui-core / ratatui-widgets / lru。
+  # 为什么可接受：不在我们手里——kasuari 0.4.12 已是 crates.io 最新（2026-03），
+  #   仍钉 hashbrown ^0.16，收不收敛取决于上游发版。与 proc-macro 不同，这份
+  #   会进二进制，代价是 kasuari 那一路的 hashbrown 查表/实现代码，量级可控。
+  # 撤掉条件：kasuari 发依赖 hashbrown 0.17+ 的版本（届时这条会变成多余项，
+  #   cargo-deny 不报多余 skip，升级 ratatui 树时要主动删掉再跑一遍确认）；
+  #   或 ratatui-core 换布局后端。
+  { crate = "hashbrown@0.16.1", reason = "kasuari 0.4.12（ratatui-core 布局后端）钉住的版本，上游未发 hashbrown 0.17 适配版。kasuari 升级后撤掉" },
 
-  # windows-sys 同时存在 0.59.0（← rustix）与 0.61.2（← errno / mio）。
-  # 豁免的是 0.59.0。
-  # 为什么可接受：两份都只在 cfg(windows) 下链接，而 release 矩阵没有 windows
-  #   target，对发布物零影响。这条正是上面 graph.targets 留空的代价，是有意付的。
-  # 撤掉条件：rustix 升级后与 errno / mio 收敛到同一个 windows-sys；或者哪天真的
-  #   开始发布 windows 产物——那时它就不再是零影响，必须重新判断。
-  { crate = "windows-sys@0.59.0", reason = "仅 cfg(windows) 下链接，release 矩阵无 windows target，对发布物零影响。rustix 与 errno/mio 收敛后撤掉" },
+  # syn 同时存在 2.0.118 与 3.0.4（ratatui 0.30 引入）。
+  # 豁免的是 3.0.4：仅 thiserror-impl 2.0.20（← thiserror 2 ← kasuari /
+  #   ratatui-core）在用；syn 2 那一路的用户是 darling / derive_more /
+  #   strum_macros 等主流 proc-macro 生态。
+  # 为什么可接受：syn 是 proc-macro 依赖，只存在于编译期，不进入发布二进制，
+  #   对体积和供应链面都零影响；收不收敛取决于上游 proc-macro 生态整体迁到
+  #   syn 3，不是本仓能推动的。
+  # 撤掉条件：darling / derive_more / strum_macros 等迁到 syn 3 后树里只剩
+  #   一个主版本（届时这条变多余，主动删掉再确认）；或 ratatui 树不再依赖
+  #   thiserror 2。
+  { crate = "syn@3.0.4", reason = "仅 thiserror-impl 2（kasuari→ratatui-core）使用 syn 3，其余 proc-macro 生态仍在 syn 2；proc-macro 不进二进制。上游生态收敛后撤掉" },
 ]
 skip-tree = []
 
 # ---------------------------------------------------------------------------
 # sources —— 依赖来源
 # ---------------------------------------------------------------------------
-# 对 `curl | bash` 的工具，「依赖从哪来」比「依赖是什么许可证」更要紧。当前 87 个
+# 对 `curl | bash` 的工具，「依赖从哪来」比「依赖是什么许可证」更要紧。当前 93 个
 # crate 全部来自 crates.io，所以这里一条豁免都没有：任何 git 依赖或私有 registry
 # 溜进来都应该当场变红。
 [sources]
