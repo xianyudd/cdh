@@ -13,7 +13,6 @@ mod overlays;
 #[path = "tui_settings.rs"]
 mod settings;
 
-use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
@@ -1344,8 +1343,12 @@ struct App {
     preview_current: Option<(String, PreviewOutcome)>,
     preview_selected_path: Option<String>,
     last_click: Option<(usize, Instant)>,
-    last_list_area: Cell<Rect>,
-    last_list_start: Cell<usize>,
+    /// List geometry published by the last successful draw, consumed by the
+    /// mouse handler to map clicks back onto result rows. Rendering itself no
+    /// longer reaches back here: `draw` returns the geometry and the event
+    /// loop stores it, so a render pass cannot mutate state mid-frame.
+    last_list_area: Rect,
+    last_list_start: usize,
     /// Monotonic clock origin for the ambient corner wireframe cube.
     corner_anim_started: Instant,
     /// The `CDH_CORNER_3D` opt-out, read once at startup. Environment cannot
@@ -1482,8 +1485,10 @@ impl App {
             preview_current: None,
             preview_selected_path: None,
             last_click: None,
-            last_list_area: Cell::new(Rect::new(0, 0, 0, 0)),
-            last_list_start: Cell::new(0),
+            // No frame has been drawn yet, so the area has no height and the
+            // click guard below rejects everything until a draw succeeds.
+            last_list_area: Rect::new(0, 0, 0, 0),
+            last_list_start: 0,
             corner_anim_started: Instant::now(),
             corner_3d_env: env_flag_enabled("CDH_CORNER_3D", true),
             discover_rx: Vec::new(),
@@ -2355,8 +2360,8 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
                 list_geometry = draw(frame, &view, &theme, corner_angle);
             })?;
             if let Some(geometry) = list_geometry {
-                app.last_list_area.set(geometry.area);
-                app.last_list_start.set(geometry.start);
+                app.last_list_area = geometry.area;
+                app.last_list_start = geometry.start;
             }
             dirty = false;
         }
@@ -2667,7 +2672,7 @@ fn handle_mouse(app: &mut App, event: event::MouseEvent) -> Option<Option<String
             app.move_by(1);
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            let list_area = app.last_list_area.get();
+            let list_area = app.last_list_area;
             if list_area.height == 0
                 || event.row < list_area.y
                 || event.row >= list_area.y + list_area.height
@@ -2677,7 +2682,7 @@ fn handle_mouse(app: &mut App, event: event::MouseEvent) -> Option<Option<String
                 return None;
             }
 
-            let selected = app.last_list_start.get() + (event.row - list_area.y) as usize;
+            let selected = app.last_list_start + (event.row - list_area.y) as usize;
             if selected >= app.filtered_results.len() {
                 return None;
             }
@@ -4237,8 +4242,8 @@ mod tests {
             })
             .unwrap();
         if let Some(geometry) = list_geometry {
-            app.last_list_area.set(geometry.area);
-            app.last_list_start.set(geometry.start);
+            app.last_list_area = geometry.area;
+            app.last_list_start = geometry.start;
         }
         terminal.backend().buffer().clone()
     }
