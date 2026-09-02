@@ -25,6 +25,30 @@ pub(super) enum SettingKey {
     Mouse,
 }
 
+/// Which settings the environment pins, snapshotted once per frame so the
+/// render path never has to consult `UiSettings` (or the process
+/// environment) while drawing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct SettingLocks {
+    pub(super) language: bool,
+    pub(super) theme: bool,
+    pub(super) preview: bool,
+    pub(super) color: bool,
+    pub(super) mouse: bool,
+}
+
+impl SettingLocks {
+    pub(super) fn is_locked(&self, key: SettingKey) -> bool {
+        match key {
+            SettingKey::Language => self.language,
+            SettingKey::Theme => self.theme,
+            SettingKey::Preview => self.preview,
+            SettingKey::Color => self.color,
+            SettingKey::Mouse => self.mouse,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct UiPreferences {
     pub(super) language: LanguagePreference,
@@ -206,6 +230,18 @@ impl UiSettings {
             SettingKey::Preview => self.environment.preview.is_some(),
             SettingKey::Color => self.environment.color.is_some(),
             SettingKey::Mouse => self.environment.mouse.is_some(),
+        }
+    }
+
+    /// The per-key lock bits, for callers that need the whole picture at once
+    /// instead of one `is_locked` round-trip per row.
+    pub(super) fn locks(&self) -> SettingLocks {
+        SettingLocks {
+            language: self.is_locked(SettingKey::Language),
+            theme: self.is_locked(SettingKey::Theme),
+            preview: self.is_locked(SettingKey::Preview),
+            color: self.is_locked(SettingKey::Color),
+            mouse: self.is_locked(SettingKey::Mouse),
         }
     }
 
