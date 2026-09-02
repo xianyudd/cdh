@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# 版本控制里的 pre-commit 钩子。装法：`just hooks-install`。
+# 与 commit-msg 同理做成薄壳，规则只在 scripts/tools/pre-commit-check.sh 一处。
+# 为什么不能放在 .git/hooks 里：见 .githooks/commit-msg 顶部的注释。
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+exec "$repo_root/scripts/tools/pre-commit-check.sh" "$@"
