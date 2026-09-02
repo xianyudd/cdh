@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -33,7 +33,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
 
       # shell-lint 需要 fish 与 zsh 才能检查 installer payload；
       # CI 上工具缺失会硬失败（见 Justfile 的 shell-lint），所以这一步必须成功
@@ -64,10 +64,16 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
+      # 版本走 toolchain 参数而不是 action 引用：引用里带版本号（@1.74）会被
+      # Dependabot 当成过时的 action tag 反复开升级 PR（见 #22），而
+      # MSRV 是 Cargo.toml rust-version 决定的固化语义（roadmap #5），不是
+      # 「action 没更新」。版本一致性由下面的 assert 步骤守着。
       - name: Install Rust (MSRV)
-        uses: dtolnay/rust-toolchain@1.74
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -104,7 +110,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # 刻意钉到精确版本，而不是像本文件其他 action 那样用浮动大版本。
       # 理由：这个 action 消费我们自己写的 deny.toml，cargo-deny 改配置 schema 时
@@ -136,7 +142,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust (stable) with Linux cross targets
         uses: dtolnay/rust-toolchain@stable

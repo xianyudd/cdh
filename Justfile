@@ -17,11 +17,16 @@ fmt-check:
 # "mapfile: command not found"，一个测试都跑不到，Mac 开发者本地也跑不了 just check。
 # 同理 docs/install.sh 放在数组初值里而不是后面单独传参：这样数组恒非空，
 # 避开 bash 3.2 在 set -u 下展开空数组直接报 unbound variable 的行为。
+#
+# .githooks 单独一条 find 且不带 `-name '*.sh'`：git 钩子按约定不带扩展名（文件名
+# 就是钩子名，加了后缀 git 不认），所以按后缀筛会把它们整个漏掉 —— 那正是「检查
+# 存在但检查不到东西」。shfmt 对无扩展名文件靠 shebang 识别语言，已实测能处理。
 shellfmt:
     #!/usr/bin/env bash
     set -euo pipefail
     files=("docs/install.sh")
     while IFS= read -r f; do files+=("$f"); done < <(find scripts -type f -name '*.sh' | sort)
+    while IFS= read -r f; do files+=("$f"); done < <(find .githooks -type f | sort)
     shfmt -w -i 2 -ci -bn -sr "${files[@]}"
 
 shellfmt-check:
@@ -30,6 +35,7 @@ shellfmt-check:
     # while read 而非 mapfile：见 shellfmt 上方注释（macOS 是 bash 3.2）
     files=("docs/install.sh")
     while IFS= read -r f; do files+=("$f"); done < <(find scripts -type f -name '*.sh' | sort)
+    while IFS= read -r f; do files+=("$f"); done < <(find .githooks -type f | sort)
     shfmt -d -i 2 -ci -bn -sr "${files[@]}"
 
 shell-lint:
@@ -38,6 +44,7 @@ shell-lint:
     # while read 而非 mapfile：见 shellfmt 上方注释（macOS 是 bash 3.2）
     files=("docs/install.sh")
     while IFS= read -r f; do files+=("$f"); done < <(find scripts -type f -name '*.sh' | sort)
+    while IFS= read -r f; do files+=("$f"); done < <(find .githooks -type f | sort)
     for f in "${files[@]}"; do
       bash -n "$f"
     done
@@ -82,10 +89,14 @@ lint:
 lint-strict:
     cargo clippy --all-targets --all-features -- -D warnings
 
+# check 的唯一用途是回答「推上去 CI 会不会绿」，所以它必须和 CI 跑同一套严格度。
+# 这里原来跑的是宽松版 lint，而 ci.yml 跑 lint-strict（`-D warnings`），后果是
+# 本地绿、CI 红，每个人都得自己记着额外多跑一条 —— 靠自觉的检查等于没有检查。
+# 宽松版仍然留着（`just lint`）给开发中途想看告警但不想被打断的场景。
 check:
     just fmt-check
     just shell-lint
-    just lint
+    just lint-strict
     just test
 
 build:
