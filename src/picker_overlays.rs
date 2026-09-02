@@ -117,11 +117,11 @@ mod help {
 
 mod settings {
     use super::super::settings::LanguagePreference;
-    use super::super::{App, Language, SettingKey, TextKey, Theme, ThemeChoice};
+    use super::super::{FrameView, Language, SettingKey, TextKey, Theme, ThemeChoice};
     use super::*;
     use unicode_width::UnicodeWidthStr;
 
-    pub fn render(frame: &mut Frame, app: &App, theme: &Theme, full: Rect, selected: usize) {
+    pub fn render(frame: &mut Frame, view: &FrameView, theme: &Theme, full: Rect, selected: usize) {
         let width = 72u16.min(full.width.saturating_sub(2));
         let height = 10u16.min(full.height);
         if width < 2 || height < 2 {
@@ -153,7 +153,7 @@ mod settings {
             frame,
             inner,
             0,
-            app.language.text(TextKey::SettingsTitle),
+            view.language.text(TextKey::SettingsTitle),
             theme.title(),
         );
 
@@ -177,13 +177,13 @@ mod settings {
             } else {
                 theme.primary()
             };
-            let text = row_text(app, key, inner.width as usize);
+            let text = row_text(view, key, inner.width as usize);
             render_line(frame, inner, offset, &text, style);
         }
 
         if inner.height > 1 {
             let footer = super::super::trim_end(
-                app.language.text(TextKey::SettingsFooter),
+                view.language.text(TextKey::SettingsFooter),
                 inner.width as usize,
             );
             render_line(frame, inner, inner.height - 1, &footer, theme.dim());
@@ -202,40 +202,39 @@ mod settings {
         })
     }
 
-    fn row_text(app: &App, key: SettingKey, width: usize) -> String {
-        let effective = app.settings.effective();
+    fn row_text(view: &FrameView, key: SettingKey, width: usize) -> String {
         let (label, value) = match key {
             SettingKey::Language => (
-                app.language.text(TextKey::SettingLanguage),
-                match effective.language {
-                    LanguagePreference::Auto => app.language.text(TextKey::LanguageAuto),
+                view.language.text(TextKey::SettingLanguage),
+                match view.prefs.language {
+                    LanguagePreference::Auto => view.language.text(TextKey::LanguageAuto),
                     LanguagePreference::ZhCn => {
-                        app.language.text(TextKey::LanguageSimplifiedChinese)
+                        view.language.text(TextKey::LanguageSimplifiedChinese)
                     }
-                    LanguagePreference::En => app.language.text(TextKey::LanguageEnglish),
+                    LanguagePreference::En => view.language.text(TextKey::LanguageEnglish),
                 },
             ),
             SettingKey::Theme => (
-                app.language.text(TextKey::SettingTheme),
-                theme_choice_label(app.language, effective.theme),
+                view.language.text(TextKey::SettingTheme),
+                theme_choice_label(view.language, view.prefs.theme),
             ),
             SettingKey::Preview => (
-                app.language.text(TextKey::SettingPreviewStartup),
-                boolean_text(app.language, effective.preview),
+                view.language.text(TextKey::SettingPreviewStartup),
+                boolean_text(view.language, view.prefs.preview),
             ),
             SettingKey::Color => (
-                app.language.text(TextKey::SettingColor),
-                boolean_text(app.language, effective.color),
+                view.language.text(TextKey::SettingColor),
+                boolean_text(view.language, view.prefs.color),
             ),
             SettingKey::Mouse => (
-                app.language.text(TextKey::SettingMouseCapture),
-                boolean_text(app.language, effective.mouse),
+                view.language.text(TextKey::SettingMouseCapture),
+                boolean_text(view.language, view.prefs.mouse),
             ),
         };
-        let marker = app
-            .settings
+        let marker = view
+            .locked
             .is_locked(key)
-            .then(|| app.language.text(TextKey::EnvironmentControlled));
+            .then(|| view.language.text(TextKey::EnvironmentControlled));
         let right = marker
             .map(|marker| format!("{value} · {marker}"))
             .unwrap_or_else(|| value.to_string());
@@ -277,10 +276,10 @@ mod settings {
 }
 
 mod excludes {
-    use super::super::{App, TextKey, Theme};
+    use super::super::{FrameView, TextKey, Theme};
     use super::*;
 
-    pub fn render(frame: &mut Frame, app: &App, theme: &Theme, full: Rect, selected: usize) {
+    pub fn render(frame: &mut Frame, view: &FrameView, theme: &Theme, full: Rect, selected: usize) {
         let width = 72u16.min(full.width.saturating_sub(2));
         let height = 14u16.min(full.height);
         if width < 2 || height < 2 {
@@ -311,17 +310,17 @@ mod excludes {
             frame,
             inner,
             0,
-            app.language.text(TextKey::ExcludesTitle),
+            view.language.text(TextKey::ExcludesTitle),
             theme.title(),
         );
 
-        let roots = app.excludes.roots();
+        let roots = view.exclude_roots;
         if roots.is_empty() {
             render_line(
                 frame,
                 inner,
                 2,
-                app.language.text(TextKey::ExcludesEmpty),
+                view.language.text(TextKey::ExcludesEmpty),
                 theme.dim(),
             );
         } else {
@@ -340,7 +339,7 @@ mod excludes {
                 };
                 let text = format!(
                     " {}",
-                    super::super::PathDisplay::from_path(root, app.home.as_deref()).text
+                    super::super::PathDisplay::from_path(root, view.home).text
                 );
                 render_line(
                     frame,
@@ -354,7 +353,7 @@ mod excludes {
 
         if layout(inner.height).1 {
             let footer = super::super::trim_end(
-                app.language.text(TextKey::ExcludesFooter),
+                view.language.text(TextKey::ExcludesFooter),
                 inner.width as usize,
             );
             render_line(frame, inner, inner.height - 1, &footer, theme.dim());
