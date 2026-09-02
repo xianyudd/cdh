@@ -7,6 +7,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+pub(super) use confirm_delete::render as render_confirm_delete;
 pub(super) use excludes::render as render_excludes;
 #[cfg(test)]
 pub(super) use excludes::{layout as excludes_layout, window_start as excludes_window_start};
@@ -390,6 +391,68 @@ mod excludes {
             Paragraph::new(super::super::trim_end(text, inner.width as usize)).style(style),
             area,
         );
+    }
+
+    fn centered(full: Rect, width: u16, height: u16) -> Rect {
+        Rect::new(
+            full.x + (full.width.saturating_sub(width)) / 2,
+            full.y + (full.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        )
+    }
+}
+
+mod confirm_delete {
+    use super::super::{confirm_delete_message, FrameView, TextKey, Theme};
+    use super::*;
+
+    pub fn render(
+        frame: &mut Frame,
+        view: &FrameView,
+        theme: &Theme,
+        full: Rect,
+        candidate_idx: usize,
+    ) {
+        let width = 56u16.min(full.width.saturating_sub(4));
+        let path = view
+            .candidates
+            .get(candidate_idx)
+            .map(|candidate| candidate.display(view.home).text)
+            .unwrap_or_else(|| view.language.text(TextKey::UnknownDirectory).to_string());
+        let message =
+            confirm_delete_message(&path, width.saturating_sub(2) as usize, view.language);
+        let lines = vec![
+            Line::from(Span::styled(
+                view.language.text(TextKey::ConfirmDeleteTitle),
+                theme.title(),
+            )),
+            Line::raw(""),
+            Line::from(Span::styled(message, theme.primary())),
+            Line::raw(""),
+            Line::from(Span::styled(
+                view.language.text(TextKey::ConfirmDeleteAgain),
+                theme.dim(),
+            )),
+        ];
+        let height = (lines.len() as u16 + 2).min(full.height.saturating_sub(2));
+        let area = centered(full, width, height);
+        frame.render_widget(Clear, area);
+        frame.render_widget(Block::default().style(theme.panel()), area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(area.width as usize),
+                theme.border(),
+            ))),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        let inner = Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn centered(full: Rect, width: u16, height: u16) -> Rect {
