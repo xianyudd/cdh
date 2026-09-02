@@ -73,7 +73,7 @@ jobs:
       - name: Install Rust (MSRV)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.74
+          toolchain: 1.88
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
