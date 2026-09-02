@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cdh — frecency directory jumping with a TUI picker</title>
+<meta name="description" content="cdh is a Rust CLI that scores your directory history with frecency (frequency x recency decay) and opens a terminal UI picker: fuzzy search, preview pane, git status, seven themes, bilingual EN/中文.">
+<style>
+:root {
+  --bg: #0a1014;
+  --bg-soft: #0e161c;
+  --bg-card: #101a21;
+  --line: #1d2b33;
+  --line-glow: #1f4a44;
+  --text: #d7e3e6;
+  --muted: #8aa3a8;
+  --accent: #35e0b8;
+  --accent-dim: #1f8f78;
+  --accent-ink: #062019;
+  --amber: #e8b45a;
+  --blue: #6fc3ff;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  line-height: 1.6;
+  -webkit-text-size-adjust: 100%;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+a:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+.wrap { max-width: 60rem; margin: 0 auto; padding: 0 1.25rem; }
+
+/* ---------- top nav ---------- */
+nav {
+  display: flex; align-items: center; gap: 1.25rem;
+  padding: 0.9rem 0; font-size: 0.92rem;
+}
+nav .logo {
+  font-family: var(--mono); font-weight: 700; font-size: 1.1rem;
+  color: var(--text); letter-spacing: 0.02em;
+}
+nav .logo .tick { color: var(--accent); }
+nav .spacer { flex: 1; }
+nav a { color: var(--muted); }
+nav a:hover { color: var(--accent); }
+
+/* ---------- hero ---------- */
+.hero { padding: 3.5rem 0 2.5rem; text-align: center; }
+.hero .glow {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 0.9rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+}
+.hero h1 {
+  font-family: var(--mono);
+  font-size: clamp(3rem, 10vw, 5rem);
+  margin: 0.4rem 0 0.6rem;
+  letter-spacing: -0.02em;
+  color: #f2f8f7;
+  text-shadow: 0 0 26px rgba(53, 224, 184, 0.35);
+}
+.hero p.tag { font-size: 1.18rem; color: var(--muted); max-width: 40rem; margin: 0 auto 2rem; }
+.hero p.tag strong { color: var(--text); font-weight: 600; }
+
+/* install command + copy */
+.install-box {
+  display: flex; align-items: stretch;
+  max-width: 40rem; margin: 0 auto;
+  border: 1px solid var(--line-glow);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  box-shadow: 0 0 24px rgba(53, 224, 184, 0.08);
+  overflow: hidden;
+}
+.install-box code {
+  flex: 1; display: block; padding: 0.85rem 1rem;
+  font-family: var(--mono); font-size: 0.86rem;
+  color: var(--accent);
+  white-space: nowrap; overflow-x: auto;
+  text-align: left;
+}
+.install-box code .sh { color: var(--muted); }
+#copy-btn {
+  border: 0; border-left: 1px solid var(--line-glow);
+  background: var(--accent-dim);
+  color: var(--accent-ink);
+  font-family: var(--sans); font-weight: 600; font-size: 0.85rem;
+  padding: 0 1.1rem; cursor: pointer;
+}
+#copy-btn:hover { background: var(--accent); }
+.copy-note {
+  min-height: 1.4em; margin: 0.6rem 0 0;
+  font-size: 0.85rem; color: var(--muted);
+}
+.hero .meta {
+  margin-top: 1.6rem; font-size: 0.85rem; color: var(--muted);
+  font-family: var(--mono);
+}
+.hero .meta span { margin: 0 0.5rem; }
+
+/* ---------- sections ---------- */
+section { padding: 2.5rem 0 1rem; }
+h2 {
+  font-size: 1.5rem; margin: 0 0 0.4rem; color: #eef6f4;
+  letter-spacing: -0.01em;
+}
+h2 .k { color: var(--accent); font-family: var(--mono); }
+.sub { color: var(--muted); margin: 0 0 1.8rem; max-width: 46rem; }
+
+/* ---------- terminal window ---------- */
+.term-scroll { overflow-x: auto; padding: 0.25rem 0 0.75rem; }
+.term {
+  min-width: 46rem;
+  border: 1px solid var(--line-glow);
+  border-radius: 10px;
+  background: #070d11;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45), 0 0 30px rgba(53, 224, 184, 0.06);
+  overflow: hidden;
+}
+.term-bar {
+  display: flex; align-items: center; gap: 0.45rem;
+  padding: 0.5rem 0.8rem;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--line);
+}
+.dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; opacity: 0.85; }
+.dot.r { background: #e0655a; } .dot.y { background: #e0b355; } .dot.g { background: #58c47a; }
+.term-bar .title { margin-left: 0.6rem; font-family: var(--mono); font-size: 0.78rem; color: var(--muted); }
+.term-bar .cube {
+  margin-left: auto; font-family: var(--mono); font-size: 0.78rem;
+  color: var(--accent-dim); animation: spin 9s linear infinite;
+  display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .term-bar .cube { animation: none; } }
+
+.term-body {
+  display: grid; grid-template-columns: 1.35fr 1fr;
+  font-family: var(--mono); font-size: 0.85rem; line-height: 1.55;
+}
+.term-left { padding: 0.7rem 0.9rem 0.4rem; }
+.query { color: var(--text); margin-bottom: 0.6rem; }
+.query .prompt { color: var(--accent); font-weight: 700; }
+.query .q { color: #f2f8f7; }
+.query .q b { color: var(--accent); font-weight: 700; }
+.cand { color: var(--muted); white-space: nowrap; }
+.cand .score { color: #4b6a70; padding-right: 0.6rem; }
+.cand .path b { color: var(--text); font-weight: 700; }
+.cand.sel {
+  background: linear-gradient(90deg, rgba(53, 224, 184, 0.22), rgba(53, 224, 184, 0.05));
+  border-left: 2px solid var(--accent);
+  color: #f2f8f7; margin-left: -0.5rem; padding-left: 0.5rem;
+}
+.cand.sel .score { color: var(--accent); }
+.cand.sel .path b { color: var(--accent); }
+
+.term-right {
+  border-left: 1px solid var(--line);
+  padding: 0.7rem 0.9rem 0.4rem;
+  color: var(--muted);
+}
+.term-right .pv-title { color: var(--text); margin-bottom: 0.5rem; }
+.term-right .pv-title::before { content: "▸ "; color: var(--accent); }
+.pv-git { color: var(--amber); }
+.pv-git .clean { color: #6fd39a; }
+.pv-time { color: var(--blue); }
+.term-right ul { margin: 0.3rem 0 0.5rem; padding-left: 1.1rem; }
+.term-right li { white-space: nowrap; }
+.term-right li.dir { color: var(--text); }
+
+.term-hints {
+  border-top: 1px solid var(--line);
+  background: var(--bg-soft);
+  padding: 0.45rem 0.9rem;
+  font-family: var(--mono); font-size: 0.75rem; color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.term-hints b { color: var(--accent); font-weight: 700; }
+
+/* ---------- features ---------- */
+.grid {
+  display: grid; gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(15.5rem, 1fr));
+}
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 1.1rem 1.2rem;
+}
+.card:hover { border-color: var(--line-glow); }
+.card .ic { font-size: 1.35rem; }
+.card h3 { margin: 0.5rem 0 0.35rem; font-size: 1.02rem; color: #eef6f4; }
+.card p { margin: 0; font-size: 0.9rem; color: var(--muted); }
+
+/* ---------- install ways ---------- */
+.ways { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
+.way {
+  background: var(--bg-card); border: 1px solid var(--line);
+  border-radius: 8px; padding: 1.1rem 1.2rem;
+}
+.way h3 { margin: 0 0 0.3rem; font-size: 1.02rem; color: #eef6f4; }
+.way h3 .n { color: var(--accent); font-family: var(--mono); margin-right: 0.4rem; }
+.way p { margin: 0 0 0.7rem; font-size: 0.88rem; color: var(--muted); }
+.way pre {
+  margin: 0; padding: 0.7rem 0.85rem;
+  background: #070d11; border: 1px solid var(--line); border-radius: 6px;
+  font-family: var(--mono); font-size: 0.8rem; line-height: 1.5;
+  color: var(--accent); overflow-x: auto;
+}
+.way pre .c { color: #4b6a70; }
+.way .shells { margin-top: 0.6rem; font-size: 0.8rem; color: var(--muted); }
+.way .shells code { font-family: var(--mono); color: var(--text); background: var(--bg-soft); padding: 0.1rem 0.35rem; border-radius: 4px; }
+
+/* ---------- footer ---------- */
+footer {
+  margin-top: 3rem; padding: 2rem 0 3rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.9rem; color: var(--muted);
+}
+footer .cols { display: flex; flex-wrap: wrap; gap: 2.5rem; }
+footer h4 { margin: 0 0 0.5rem; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--text); }
+footer ul { list-style: none; margin: 0; padding: 0; }
+footer li { margin: 0.25rem 0; }
+footer .fine { margin-top: 1.8rem; font-size: 0.8rem; font-family: var(--mono); }
+
+/* ---------- light scheme (optional, dark is primary) ---------- */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f9f8; --bg-soft: #eef4f2; --bg-card: #ffffff;
+    --line: #d5e0dd; --line-glow: #9ed8c9;
+    --text: #22333a; --muted: #5c7278;
+    --accent: #0b8f6f; --accent-dim: #14a683; --accent-ink: #ffffff;
+    --amber: #a06a12; --blue: #12689e;
+  }
+  .hero h1 { color: #14332c; text-shadow: none; }
+  .term, .way pre { background: #ffffff; }
+  h2, h2 + .sub strong, .card h3, .way h3 { color: #17262b; }
+  .hero p.tag strong, .query .q, .cand.sel, .term-right .pv-title { color: #17262b; }
+  .cand .score, .way pre .c { color: #8fa6ab; }
+  .term-right li.dir, .cand .path b, .query .q b { color: #22333a; }
+}
+
+@media (max-width: 34rem) {
+  nav { gap: 0.9rem; font-size: 0.85rem; }
+  .hero { padding: 2.5rem 0 1.5rem; }
+  .term { font-size: 0.8rem; }
+  .install-box { flex-direction: column; }
+  #copy-btn { border-left: 0; border-top: 1px solid var(--line-glow); padding: 0.6rem; }
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <nav aria-label="Site">
+    <span class="logo"><span class="tick">➜</span> cdh</span>
+    <span class="spacer"></span>
+    <a href="#features">Features</a>
+    <a href="#install">Install</a>
+    <a href="https://github.com/xianyudd/cdh">GitHub</a>
+  </nav>
+</div>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="glow">frequency × recency</p>
+    <h1>cdh</h1>
+    <p class="tag">
+      Jump to the directory you mean, not the one you type.
+      <strong>cdh</strong> scores your shell history with a <strong>frecency</strong>
+      model — visit frequency times recency decay — then opens a terminal UI picker
+      so the right path is one fuzzy search away.
+    </p>
+    <div class="install-box">
+      <code id="install-cmd"><span class="sh">$</span> curl -fsSL https://xianyudd.github.io/cdh/install.sh | bash</code>
+      <button id="copy-btn" type="button" aria-describedby="copy-note">Copy</button>
+    </div>
+    <p class="copy-note" id="copy-note" aria-live="polite">Works with bash, fish and zsh — the installer auto-detects your shell.</p>
+    <p class="meta">
+      <span>v0.3.2</span>·<span>Rust</span>·<span>MIT</span>·<span>MSRV 1.88</span>
+    </p>
+  </div>
+</header>
+
+<main>
+<div class="wrap">
+
+<section id="tui" aria-label="The TUI picker">
+  <h2><span class="k">$</span> A picker that looks like your terminal, because it is one</h2>
+  <p class="sub">
+    One keybinding opens the picker inside your shell. Fuzzy-filter the candidates,
+    read the preview, hit <code>Enter</code> — cdh performs the jump, hands the
+    terminal back, and gets out of the way.
+  </p>
+  <div class="term-scroll">
+    <div class="term" role="img" aria-label="Mock-up of the cdh TUI: a query line reading 'cd', a ranked candidate list with the top entry selected, a preview pane showing directory contents, git branch and last-visit time, and a hint bar listing keyboard shortcuts.">
+      <div class="term-bar" aria-hidden="true">
+        <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+        <span class="title">cdh — directory picker</span>
+        <span class="cube">◈</span>
+      </div>
+      <div class="term-body">
+        <div class="term-left" aria-hidden="true">
+          <p class="query"><span class="prompt">❯</span> <span class="q">~/<b>cd</b>h</span></p>
+          <p class="cand sel"><span class="score">0.9812</span><span class="path">~/work/<b>cd</b>h</span></p>
+          <p class="cand"><span class="score">0.8410</span><span class="path">~/work/<b>cd</b>h/docs</span></p>
+          <p class="cand"><span class="score">0.6247</span><span class="path">~/.cache/<b>cd</b>h</span></p>
+          <p class="cand"><span class="score">0.5193</span><span class="path">~/work/<b>cd</b>h/src/picker</span></p>
+          <p class="cand"><span class="score">0.4071</span><span class="path">~/s<b>cd</b>oc/notes</span></p>
+          <p class="cand"><span class="score">0.3325</span><span class="path">~/work/<b>cd</b>h/docs/design</span></p>
+          <p class="cand"><span class="score">0.2108</span><span class="path">~/ar<b>cd</b>hive/2025</span></p>
+        </div>
+        <div class="term-right" aria-hidden="true">
+          <p class="pv-title">~/work/cdh</p>
+          <p class="pv-git">⎇ main <span class="clean">● clean</span></p>
+          <p class="pv-time">◷ last visit: 2 min ago</p>
+          <ul>
+            <li class="dir">src/</li>
+            <li class="dir">docs/</li>
+            <li class="dir">scripts/</li>
+            <li>Cargo.toml</li>
+            <li>Justfile</li>
+            <li>README.md</li>
+          </ul>
+        </div>
+      </div>
+      <p class="term-hints" aria-hidden="true">
+        <b>Enter</b> jump · <b>Tab</b> preview · <b>Ctrl+D</b> exclude · <b>F1</b> help · <b>F2</b> settings · <b>F4</b> exclusions · <b>Esc</b> quit
+      </p>
+    </div>
+  </div>
+</section>
+
+<section id="features" aria-label="Features">
+  <h2><span class="k">#</span> What you get</h2>
+  <p class="sub">A small binary with a few opinions, all of them about getting you to the right directory faster.</p>
+  <div class="grid">
+    <div class="card">
+      <span class="ic" aria-hidden="true">📉</span>
+      <h3>Frecency scoring that decays</h3>
+      <p>Visit frequency is blended with a recency half-life and fused across multiple signals — so a directory you lived in last month stops crowding out the one you opened five minutes ago, and <code>$HOME</code> no longer bosses the leaderboard.</p>
+    </div>
+    <div class="card">
+      <span class="ic" aria-hidden="true">🔍</span>
+      <h3>Fuzzy search with live preview</h3>
+      <p>Type a fragment, get instant re-filtering. The preview pane shows directory contents, the git branch and dirty state, and when you last visited — before you commit to the jump.</p>
+    </div>
+    <div class="card">
+      <span class="ic" aria-hidden="true">🌳</span>
+      <h3>History plus directory tree</h3>
+      <p>The candidate pool merges your cd history with a background scan of the tree, so directories you have never visited are still findable. <code>Ctrl+D</code> excludes a subtree for good.</p>
+    </div>
+    <div class="card">
+      <span class="ic" aria-hidden="true">🎨</span>
+      <h3>Seven themes</h3>
+      <p>Graphite, Nord, Daylight, Mono, Dracula, Amber and Forest — with full no-colour fallback, because a picker should respect your terminal, not fight it.</p>
+    </div>
+    <div class="card">
+      <span class="ic" aria-hidden="true">🌏</span>
+      <h3>Bilingual interface</h3>
+      <p>The whole TUI speaks English and 中文, switchable in settings. Fullwidth input like <code>？</code> works in the query line too.</p>
+    </div>
+    <div class="card">
+      <span class="ic" aria-hidden="true">🖱️</span>
+      <h3>Mouse support, honest keys</h3>
+      <p>Click to select, double-click to jump, wheel to scroll — and a complete keyboard map (<code>F1</code> help, <code>F2</code> settings, <code>F4</code> exclusion list) for when you never leave the home row.</p>
+    </div>
+    <div class="card">
+      <span class="ic" aria-hidden="true">🧊</span>
+      <h3>A quiet corner cube</h3>
+      <p>A small ambient 3D cube animates in the corner — non-blocking, off in no-colour mode, disableable via environment variable, and never in front of your selected row. Terminal bling with manners.</p>
+    </div>
+    <div class="card">
+      <span class="ic" aria-hidden="true">🦀</span>
+      <h3>One Rust binary, XDG-clean</h3>
+      <p>Single static-friendly binary from Rust with MSRV 1.88. History and state live under <code>~/.local/share/cdh</code> and <code>~/.local/state/cdh</code>; shell integration is a lightweight hook for bash, fish and zsh.</p>
+    </div>
+  </div>
+</section>
+
+<section id="install" aria-label="Installation">
+  <h2><span class="k">λ</span> Three ways in</h2>
+  <p class="sub">Pick whichever fits your machine. The curl installer auto-detects your shell and wires up the hook.</p>
+  <div class="ways">
+    <div class="way">
+      <h3><span class="n">01</span>Curl installer</h3>
+      <p>One line, any of the three shells.</p>
+      <pre><span class="c"># auto-detect shell</span>
+curl -fsSL https://xianyudd.github.io/cdh/install.sh | bash
+
+<span class="c"># or pin a shell explicitly</span>
+curl -fsSL https://xianyudd.github.io/cdh/install.sh \
+  | bash -s -- --shell zsh</pre>
+      <p class="shells">Shell hooks: <code>bash</code> <code>fish</code> <code>zsh</code></p>
+    </div>
+    <div class="way">
+      <h3><span class="n">02</span>cargo install</h3>
+      <p>If you already live in Cargo.</p>
+      <pre>cargo install cdh</pre>
+      <p class="shells">Then add the shell hook with the curl installer, or follow the <a href="https://github.com/xianyudd/cdh/blob/main/README.en.md">README</a>.</p>
+    </div>
+    <div class="way">
+      <h3><span class="n">03</span>GitHub Releases</h3>
+      <p>Prebuilt binaries, no toolchain needed.</p>
+      <pre><span class="c"># example: Linux x86_64</span>
+curl -fsSL https://github.com/xianyudd/cdh/releases/download/\
+v0.3.2/cdh-v0.3.2-x86_64-unknown-linux-gnu.tar.gz \
+  | tar -xz</pre>
+      <p class="shells">Targets: Linux gnu/musl (x86_64, aarch64) · macOS — see <a href="https://github.com/xianyudd/cdh/releases">Releases</a>.</p>
+    </div>
+  </div>
+</section>
+
+</div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="cols">
+      <div>
+        <h4>Project</h4>
+        <ul>
+          <li><a href="https://github.com/xianyudd/cdh">GitHub repository</a></li>
+          <li><a href="https://github.com/xianyudd/cdh/releases">Releases</a></li>
+          <li><a href="https://github.com/xianyudd/cdh/blob/main/CHANGELOG.md">CHANGELOG</a></li>
+          <li><a href="https://github.com/xianyudd/cdh/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Docs</h4>
+        <ul>
+          <li><a href="https://github.com/xianyudd/cdh/blob/main/README.en.md">README (English)</a></li>
+          <li><a href="https://github.com/xianyudd/cdh/blob/main/README.md">README（中文）</a></li>
+          <li><a href="./roadmap.md">Roadmap</a></li>
+          <li><a href="./design/tui-design-principles.md">TUI design principles</a></li>
+          <li><a href="./design/tree-discovery.md">Tree discovery notes</a></li>
+          <li><a href="./install.sh">install.sh</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="fine">cdh v0.3.2 · MIT · Rust (MSRV 1.88) · this page has no external dependencies</p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var btn = document.getElementById("copy-btn");
+  var note = document.getElementById("copy-note");
+  var cmd = document.getElementById("install-cmd");
+  if (!btn || !cmd) { return; }
+  function feedback(msg, ok) {
+    note.textContent = msg;
+    btn.textContent = ok ? "Copied!" : "Copy";
+    if (ok) {
+      setTimeout(function () { btn.textContent = "Copy"; }, 2000);
+    }
+  }
+  btn.addEventListener("click", function () {
+    var text = cmd.textContent.replace(/^\$ /, "").trim();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { feedback("Copied to clipboard — paste it into your terminal.", true); },
+        function () { feedback("Copy failed — select the command manually.", false); }
+      );
+    } else {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        feedback("Copied to clipboard — paste it into your terminal.", true);
+      } catch (e) {
+        feedback("Copy failed — select the command manually.", false);
+      }
+      document.body.removeChild(ta);
+    }
+  });
+})();
+</script>
+
+</body>
+</html>
