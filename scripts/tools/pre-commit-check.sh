@@ -24,9 +24,12 @@ if command -v just > /dev/null 2>&1; then
   just shell-lint
   cargo test --locked --all
 else
+  # 与 Justfile 的 shellfmt / shellfmt-check / shell-lint 三条配方对齐：.githooks 里的
+  # 钩子没有 .sh 后缀（git 按文件名认钩子），所以那条 find 不带 -name 过滤。没 just 的
+  # 机器上这两条走不到 .githooks 的话，「检查存在」照样会漏掉钩子自己。
   cargo fmt --check
-  shfmt -d -i 2 -ci -bn -sr docs/install.sh $(find scripts -type f -name '*.sh' | sort)
-  for f in $(find scripts -type f -name '*.sh' | sort) docs/install.sh; do
+  shfmt -d -i 2 -ci -bn -sr docs/install.sh $(find scripts -type f -name '*.sh' | sort) $(find .githooks -type f | sort)
+  for f in $(find scripts -type f -name '*.sh' | sort) $(find .githooks -type f | sort) docs/install.sh; do
     bash -n "$f"
   done
   cargo test --locked --all
