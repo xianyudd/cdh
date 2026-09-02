@@ -139,56 +139,37 @@ h2 .k { color: var(--accent); font-family: var(--mono); }
 .dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; opacity: 0.85; }
 .dot.r { background: #e0655a; } .dot.y { background: #e0b355; } .dot.g { background: #58c47a; }
 .term-bar .title { margin-left: 0.6rem; font-family: var(--mono); font-size: 0.78rem; color: var(--muted); }
-.term-bar .cube {
-  margin-left: auto; font-family: var(--mono); font-size: 0.78rem;
-  color: var(--accent-dim); animation: spin 9s linear infinite;
-  display: inline-block;
+.term-bar .demo-ctl { margin-left: auto; display: flex; align-items: center; gap: 0.3rem; }
+.term-bar .demo-ctl button {
+  font-family: var(--mono); font-size: 0.72rem; line-height: 1;
+  color: var(--muted); background: transparent;
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 0.28rem 0.5rem; cursor: pointer; min-width: 1.9rem;
 }
-@keyframes spin { to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) { .term-bar .cube { animation: none; } }
+.term-bar .demo-ctl button:hover { color: var(--accent); border-color: var(--line-glow); }
+#demo-pos { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); margin-left: 0.25rem; }
 
-.term-body {
-  display: grid; grid-template-columns: 1.35fr 1fr;
-  font-family: var(--mono); font-size: 0.85rem; line-height: 1.55;
+/* recorded demo screen */
+.demo { overflow-x: auto; background: rgb(20, 24, 34); }
+.demo-frame {
+  padding: 0.55rem 0.8rem;
+  font-family: var(--mono); font-size: 0.8rem; line-height: 1.4;
+  white-space: pre; width: max-content; min-width: 100%;
 }
-.term-left { padding: 0.7rem 0.9rem 0.4rem; }
-.query { color: var(--text); margin-bottom: 0.6rem; }
-.query .prompt { color: var(--accent); font-weight: 700; }
-.query .q { color: #f2f8f7; }
-.query .q b { color: var(--accent); font-weight: 700; }
-.cand { color: var(--muted); white-space: nowrap; }
-.cand .score { color: #4b6a70; padding-right: 0.6rem; }
-.cand .path b { color: var(--text); font-weight: 700; }
-.cand.sel {
-  background: linear-gradient(90deg, rgba(53, 224, 184, 0.22), rgba(53, 224, 184, 0.05));
-  border-left: 2px solid var(--accent);
-  color: #f2f8f7; margin-left: -0.5rem; padding-left: 0.5rem;
-}
-.cand.sel .score { color: var(--accent); }
-.cand.sel .path b { color: var(--accent); }
-
-.term-right {
-  border-left: 1px solid var(--line);
-  padding: 0.7rem 0.9rem 0.4rem;
-  color: var(--muted);
-}
-.term-right .pv-title { color: var(--text); margin-bottom: 0.5rem; }
-.term-right .pv-title::before { content: "▸ "; color: var(--accent); }
-.pv-git { color: var(--amber); }
-.pv-git .clean { color: #6fd39a; }
-.pv-time { color: var(--blue); }
-.term-right ul { margin: 0.3rem 0 0.5rem; padding-left: 1.1rem; }
-.term-right li { white-space: nowrap; }
-.term-right li.dir { color: var(--text); }
-
-.term-hints {
+.demo-caption {
+  display: flex; align-items: baseline; gap: 0.6rem; margin: 0;
   border-top: 1px solid var(--line);
   background: var(--bg-soft);
   padding: 0.45rem 0.9rem;
-  font-family: var(--mono); font-size: 0.75rem; color: var(--muted);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 0.82rem; color: var(--muted);
 }
-.term-hints b { color: var(--accent); font-weight: 700; }
+.demo-caption .tag {
+  flex: none; font-family: var(--mono); font-size: 0.68rem;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--accent-dim); border: 1px solid var(--line-glow);
+  border-radius: 4px; padding: 0.05rem 0.4rem;
+}
+.demo-note { margin: 0.7rem 0 0; font-size: 0.8rem; color: var(--muted); }
 
 /* ---------- features ---------- */
 .grid {
@@ -249,9 +230,8 @@ footer .fine { margin-top: 1.8rem; font-size: 0.8rem; font-family: var(--mono); 
   .hero h1 { color: #14332c; text-shadow: none; }
   .term, .way pre { background: #ffffff; }
   h2, h2 + .sub strong, .card h3, .way h3 { color: #17262b; }
-  .hero p.tag strong, .query .q, .cand.sel, .term-right .pv-title { color: #17262b; }
-  .cand .score, .way pre .c { color: #8fa6ab; }
-  .term-right li.dir, .cand .path b, .query .q b { color: #22333a; }
+  .hero p.tag strong { color: #17262b; }
+  .way pre .c { color: #8fa6ab; }
 }
 
 @media (max-width: 34rem) {
@@ -307,42 +287,31 @@ footer .fine { margin-top: 1.8rem; font-size: 0.8rem; font-family: var(--mono); 
     terminal back, and gets out of the way.
   </p>
   <div class="term-scroll">
-    <div class="term" role="img" aria-label="Mock-up of the cdh TUI: a query line reading 'cd', a ranked candidate list with the top entry selected, a preview pane showing directory contents, git branch and last-visit time, and a hint bar listing keyboard shortcuts.">
-      <div class="term-bar" aria-hidden="true">
-        <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-        <span class="title">cdh — directory picker</span>
-        <span class="cube">◈</span>
-      </div>
-      <div class="term-body">
-        <div class="term-left" aria-hidden="true">
-          <p class="query"><span class="prompt">❯</span> <span class="q">~/<b>cd</b>h</span></p>
-          <p class="cand sel"><span class="score">0.9812</span><span class="path">~/work/<b>cd</b>h</span></p>
-          <p class="cand"><span class="score">0.8410</span><span class="path">~/work/<b>cd</b>h/docs</span></p>
-          <p class="cand"><span class="score">0.6247</span><span class="path">~/.cache/<b>cd</b>h</span></p>
-          <p class="cand"><span class="score">0.5193</span><span class="path">~/work/<b>cd</b>h/src/picker</span></p>
-          <p class="cand"><span class="score">0.4071</span><span class="path">~/s<b>cd</b>oc/notes</span></p>
-          <p class="cand"><span class="score">0.3325</span><span class="path">~/work/<b>cd</b>h/docs/design</span></p>
-          <p class="cand"><span class="score">0.2108</span><span class="path">~/ar<b>cd</b>hive/2025</span></p>
-        </div>
-        <div class="term-right" aria-hidden="true">
-          <p class="pv-title">~/work/cdh</p>
-          <p class="pv-git">⎇ main <span class="clean">● clean</span></p>
-          <p class="pv-time">◷ last visit: 2 min ago</p>
-          <ul>
-            <li class="dir">src/</li>
-            <li class="dir">docs/</li>
-            <li class="dir">scripts/</li>
-            <li>Cargo.toml</li>
-            <li>Justfile</li>
-            <li>README.md</li>
-          </ul>
+    <div class="term" role="group" aria-label="Recorded cdh TUI session, eight frames with playback controls">
+      <div class="term-bar">
+        <span class="dot r" aria-hidden="true"></span><span class="dot y" aria-hidden="true"></span><span class="dot g" aria-hidden="true"></span>
+        <span class="title">cdh — recorded session</span>
+        <div class="demo-ctl">
+          <button id="demo-prev" type="button" aria-label="Previous frame">&#9664;</button>
+          <button id="demo-play" type="button" aria-label="Play demo">&#9654;</button>
+          <button id="demo-next" type="button" aria-label="Next frame">&#9654;&#9654;</button>
+          <span id="demo-pos" aria-hidden="true">1/8</span>
         </div>
       </div>
-      <p class="term-hints" aria-hidden="true">
-        <b>Enter</b> jump · <b>Tab</b> preview · <b>Ctrl+D</b> exclude · <b>F1</b> help · <b>F2</b> settings · <b>F4</b> exclusions · <b>Esc</b> quit
+      <div class="demo">
+        <div class="demo-frame" id="demo-frame" aria-live="off"><div><span style="color:rgb(232,238,255);font-weight:700;">cdh</span><span style="color:rgb(125,137,166);">1–23 / 23 · Page 1/1</span></div><div><span style="color:rgb(168,184,255);">❯ ▏</span><span style="color:rgb(125,137,166);">Search paths…</span></div><div><span style="color:rgb(81,95,125);">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span></div><div><span style="color:rgb(195,232,141);background:rgb(53,69,106);font-weight:700;">›</span><span style="color:rgb(247,249,255);background:rgb(53,69,106);"> 1  </span><span style="color:rgb(125,137,166);background:rgb(53,69,106);">~/projects/</span><span style="color:rgb(247,249,255);background:rgb(53,69,106);font-weight:700;">awesome-app</span><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(232,238,255);font-weight:700;">awesome-app</span></div><div><span style="color:rgb(216,225,245);">  2  </span><span style="color:rgb(125,137,166);">~/projects/</span><span style="color:rgb(216,225,245);font-weight:700;">api-server</span><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(125,137,166);">/tmp/cdh-demo-home/projects/awesome-app</span></div><div><span style="color:rgb(216,225,245);">  3  </span><span style="color:rgb(125,137,166);">~/projects/</span><span style="color:rgb(216,225,245);font-weight:700;">cli-tools</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(216,225,245);">  4  </span><span style="color:rgb(125,137,166);">~/work/</span><span style="color:rgb(216,225,245);font-weight:700;">quarterly-report</span><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(125,137,166);">Git: </span><span style="color:rgb(255,203,107);">● </span><span style="color:rgb(216,225,245);">main</span><span style="color:rgb(125,137,166);"> · </span><span style="color:rgb(255,203,107);">modified</span></div><div><span style="color:rgb(216,225,245);">  5  </span><span style="color:rgb(125,137,166);">~/study/</span><span style="color:rgb(216,225,245);font-weight:700;">rust-book</span><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(125,137,166);">Last visit: </span><span style="color:rgb(216,225,245);">10 minutes ago</span></div><div><span style="color:rgb(216,225,245);">  6  </span><span style="color:rgb(125,137,166);">~/study/</span><span style="color:rgb(216,225,245);font-weight:700;">wasm-notes</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(216,225,245);">  7  </span><span style="color:rgb(216,225,245);font-weight:700;">~</span><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(125,137,166);">▸ </span><span style="color:rgb(216,225,245);">.git</span></div><div><span style="color:rgb(216,225,245);">  8  </span><span style="color:rgb(125,137,166);">~/</span><span style="color:rgb(216,225,245);font-weight:700;">.config</span><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(125,137,166);">▸ </span><span style="color:rgb(216,225,245);">src</span></div><div><span style="color:rgb(216,225,245);">  9  </span><span style="color:rgb(125,137,166);">~/.config/</span><span style="color:rgb(216,225,245);font-weight:700;">cdh</span><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(125,137,166);">▸ </span><span style="color:rgb(216,225,245);">tests</span></div><div><span style="color:rgb(216,225,245);"> 10  </span><span style="color:rgb(125,137,166);">~/</span><span style="color:rgb(216,225,245);font-weight:700;">.local</span><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(125,137,166);">· </span><span style="color:rgb(216,225,245);">Cargo.toml</span></div><div><span style="color:rgb(216,225,245);"> 11  </span><span style="color:rgb(125,137,166);">~/.local/</span><span style="color:rgb(216,225,245);font-weight:700;">share</span><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(125,137,166);">· </span><span style="color:rgb(216,225,245);">README.md</span></div><div><span style="color:rgb(216,225,245);"> 12  </span><span style="color:rgb(125,137,166);">~/.local/share/</span><span style="color:rgb(216,225,245);font-weight:700;">cdh</span><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(125,137,166);">· </span><span style="color:rgb(216,225,245);">TODO.md</span></div><div><span style="color:rgb(216,225,245);"> 13  </span><span style="color:rgb(125,137,166);">~/.local/share/cdh/</span><span style="color:rgb(216,225,245);font-weight:700;">history</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(216,225,245);"> 14  </span><span style="color:rgb(125,137,166);">~/.local/</span><span style="color:rgb(216,225,245);font-weight:700;">state</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(216,225,245);"> 15  </span><span style="color:rgb(125,137,166);">~/.local/state/</span><span style="color:rgb(216,225,245);font-weight:700;">cdh</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(216,225,245);"> 16  </span><span style="color:rgb(125,137,166);">~/</span><span style="color:rgb(216,225,245);font-weight:700;">projects</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(216,225,245);"> 17  </span><span style="color:rgb(125,137,166);">~/projects/api-server/</span><span style="color:rgb(216,225,245);font-weight:700;">src</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(216,225,245);"> 18  </span><span style="color:rgb(125,137,166);">~/projects/awesome-app/</span><span style="color:rgb(216,225,245);font-weight:700;">src</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(216,225,245);"> 19  </span><span style="color:rgb(125,137,166);">~/projects/awesome-app/</span><span style="color:rgb(216,225,245);font-weight:700;">tests</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(216,225,245);"> 20  </span><span style="color:rgb(125,137,166);">~/</span><span style="color:rgb(216,225,245);font-weight:700;">study</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(216,225,245);"> 21  </span><span style="color:rgb(125,137,166);">~/</span><span style="color:rgb(216,225,245);font-weight:700;">tmp</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(216,225,245);"> 22  </span><span style="color:rgb(125,137,166);">~/tmp/</span><span style="color:rgb(216,225,245);font-weight:700;">scratch</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(216,225,245);"> 23  </span><span style="color:rgb(125,137,166);">~/</span><span style="color:rgb(216,225,245);font-weight:700;">work</span><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(81,95,125);">│</span></div><div><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(227,234,255);">⣀</span><span style="color:rgb(225,232,255);">⣀</span><span style="color:rgb(222,230,255);">⣀</span><span style="color:rgb(220,228,255);">⣀</span><span style="color:rgb(218,226,255);">⣀</span><span style="color:rgb(215,224,255);">⣀</span><span style="color:rgb(213,222,255);">⣀</span><span style="color:rgb(211,220,255);">⣀</span><span style="color:rgb(208,218,255);">⣀</span><span style="color:rgb(207,217,255);">⡀</span></div><div><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(157,172,239);">⠸</span><span style="color:rgb(176,191,255);">⣿</span><span style="color:rgb(137,151,209);">⡅</span><span style="color:rgb(194,206,255);">⡇</span></div><div><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(172,187,255);">⣿</span><span style="color:rgb(145,159,220);">⡇</span><span style="color:rgb(139,152,211);">⢠</span><span style="color:rgb(160,175,243);">⡇</span></div><div><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(196,208,255);">⣇</span><span style="color:rgb(155,170,236);">⡇</span><span style="color:rgb(160,175,243);">⢸</span><span style="color:rgb(131,144,200);">⠃</span></div><div><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(191,203,255);">⣿</span><span style="color:rgb(132,145,201);">⠁</span><span style="color:rgb(127,140,193);">⢀</span><span style="color:rgb(172,188,255);">⣸</span></div><div><span style="color:rgb(81,95,125);">│</span><span style="color:rgb(183,197,255);">⠙</span><span style="color:rgb(156,170,236);">⠋</span><span style="color:rgb(175,190,255);">⠉</span><span style="color:rgb(184,198,255);">⠉</span><span style="color:rgb(190,203,255);">⠉</span><span style="color:rgb(180,194,255);">⠉</span><span style="color:rgb(166,182,252);">⠉</span><span style="color:rgb(151,165,229);">⠉</span><span style="color:rgb(140,153,212);">⠁</span></div><div><span style="color:rgb(81,95,125);">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span></div><div><span style="color:rgb(168,184,255);font-weight:700;">↑↓</span><span style="color:rgb(125,137,166);"> Select</span><span style="color:rgb(81,95,125);"> · </span><span style="color:rgb(168,184,255);font-weight:700;">Ctrl+↑↓</span><span style="color:rgb(125,137,166);"> Page</span><span style="color:rgb(81,95,125);"> · </span><span style="color:rgb(168,184,255);font-weight:700;">Ctrl+H</span><span style="color:rgb(125,137,166);"> Hidden dirs</span><span style="color:rgb(81,95,125);"> · </span><span style="color:rgb(168,184,255);font-weight:700;">Enter</span><span style="color:rgb(125,137,166);"> Jump</span><span style="color:rgb(81,95,125);"> · </span><span style="color:rgb(168,184,255);font-weight:700;">Tab</span><span style="color:rgb(125,137,166);"> Preview</span><span style="color:rgb(81,95,125);"> · </span><span style="color:rgb(168,184,255);font-weight:700;">F1</span><span style="color:rgb(125,137,166);"> Help</span><span style="color:rgb(81,95,125);"> · </span><span style="color:rgb(168,184,255);font-weight:700;">F2</span><span style="color:rgb(125,137,166);"> Settings</span><span style="color:rgb(81,95,125);"> · </span><span style="color:rgb(168,184,255);font-weight:700;">Esc</span><span style="color:rgb(125,137,166);"> Exit</span></div></div>
+      </div>
+      <p class="demo-caption">
+        <span class="tag">recorded demo</span>
+        <span id="demo-caption-text">Candidates ranked by frecency — most-used paths float to the top</span>
       </p>
     </div>
   </div>
+  <p class="demo-note">
+    A real cdh session captured in tmux (isolated demo home, no mock-up). Playback
+    stays on the first frame if your system prefers reduced motion — the arrow
+    buttons still step through it.
+  </p>
 </section>
 
 <section id="features" aria-label="Features">
@@ -490,6 +459,67 @@ v0.3.2/cdh-v0.3.2-x86_64-unknown-linux-gnu.tar.gz \
       document.body.removeChild(ta);
     }
   });
+})();
+</script>
+
+<script src="./demo-frames.js"></script>
+<script>
+(function () {
+  var data = window.CDH_DEMO;
+  if (!data || !data.frames || !data.frames.length) { return; }
+  var frameEl = document.getElementById("demo-frame");
+  var capEl = document.getElementById("demo-caption-text");
+  var playBtn = document.getElementById("demo-play");
+  if (!frameEl || !capEl || !playBtn) { return; }
+  var prevBtn = document.getElementById("demo-prev");
+  var nextBtn = document.getElementById("demo-next");
+  var posEl = document.getElementById("demo-pos");
+  var BASE_BG = "(20, 24, 34)";
+  var n = data.frames.length;
+  function esc(t) {
+    return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  function renderFrame(frame) {
+    return frame.map(function (row) {
+      var html = "";
+      for (var i = 0; i < row.length; i++) {
+        var seg = row[i], text = seg[1];
+        if (!text) { continue; }
+        var s = data.styles[seg[0]];
+        var css = "";
+        if (s[0] !== "None") { css += "color:rgb(" + s[0].replace(/[() ]/g, "") + ");"; }
+        if (s[1] !== "None" && s[1] !== BASE_BG) { css += "background:rgb(" + s[1].replace(/[() ]/g, "") + ");"; }
+        if (s[2]) { css += "font-weight:700;"; }
+        html += css ? '<span style="' + css + '">' + esc(text) + "</span>" : esc(text);
+      }
+      return "<div>" + html + "</div>";
+    }).join("");
+  }
+  var frames = data.frames.map(renderFrame);
+  var i = 0, timer = null;
+  function show(k) {
+    i = ((k % n) + n) % n;
+    frameEl.innerHTML = frames[i];
+    capEl.textContent = data.captions[i] || "";
+    if (posEl) { posEl.textContent = (i + 1) + "/" + n; }
+  }
+  function stop() {
+    if (timer) { clearInterval(timer); timer = null; }
+    playBtn.innerHTML = "&#9654;";
+    playBtn.setAttribute("aria-label", "Play demo");
+  }
+  function start() {
+    stop();
+    timer = setInterval(function () { show(i + 1); }, 1600);
+    playBtn.innerHTML = "&#10074;&#10074;";
+    playBtn.setAttribute("aria-label", "Pause demo");
+  }
+  playBtn.addEventListener("click", function () { timer ? stop() : start(); });
+  if (prevBtn) { prevBtn.addEventListener("click", function () { stop(); show(i - 1); }); }
+  if (nextBtn) { nextBtn.addEventListener("click", function () { stop(); show(i + 1); }); }
+  show(0);
+  var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!reduced) { start(); }
 })();
 </script>
 
