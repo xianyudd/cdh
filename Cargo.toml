@@ -2,7 +2,7 @@
 name = "cdh"
 version = "0.3.2"
 edition = "2021"                     # 若你确实用了 2024 特性，可改为 "2024"
-rust-version = "1.74"                # 最低编译版本（受 ratatui 0.29 约束）
+rust-version = "1.88"                # 最低编译版本（受 ratatui 0.30 约束；依赖解冻战役，2026-09-02 用户裁定 MSRV 1.74→1.88）
 description = "A frecency-based smart directory jumper with a lightweight TUI."
 readme = "README.md"
 repository = "https://github.com/xianyudd/cdh"

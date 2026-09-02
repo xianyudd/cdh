@@ -60,3 +60,10 @@ updates:
     # `ci` 在 scope 白名单里。
     commit-message:
       prefix: "chore(ci)"
+    # dtolnay/rust-toolchain 不许动：MSRV job 引用它装的是 Cargo.toml
+    # rust-version（1.74）那个 pinned 版本，Dependabot 把引用里的 @1.74 当成
+    # 过时 action tag 报「1.74 → 1.100」（见 #22），合了就拆掉 MSRV 的 CI 固化
+    # （roadmap #5）。版本一致性由 ci.yml 的 assert 步骤守着，这里 ignore 是
+    # 双保险——主防线是把版本移进 toolchain 参数、引用钉 @master。
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
