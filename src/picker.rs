@@ -4004,10 +4004,10 @@ mod tests {
 
     #[test]
     fn mouse_click_selects_the_clicked_list_row() {
-        // End to end through the render-to-mouse channel: a rendered frame
-        // publishes the list geometry, and a click inside row N of that
-        // geometry selects result N. The expected row comes from the
-        // independently derived list area, not from the renderer's output.
+        // Through the render-to-mouse mapping: a rendered frame publishes
+        // the list geometry, and a click inside row N of that geometry
+        // selects result N. The expected row comes from the independently
+        // derived list area, not from the renderer's output.
         let full = Rect::new(0, 0, 80, 24);
         let list = independently_derived_list_area(full);
 
@@ -4082,6 +4082,39 @@ mod tests {
         app.filtered_results.truncate(2);
         click(&mut app, list.x + 4, list.y + 3);
         assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn mouse_click_maps_screen_rows_through_the_page_start() {
+        // A page-2 row sits at screen offset N but global index
+        // page_size + N -- the published geometry's `start` half is what
+        // carries that offset. Expected indices come from the independently
+        // derived page size (the list area's height), not from `PageWindow`.
+        let full = Rect::new(0, 0, 80, 24);
+        let list = independently_derived_list_area(full);
+        let page_size = list.height as usize;
+
+        let mut app = list_render_app(full, 25);
+        app.set_selected(page_size);
+        render_frame(&mut app, full.width, full.height);
+        click(&mut app, list.x + 4, list.y + 3);
+        assert_eq!(app.selected_index, page_size + 3);
+        assert_eq!(
+            app.selected_raw().as_deref(),
+            Some("/home/jason/workspace/project-22")
+        );
+
+        // A later page on a bigger pool, so the offset under test is never
+        // the first page size.
+        let mut app = list_render_app(full, 45);
+        app.set_selected(page_size * 2);
+        render_frame(&mut app, full.width, full.height);
+        click(&mut app, list.x + 2, list.y + 5);
+        assert_eq!(app.selected_index, page_size * 2 + 5);
+        assert_eq!(
+            app.selected_raw().as_deref(),
+            Some("/home/jason/workspace/project-43")
+        );
     }
 
     #[test]
@@ -4247,10 +4280,11 @@ mod tests {
         )
     }
 
-    /// A full frame plus the mouse-hit geometry a real frame publishes: the
-    /// production loop stores the list geometry after drawing, and the click
-    /// tests exercise exactly that render-to-mouse channel end to end. This
-    /// is `render_buffer` for callers that go on to click.
+    /// A full frame plus the list geometry stored back the way `run_ui`
+    /// stores it after a successful draw. This is a test-side mirror of that
+    /// handoff, not the production path: the geometry comes from the same
+    /// `draw` return value the event loop consumes, and the click tests then
+    /// exercise `handle_mouse`'s row-to-result mapping against it.
     fn render_frame(app: &mut App, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
