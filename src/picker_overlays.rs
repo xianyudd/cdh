@@ -99,7 +99,7 @@ mod help {
 
     fn row(key: &str, description: &str, theme: &Theme) -> Line<'static> {
         const KEY_WIDTH: usize = 21;
-        let padding = KEY_WIDTH.saturating_sub(UnicodeWidthStr::width(key));
+        let padding = KEY_WIDTH.saturating_sub(UnicodeWidthStr::width(key)).max(1);
         Line::from(vec![
             Span::styled(format!("{key}{}", " ".repeat(padding)), theme.accent()),
             Span::styled(description.to_string(), theme.primary()),

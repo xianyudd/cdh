@@ -2452,6 +2452,24 @@ fn help_lists_both_page_key_sets_and_query_editing_controls() {
 }
 
 #[test]
+fn help_rows_keep_a_gutter_when_the_key_outgrows_the_column() {
+    let theme = Theme::new(false);
+    for language in [Language::ZhCn, Language::En] {
+        for line in overlays::help_lines(language, &theme) {
+            let [key, description] = line.spans.as_slice() else {
+                continue;
+            };
+            assert!(
+                key.content.ends_with(' '),
+                "{:?} runs straight into {:?}",
+                key.content,
+                description.content
+            );
+        }
+    }
+}
+
+#[test]
 fn all_help_shortcuts_open_help_without_entering_search() {
     for (code, modifiers) in [
         (KeyCode::F(1), KeyModifiers::NONE),
