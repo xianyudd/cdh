@@ -3877,6 +3877,98 @@ mod tests {
         assert!(!mouse_event_enabled(&control, Mode::Normal));
     }
 
+    /// `list_render_app` with the preview panel on, for click tests that need
+    /// chrome beside the list. The worker stays absent: rendering never
+    /// consults it, only the event loop does.
+    fn preview_click_app(full: Rect, count: usize) -> App {
+        let mut app = list_render_app(full, count);
+        app.preview_visible = true;
+        app.set_page_size(page_size_for(full, true, false));
+        app
+    }
+
+    #[test]
+    fn mouse_click_selects_the_clicked_list_row() {
+        // End to end through the render-to-mouse channel: a rendered frame
+        // publishes the list geometry, and a click inside row N of that
+        // geometry selects result N. The expected row comes from the
+        // independently derived list area, not from the renderer's output.
+        let full = Rect::new(0, 0, 80, 24);
+        let list = independently_derived_list_area(full);
+
+        let mut app = list_render_app(full, 6);
+        render_frame(&mut app, full.width, full.height);
+        click(&mut app, list.x + 4, list.y + 2);
+        assert_eq!(app.selected_index, 2);
+        assert_eq!(
+            app.selected_raw().as_deref(),
+            Some("/home/jason/workspace/project-02")
+        );
+
+        // A different row on a different candidate set, so the hit is not an
+        // accident of one geometry or one pool.
+        let mut app = list_render_app(full, 12);
+        render_frame(&mut app, full.width, full.height);
+        click(&mut app, list.x + 1, list.y + 7);
+        assert_eq!(app.selected_index, 7);
+        assert_eq!(
+            app.selected_raw().as_deref(),
+            Some("/home/jason/workspace/project-07")
+        );
+    }
+
+    #[test]
+    fn mouse_click_outside_the_list_keeps_the_selection() {
+        let full = Rect::new(0, 0, 80, 24);
+        let list = independently_derived_list_area(full);
+        let mut app = list_render_app(full, 6);
+        app.set_selected(1);
+        render_frame(&mut app, full.width, full.height);
+
+        // Below the list (the divider/footer rows) and the side padding
+        // column at a valid list row are both off-target.
+        click(&mut app, list.x + 4, list.y + list.height);
+        click(&mut app, list.x.saturating_sub(1), list.y + 1);
+        assert_eq!(app.selected_index, 1);
+
+        // The preview panel is chrome, not a list row: a click there must not
+        // move the selection either. The click column is read off the frame
+        // itself -- wherever the preview's own placeholder renders is inside
+        // the preview panel by construction, and never inside the list.
+        let wide = Rect::new(0, 0, 110, 24);
+        let mut app = preview_click_app(wide, 6);
+        app.set_selected(1);
+        let buffer = render_frame(&mut app, wide.width, wide.height);
+        let loading_row = buffer_row_containing(&buffer, "加载中");
+        let preview_column = (0..wide.width)
+            .find(|&x| buffer[(x, loading_row)].symbol() == "加")
+            .expect("loading glyph on the preview row");
+        click(&mut app, preview_column, loading_row);
+        assert_eq!(app.selected_index, 1);
+    }
+
+    #[test]
+    fn mouse_click_below_the_last_row_of_a_short_tail_page_keeps_the_selection() {
+        let full = Rect::new(0, 0, 80, 24);
+        let list = independently_derived_list_area(full);
+        let mut app = list_render_app(full, 3);
+        app.set_selected(1);
+        render_frame(&mut app, full.width, full.height);
+        // The page holds 3 of 19 rows; the row under the last populated one is
+        // inside the terminal but past the results.
+        click(&mut app, list.x + 4, list.y + 3);
+        assert_eq!(app.selected_index, 1);
+
+        // The same guard when the geometry is a frame behind the pool: the
+        // results shrank after the last draw, so the hit passes the area check
+        // but lands past the end of the filtered set.
+        let mut app = list_render_app(full, 6);
+        render_frame(&mut app, full.width, full.height);
+        app.filtered_results.truncate(2);
+        click(&mut app, list.x + 4, list.y + 3);
+        assert_eq!(app.selected_index, 0);
+    }
+
     #[test]
     fn restore_screen_emits_mouse_cleanup_before_leaving_the_alternate_screen() {
         // The panic hook passes `true` unconditionally because it cannot see the
@@ -4007,6 +4099,45 @@ mod tests {
             cube::WIDTH,
             cube::HEIGHT,
         )
+    }
+
+    /// Derive the list area from the terminal contract rather than from the
+    /// production `ScreenLayout`: one side-padding column, three fixed rows
+    /// above the content, two fixed rows below it, and no preview or cube.
+    /// The click tests below turn rows into expected selections through this
+    /// derivation, so a renderer that moved the list fails them.
+    fn independently_derived_list_area(full: Rect) -> Rect {
+        const SIDE_PADDING: u16 = 1;
+        const CONTENT_TOP_ROWS: u16 = 3;
+        const CONTENT_BOTTOM_ROWS: u16 = 2;
+        Rect::new(
+            full.x + SIDE_PADDING,
+            full.y + CONTENT_TOP_ROWS,
+            full.width.saturating_sub(SIDE_PADDING * 2),
+            full.height
+                .saturating_sub(CONTENT_TOP_ROWS + CONTENT_BOTTOM_ROWS),
+        )
+    }
+
+    /// A full frame plus the mouse-hit geometry a real frame publishes: the
+    /// production loop stores the list geometry after drawing, and the click
+    /// tests exercise exactly that render-to-mouse channel end to end. This
+    /// is `render_buffer` for callers that go on to click.
+    fn render_frame(app: &mut App, width: u16, height: u16) -> Buffer {
+        render_buffer(app, width, height, true)
+    }
+
+    /// A left-button press at `column`/`row`, as crossterm would deliver it.
+    fn click(app: &mut App, column: u16, row: u16) {
+        handle_mouse(
+            app,
+            event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
     }
 
     fn cube_render_app(full: Rect) -> App {
@@ -6948,6 +7079,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A preview-visible app with the side panel laid out for `full`, ready
+    /// for frame-level assertions about the panel's contents.
+    fn preview_panel_app(full: Rect, raw: &str) -> App {
+        let mut app = App::with_preview_worker(build_candidates(&recs(&[(raw, 0.9)])), None, true);
+        app.home = Some("/home/jason".to_string());
+        app.set_page_size(page_size_for(full, true, false));
+        app
+    }
+
+    #[test]
+    fn preview_panel_frame_renders_directory_entries_from_current_data() {
+        // Data state: the selected row's preview arrived, so the panel shows
+        // its entries -- and no loading placeholder.
+        let full = Rect::new(0, 0, 110, 24);
+        let mut app = preview_panel_app(full, "/home/jason/target");
+        app.preview_current = Some((
+            "/home/jason/target".to_string(),
+            preview_data(&["alpha", "beta"]),
+        ));
+        let text = buffer_text(&render_buffer(&app, full.width, full.height, true));
+        assert!(text.contains("alpha"), "entry names missing:\n{text}");
+        assert!(text.contains("beta"), "entry names missing:\n{text}");
+        assert!(!text.contains("加载中"), "data state must not show loading");
+    }
+
+    #[test]
+    fn preview_panel_frame_renders_loading_placeholder_while_pending() {
+        // Loading state: a request for the selected row is in flight, so the
+        // panel shows the placeholder instead of whatever it last showed.
+        let full = Rect::new(0, 0, 110, 24);
+        let mut app = preview_panel_app(full, "/home/jason/target");
+        app.preview_loading = Some("/home/jason/target".to_string());
+        app.preview_current = Some((
+            "/home/jason/target".to_string(),
+            preview_data(&["stale-entry"]),
+        ));
+        let text = buffer_text(&render_buffer(&app, full.width, full.height, true));
+        assert!(
+            text.contains("加载中…"),
+            "loading placeholder missing:\n{text}"
+        );
+        assert!(
+            !text.contains("stale-entry"),
+            "loading must win over the previous contents"
+        );
     }
 
     fn preview_data(names: &[&str]) -> PreviewOutcome {
