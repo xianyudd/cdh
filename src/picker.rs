@@ -60,7 +60,8 @@ use crate::{history, AppContext, Paths};
 use i18n::resolve_language;
 use i18n::{detect_locale_language, Language, TextKey};
 use settings::{
-    LanguagePreference, SettingKey, SettingsLoad, UiEnvironment, UiPreferences, UiSettings,
+    LanguagePreference, SettingKey, SettingLocks, SettingsLoad, UiEnvironment, UiPreferences,
+    UiSettings,
 };
 
 const MIN_HEIGHT: u16 = 8;
@@ -1536,6 +1537,36 @@ impl App {
         self.total_pages = page.page_count;
     }
 
+    /// Snapshot everything rendering reads, once per frame. Drawing then
+    /// consumes only the snapshot, never `App` -- no chance for a render to
+    /// disagree with the state another renderer saw in the same frame.
+    fn view(&self) -> FrameView<'_> {
+        let preview_panel = match self.selected_candidate() {
+            Some(candidate) => preview_outcome_for_selected(self, candidate),
+            // No selection means the preview header shows the no-selection
+            // message before the panel outcome is ever consulted.
+            None => PreviewPanelOutcome::Loading,
+        };
+        FrameView {
+            language: self.language,
+            prefs: self.settings.effective(),
+            locked: self.settings.locks(),
+            exclude_roots: self.excludes.roots(),
+            home: self.home.as_deref(),
+            query: &self.query,
+            query_cursor: self.query_cursor,
+            results: &self.filtered_results,
+            candidates: &self.candidates,
+            page: self.page(),
+            selected_index: self.selected_index,
+            preview_visible: self.preview_visible,
+            preview_panel,
+            notice: self.notice.as_deref(),
+            mode: self.mode,
+            corner: self.corner_3d_enabled(),
+        }
+    }
+
     fn set_page_size(&mut self, page_size: usize) -> bool {
         let page_size = page_size.max(1);
         if self.page_size == page_size {
@@ -2317,10 +2348,16 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
         }
         if dirty {
             let corner_angle = app.corner_anim_angle(Instant::now());
+            let mut list_geometry = None;
             terminal.draw(|frame| {
                 let theme = Theme::with_choice(app.color_enabled, app.theme_choice);
-                draw(frame, &app, &theme, corner_angle);
+                let view = app.view();
+                list_geometry = draw(frame, &view, &theme, corner_angle);
             })?;
+            if let Some(geometry) = list_geometry {
+                app.last_list_area.set(geometry.area);
+                app.last_list_start.set(geometry.start);
+            }
             dirty = false;
         }
 
@@ -2785,54 +2822,115 @@ fn page_size_for(full: Rect, preview_visible: bool, corner_enabled: bool) -> usi
         .unwrap_or(1)
 }
 
+/// The list geometry a frame published: where the list sat on screen and
+/// which result index its first row showed. The mouse handler consumes it to
+/// turn screen rows back into result indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListGeometry {
+    area: Rect,
+    start: usize,
+}
+
+/// One frame's worth of render input, snapshotted from `App` before `draw`
+/// runs. Everything on screen is a function of this struct plus the theme
+/// and cube angle -- no reaching back into `App` mid-render, which is what
+/// lets a test pin a frame and get the same pixels every time.
+struct FrameView<'a> {
+    language: Language,
+    /// `settings.effective()`, taken once per frame.
+    prefs: UiPreferences,
+    /// The per-key environment locks, taken once per frame.
+    locked: SettingLocks,
+    exclude_roots: &'a [String],
+    home: Option<&'a str>,
+    query: &'a str,
+    query_cursor: usize,
+    results: &'a [Match],
+    candidates: &'a [Candidate],
+    page: PageWindow,
+    selected_index: usize,
+    preview_visible: bool,
+    /// The preview state machine's verdict for the selected row, decided here
+    /// so `render_preview` never re-derives it.
+    preview_panel: PreviewPanelOutcome<'a>,
+    notice: Option<&'a str>,
+    mode: Mode,
+    /// `corner_3d_enabled()`, resolved once per frame.
+    corner: bool,
+}
+
+impl FrameView<'_> {
+    fn selected_candidate(&self) -> Option<&Candidate> {
+        self.results
+            .get(self.selected_index)
+            .map(|matched| &self.candidates[matched.idx])
+    }
+}
+
 /// `corner_angle` is passed in rather than read from the clock here, so that
 /// rendering stays a pure function of state and a test can pin a frame.
-fn draw(frame: &mut Frame, app: &App, theme: &Theme, corner_angle: f32) {
+///
+/// Returns the list geometry the frame published, or `None` when the
+/// terminal was too small to lay out a list at all (the caller then keeps
+/// whatever geometry the last successful frame published).
+fn draw(
+    frame: &mut Frame,
+    view: &FrameView,
+    theme: &Theme,
+    corner_angle: f32,
+) -> Option<ListGeometry> {
     let full = frame.area();
 
-    let corner =
-        if let Some(layout) = screen_layout(full, app.preview_visible, app.corner_3d_enabled()) {
-            // Flat main chrome: solid surface fill, no outer box border. Hierarchy
-            // comes from dividers, spacing, and the elevated panel overlays.
-            frame.render_widget(Clear, full);
-            frame.render_widget(Block::default().style(theme.surface()), full);
-            render_header(frame, app, theme, layout.header);
-            render_input(frame, app, theme, layout.input);
-            render_divider(frame, theme, layout.top_divider);
-            render_list(frame, app, theme, layout.list);
-            if let Some((preview_area, placement)) = layout.preview {
-                render_preview(frame, app, theme, preview_area, placement);
-            }
-            render_divider(frame, theme, layout.bottom_divider);
-            render_footer(frame, app, theme, layout.footer, layout.preview_unavailable);
-            if let Some(corner) = layout.corner {
-                cube::render(frame, corner, corner_angle, theme.cube_ink());
-            }
-            layout.corner
-        } else {
-            frame.render_widget(Clear, full);
-            frame.render_widget(Block::default().style(theme.surface()), full);
-            frame.render_widget(
-                Paragraph::new(app.language.text(TextKey::TerminalTooSmall)).style(theme.dim()),
-                full,
-            );
-            None
-        };
+    let mut list_geometry = None;
+    let corner = if let Some(layout) = screen_layout(full, view.preview_visible, view.corner) {
+        // Flat main chrome: solid surface fill, no outer box border. Hierarchy
+        // comes from dividers, spacing, and the elevated panel overlays.
+        frame.render_widget(Clear, full);
+        frame.render_widget(Block::default().style(theme.surface()), full);
+        render_header(frame, view, theme, layout.header);
+        render_input(frame, view, theme, layout.input);
+        render_divider(frame, theme, layout.top_divider);
+        list_geometry = Some(render_list(frame, view, theme, layout.list));
+        if let Some((preview_area, placement)) = layout.preview {
+            render_preview(frame, view, theme, preview_area, placement);
+        }
+        render_divider(frame, theme, layout.bottom_divider);
+        render_footer(
+            frame,
+            view,
+            theme,
+            layout.footer,
+            layout.preview_unavailable,
+        );
+        if let Some(corner) = layout.corner {
+            cube::render(frame, corner, corner_angle, theme.cube_ink());
+        }
+        layout.corner
+    } else {
+        frame.render_widget(Clear, full);
+        frame.render_widget(Block::default().style(theme.surface()), full);
+        frame.render_widget(
+            Paragraph::new(view.language.text(TextKey::TerminalTooSmall)).style(theme.dim()),
+            full,
+        );
+        None
+    };
 
     let overlay_area = screen_overlay_area(full, corner);
-    match app.mode {
+    match view.mode {
         Mode::Normal => {}
-        Mode::Help => overlays::render_help(frame, app.language, theme, overlay_area),
+        Mode::Help => overlays::render_help(frame, view.language, theme, overlay_area),
         Mode::Settings { selected } => {
-            overlays::render_settings(frame, app, theme, overlay_area, selected)
+            overlays::render_settings(frame, view, theme, overlay_area, selected)
         }
         Mode::Excludes { selected } => {
-            overlays::render_excludes(frame, app, theme, overlay_area, selected)
+            overlays::render_excludes(frame, view, theme, overlay_area, selected)
         }
         Mode::ConfirmDelete { candidate_idx } => {
-            render_confirm_delete(frame, app, theme, overlay_area, candidate_idx)
+            render_confirm_delete(frame, view, theme, overlay_area, candidate_idx)
         }
     }
+    list_geometry
 }
 
 fn screen_overlay_area(full: Rect, corner: Option<Rect>) -> Rect {
@@ -2843,9 +2941,9 @@ fn screen_overlay_area(full: Rect, corner: Option<Rect>) -> Rect {
     }
 }
 
-fn render_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+fn render_header(frame: &mut Frame, view: &FrameView, theme: &Theme, area: Rect) {
     let title = "cdh";
-    let summary = app.page().summary(app.filtered_results.len(), app.language);
+    let summary = view.page.summary(view.results.len(), view.language);
     let title_width = UnicodeWidthStr::width(title);
     let summary_width = UnicodeWidthStr::width(summary.as_str());
     let width = area.width as usize;
@@ -2946,26 +3044,26 @@ fn visible_query_sides(before: &str, after: &str, max_width: usize) -> (String, 
     )
 }
 
-fn render_input(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+fn render_input(frame: &mut Frame, view: &FrameView, theme: &Theme, area: Rect) {
     let prompt = "❯ ";
     let cursor = "▏";
     let width = area.width as usize;
     let available = width.saturating_sub(UnicodeWidthStr::width(prompt));
     let cursor_width = UnicodeWidthStr::width(cursor);
     let mut spans = vec![Span::styled(prompt, theme.accent())];
-    if app.query.is_empty() {
+    if view.query.is_empty() {
         spans.push(Span::styled(cursor, theme.accent()));
         spans.push(Span::styled(
             trim_end(
-                app.language.text(TextKey::SearchPlaceholder),
+                view.language.text(TextKey::SearchPlaceholder),
                 available.saturating_sub(cursor_width),
             ),
             theme.dim(),
         ));
     } else {
-        let cursor_index = app.query_cursor.min(app.query_grapheme_count());
+        let cursor_index = view.query_cursor.min(grapheme_count(view.query));
         let viewport = query_viewport(
-            &app.query,
+            view.query,
             cursor_index,
             available.saturating_sub(cursor_width),
         );
@@ -3008,21 +3106,26 @@ fn empty_state_line(query: &str, language: Language, theme: &Theme) -> Line<'sta
     ])
 }
 
-fn render_list(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
-    let page = app.page();
+fn render_list(frame: &mut Frame, view: &FrameView, theme: &Theme, area: Rect) -> ListGeometry {
+    let page = view.page;
     let row_capacity = area.height as usize;
     let list_area = Rect::new(area.x, area.y, area.width, row_capacity as u16);
-    app.last_list_start.set(page.start);
-    app.last_list_area.set(Rect::new(
-        list_area.x,
-        list_area.y,
-        list_area.width,
-        page.end.saturating_sub(page.start) as u16,
-    ));
+    // Published up front, before any early return: the mouse handler has to
+    // see where this frame's list ended up even when the page is empty or the
+    // list area has no height, not where an older, larger one did.
+    let geometry = ListGeometry {
+        area: Rect::new(
+            list_area.x,
+            list_area.y,
+            list_area.width,
+            page.end.saturating_sub(page.start) as u16,
+        ),
+        start: page.start,
+    };
 
-    if app.filtered_results.is_empty() {
+    if view.results.is_empty() {
         if list_area.height == 0 {
-            return;
+            return geometry;
         }
         let empty_area = Rect::new(
             list_area.x,
@@ -3031,27 +3134,24 @@ fn render_list(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             1,
         );
         frame.render_widget(
-            Paragraph::new(empty_state_line(&app.query, app.language, theme))
+            Paragraph::new(empty_state_line(view.query, view.language, theme))
                 .alignment(Alignment::Center),
             empty_area,
         );
-        return;
+        return geometry;
     }
 
     // Highlights and the abbreviated display are built here, for visible rows
     // only -- one throwaway matcher for the page instead of a stored index per
     // candidate. See `Filter::run` and `Candidate::display`.
-    let home = app.home.as_deref();
+    let home = view.home;
     let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
     let mut lines = Vec::with_capacity(page.end - page.start);
-    for (offset, matched) in app.filtered_results[page.start..page.end]
-        .iter()
-        .enumerate()
-    {
+    for (offset, matched) in view.results[page.start..page.end].iter().enumerate() {
         let index = page.start + offset;
-        let candidate = &app.candidates[matched.idx];
+        let candidate = &view.candidates[matched.idx];
         let highlights = if candidate.exists {
-            compute_row_highlights(&mut matcher, &candidate.raw, &app.query)
+            compute_row_highlights(&mut matcher, &candidate.raw, view.query)
         } else {
             Vec::new()
         };
@@ -3061,15 +3161,16 @@ fn render_list(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             &highlights,
             ListRowOptions {
                 index,
-                total: app.filtered_results.len(),
-                selected: index == app.selected_index,
+                total: view.results.len(),
+                selected: index == view.selected_index,
                 width: area.width as usize,
-                language: app.language,
+                language: view.language,
             },
             theme,
         ));
     }
     frame.render_widget(Paragraph::new(lines), list_area);
+    geometry
 }
 
 #[derive(Clone, Copy)]
@@ -3230,7 +3331,7 @@ fn decimal_width(value: usize) -> usize {
 
 fn render_preview(
     frame: &mut Frame,
-    app: &App,
+    view: &FrameView,
     theme: &Theme,
     area: Rect,
     placement: PreviewPlacement,
@@ -3279,10 +3380,10 @@ fn render_preview(
         return;
     }
 
-    let Some(candidate) = app.selected_candidate() else {
+    let Some(candidate) = view.selected_candidate() else {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                app.language.text(TextKey::NoSelection),
+                view.language.text(TextKey::NoSelection),
                 theme.dim(),
             )),
             inner,
@@ -3302,21 +3403,21 @@ fn render_preview(
         Line::raw(""),
     ];
 
-    match preview_outcome_for_selected(app, candidate) {
+    match view.preview_panel {
         PreviewPanelOutcome::Loading => {
             lines.push(Line::from(Span::styled(
-                app.language.text(TextKey::Loading),
+                view.language.text(TextKey::Loading),
                 theme.dim(),
             )));
         }
         PreviewPanelOutcome::Missing | PreviewPanelOutcome::Outcome(PreviewOutcome::Missing) => {
             lines.push(Line::from(Span::styled(
-                app.language.text(TextKey::DirectoryMissing),
+                view.language.text(TextKey::DirectoryMissing),
                 theme.warning(),
             )));
         }
         PreviewPanelOutcome::Outcome(PreviewOutcome::Error(message)) => {
-            let prefix = app.language.text(TextKey::CannotReadPrefix);
+            let prefix = view.language.text(TextKey::CannotReadPrefix);
             lines.push(Line::from(vec![
                 Span::styled(prefix, theme.dim()),
                 Span::styled(
@@ -3330,19 +3431,19 @@ fn render_preview(
         }
         PreviewPanelOutcome::Outcome(PreviewOutcome::Data(data)) => {
             if let Some(git) = &data.git {
-                lines.push(git_line(git, app.language, theme, width));
+                lines.push(git_line(git, view.language, theme, width));
             }
             lines.push(Line::from(vec![
-                Span::styled(app.language.text(TextKey::LastVisitPrefix), theme.dim()),
+                Span::styled(view.language.text(TextKey::LastVisitPrefix), theme.dim()),
                 Span::styled(
-                    relative_time(candidate.last_visit, app.language),
+                    relative_time(candidate.last_visit, view.language),
                     theme.primary(),
                 ),
             ]));
             lines.push(Line::raw(""));
             if data.entries.is_empty() {
                 lines.push(Line::from(Span::styled(
-                    app.language.text(TextKey::EmptyDirectory),
+                    view.language.text(TextKey::EmptyDirectory),
                     theme.dim(),
                 )));
             } else {
@@ -3358,7 +3459,7 @@ fn render_preview(
                 }
                 if data.has_more_entries {
                     lines.push(Line::from(Span::styled(
-                        app.language.text(TextKey::MoreEntries),
+                        view.language.text(TextKey::MoreEntries),
                         theme.dim(),
                     )));
                 }
@@ -3387,6 +3488,7 @@ fn git_line(git: &GitInfo, language: Language, theme: &Theme, width: usize) -> L
     Line::from(spans)
 }
 
+#[derive(Clone, Copy)]
 enum PreviewPanelOutcome<'a> {
     Loading,
     Missing,
@@ -3431,12 +3533,12 @@ fn relative_time_at(timestamp: Option<i64>, now: i64, language: Language) -> Str
 
 fn render_footer(
     frame: &mut Frame,
-    app: &App,
+    view: &FrameView,
     theme: &Theme,
     area: Rect,
     preview_unavailable: bool,
 ) {
-    let line = if let Some(notice) = &app.notice {
+    let line = if let Some(notice) = view.notice {
         Line::from(Span::styled(
             trim_end(notice, area.width as usize),
             theme.primary(),
@@ -3444,16 +3546,16 @@ fn render_footer(
     } else if preview_unavailable {
         Line::from(Span::styled(
             trim_end(
-                app.language.text(TextKey::PreviewSpaceInsufficient),
+                view.language.text(TextKey::PreviewSpaceInsufficient),
                 area.width as usize,
             ),
             theme.warning(),
         ))
     } else {
         let hint = fit_footer(
-            app.language.text(TextKey::FooterPrimary),
-            app.language.text(TextKey::FooterCompact),
-            app.language.text(TextKey::FooterShort),
+            view.language.text(TextKey::FooterPrimary),
+            view.language.text(TextKey::FooterCompact),
+            view.language.text(TextKey::FooterShort),
             area.width as usize,
         );
         footer_hint_line(&trim_end(&hint, area.width as usize), theme)
@@ -3490,28 +3592,28 @@ fn fit_footer(full: &str, compact: &str, short: &str, width: usize) -> String {
 
 fn render_confirm_delete(
     frame: &mut Frame,
-    app: &App,
+    view: &FrameView,
     theme: &Theme,
     full: Rect,
     candidate_idx: usize,
 ) {
     let width = 56u16.min(full.width.saturating_sub(4));
-    let path = app
+    let path = view
         .candidates
         .get(candidate_idx)
-        .map(|candidate| candidate.display(app.home.as_deref()).text)
-        .unwrap_or_else(|| app.language.text(TextKey::UnknownDirectory).to_string());
-    let message = confirm_delete_message(&path, width.saturating_sub(2) as usize, app.language);
+        .map(|candidate| candidate.display(view.home).text)
+        .unwrap_or_else(|| view.language.text(TextKey::UnknownDirectory).to_string());
+    let message = confirm_delete_message(&path, width.saturating_sub(2) as usize, view.language);
     let lines = vec![
         Line::from(Span::styled(
-            app.language.text(TextKey::ConfirmDeleteTitle),
+            view.language.text(TextKey::ConfirmDeleteTitle),
             theme.title(),
         )),
         Line::raw(""),
         Line::from(Span::styled(message, theme.primary())),
         Line::raw(""),
         Line::from(Span::styled(
-            app.language.text(TextKey::ConfirmDeleteAgain),
+            view.language.text(TextKey::ConfirmDeleteAgain),
             theme.dim(),
         )),
     ];
@@ -4074,7 +4176,9 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, app, &Theme::new(color), TEST_CUBE_ANGLE))
+            .draw(|frame| {
+                draw(frame, &app.view(), &Theme::new(color), TEST_CUBE_ANGLE);
+            })
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -4124,7 +4228,19 @@ mod tests {
     /// tests exercise exactly that render-to-mouse channel end to end. This
     /// is `render_buffer` for callers that go on to click.
     fn render_frame(app: &mut App, width: u16, height: u16) -> Buffer {
-        render_buffer(app, width, height, true)
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut list_geometry = None;
+        terminal
+            .draw(|frame| {
+                list_geometry = draw(frame, &app.view(), &Theme::new(true), TEST_CUBE_ANGLE);
+            })
+            .unwrap();
+        if let Some(geometry) = list_geometry {
+            app.last_list_area.set(geometry.area);
+            app.last_list_start.set(geometry.start);
+        }
+        terminal.backend().buffer().clone()
     }
 
     /// A left-button press at `column`/`row`, as crossterm would deliver it.
@@ -4372,7 +4488,9 @@ mod tests {
         let backend = TestBackend::new(60, 16);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &app, &theme, TEST_CUBE_ANGLE))
+            .draw(|frame| {
+                draw(frame, &app.view(), &theme, TEST_CUBE_ANGLE);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let surface = theme.surface().bg.unwrap();
@@ -5963,7 +6081,9 @@ mod tests {
         let backend = TestBackend::new(5, 1);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_input(frame, &app, &Theme::new(true), frame.area()))
+            .draw(|frame| {
+                render_input(frame, &app.view(), &Theme::new(true), frame.area());
+            })
             .unwrap();
     }
 
