@@ -8,6 +8,8 @@
 mod cube;
 #[path = "picker_i18n.rs"]
 mod i18n;
+#[path = "picker_overlays.rs"]
+mod overlays;
 #[path = "tui_settings.rs"]
 mod settings;
 
@@ -1999,7 +2001,7 @@ impl App {
                 self.notice = Some(format!(
                     "{}: {}",
                     self.language.text(TextKey::SettingTheme),
-                    theme_choice_label(self.language, candidate.theme)
+                    overlays::theme_choice_label(self.language, candidate.theme)
                 ));
             }
             Err(error) => {
@@ -2788,42 +2790,56 @@ fn page_size_for(full: Rect, preview_visible: bool, corner_enabled: bool) -> usi
 fn draw(frame: &mut Frame, app: &App, theme: &Theme, corner_angle: f32) {
     let full = frame.area();
 
-    // The gutter is reserved for the whole session, not per mode: opening help
-    // or settings must not reflow the list underneath the overlay.
-    if let Some(layout) = screen_layout(full, app.preview_visible, app.corner_3d_enabled()) {
-        // Flat main chrome: solid surface fill, no outer box border. Hierarchy
-        // comes from dividers, spacing, and the elevated panel overlays.
-        frame.render_widget(Clear, full);
-        frame.render_widget(Block::default().style(theme.surface()), full);
-        render_header(frame, app, theme, layout.header);
-        render_input(frame, app, theme, layout.input);
-        render_divider(frame, theme, layout.top_divider);
-        render_list(frame, app, theme, layout.list);
-        if let Some((preview_area, placement)) = layout.preview {
-            render_preview(frame, app, theme, preview_area, placement);
-        }
-        render_divider(frame, theme, layout.bottom_divider);
-        render_footer(frame, app, theme, layout.footer, layout.preview_unavailable);
-        if let (Some(corner), Mode::Normal) = (layout.corner, app.mode) {
-            cube::render(frame, corner, corner_angle, theme.cube_ink());
-        }
-    } else {
-        frame.render_widget(Clear, full);
-        frame.render_widget(Block::default().style(theme.surface()), full);
-        frame.render_widget(
-            Paragraph::new(app.language.text(TextKey::TerminalTooSmall)).style(theme.dim()),
-            full,
-        );
-    }
+    let corner =
+        if let Some(layout) = screen_layout(full, app.preview_visible, app.corner_3d_enabled()) {
+            // Flat main chrome: solid surface fill, no outer box border. Hierarchy
+            // comes from dividers, spacing, and the elevated panel overlays.
+            frame.render_widget(Clear, full);
+            frame.render_widget(Block::default().style(theme.surface()), full);
+            render_header(frame, app, theme, layout.header);
+            render_input(frame, app, theme, layout.input);
+            render_divider(frame, theme, layout.top_divider);
+            render_list(frame, app, theme, layout.list);
+            if let Some((preview_area, placement)) = layout.preview {
+                render_preview(frame, app, theme, preview_area, placement);
+            }
+            render_divider(frame, theme, layout.bottom_divider);
+            render_footer(frame, app, theme, layout.footer, layout.preview_unavailable);
+            if let Some(corner) = layout.corner {
+                cube::render(frame, corner, corner_angle, theme.cube_ink());
+            }
+            layout.corner
+        } else {
+            frame.render_widget(Clear, full);
+            frame.render_widget(Block::default().style(theme.surface()), full);
+            frame.render_widget(
+                Paragraph::new(app.language.text(TextKey::TerminalTooSmall)).style(theme.dim()),
+                full,
+            );
+            None
+        };
 
+    let overlay_area = screen_overlay_area(full, corner);
     match app.mode {
         Mode::Normal => {}
-        Mode::Help => render_help(frame, app.language, theme, full),
-        Mode::Settings { selected } => render_settings(frame, app, theme, full, selected),
-        Mode::Excludes { selected } => render_excludes(frame, app, theme, full, selected),
-        Mode::ConfirmDelete { candidate_idx } => {
-            render_confirm_delete(frame, app, theme, full, candidate_idx)
+        Mode::Help => overlays::render_help(frame, app.language, theme, overlay_area),
+        Mode::Settings { selected } => {
+            overlays::render_settings(frame, app, theme, overlay_area, selected)
         }
+        Mode::Excludes { selected } => {
+            overlays::render_excludes(frame, app, theme, overlay_area, selected)
+        }
+        Mode::ConfirmDelete { candidate_idx } => {
+            render_confirm_delete(frame, app, theme, overlay_area, candidate_idx)
+        }
+    }
+}
+
+fn screen_overlay_area(full: Rect, corner: Option<Rect>) -> Rect {
+    let right = corner.map_or(full.x + full.width, |corner| corner.x);
+    Rect {
+        width: right.saturating_sub(full.x),
+        ..full
     }
 }
 
@@ -3472,341 +3488,6 @@ fn fit_footer(full: &str, compact: &str, short: &str, width: usize) -> String {
     }
 }
 
-fn render_help(frame: &mut Frame, language: Language, theme: &Theme, full: Rect) {
-    let lines = help_lines(language, theme);
-    let width = 76u16.min(full.width.saturating_sub(4));
-    let height = (lines.len() as u16 + 2).min(full.height);
-    let area = centered(full, width, height);
-    frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(theme.panel()), area);
-    // Flat panel: top rule instead of a boxed border.
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            theme.border(),
-        ))),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    let inner = Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-fn help_lines(language: Language, theme: &Theme) -> Vec<Line<'static>> {
-    vec![
-        Line::from(Span::styled(
-            language.text(TextKey::HelpTitle),
-            theme.title(),
-        )),
-        help_section(language.text(TextKey::Movement), theme),
-        help_row("↑ / Ctrl+P", language.text(TextKey::PreviousItem), theme),
-        help_row("↓ / Ctrl+N", language.text(TextKey::NextItem), theme),
-        help_section(language.text(TextKey::Paging), theme),
-        help_row("Ctrl+↑ / PgUp", language.text(TextKey::PreviousPage), theme),
-        help_row("Ctrl+↓ / PgDn", language.text(TextKey::NextPage), theme),
-        help_row("Home", language.text(TextKey::FirstItem), theme),
-        help_row("End", language.text(TextKey::LastItem), theme),
-        help_section(language.text(TextKey::Search), theme),
-        help_row("← / →", language.text(TextKey::MoveCursor), theme),
-        help_row(
-            "Backspace",
-            language.text(TextKey::DeleteBeforeCursor),
-            theme,
-        ),
-        help_row("Delete", language.text(TextKey::DeleteAtCursor), theme),
-        help_row(
-            "Ctrl+U",
-            language.text(TextKey::ClearSearchDescription),
-            theme,
-        ),
-        help_section(language.text(TextKey::Actions), theme),
-        help_row("Enter", language.text(TextKey::JumpToDirectory), theme),
-        help_row("Tab", language.text(TextKey::TogglePreview), theme),
-        help_row("Ctrl+D", language.text(TextKey::DeleteHistoryEntry), theme),
-        help_row(
-            "Ctrl+H / F5",
-            language.text(TextKey::ToggleHiddenDirectories),
-            theme,
-        ),
-        help_row("F1 / ? / ？", language.text(TextKey::OpenHelp), theme),
-        help_row("F2", language.text(TextKey::OpenSettings), theme),
-        help_row("F4", language.text(TextKey::OpenExcludes), theme),
-        help_row("Ctrl+T / F3", language.text(TextKey::SettingTheme), theme),
-        help_row(
-            "↑↓  ←→  Enter/Space  Esc",
-            language.text(TextKey::SettingsControls),
-            theme,
-        ),
-        help_row("Esc", language.text(TextKey::EscapeDescription), theme),
-    ]
-}
-
-fn render_settings(frame: &mut Frame, app: &App, theme: &Theme, full: Rect, selected: usize) {
-    let width = 72u16.min(full.width.saturating_sub(2));
-    let height = 10u16.min(full.height);
-    if width < 2 || height < 2 {
-        return;
-    }
-
-    let area = centered(full, width, height);
-    frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(theme.panel()), area);
-    // Flat panel: no box border — title + dim rule keep hierarchy without a frame.
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            theme.border(),
-        ))),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    let inner = Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    if inner.is_empty() {
-        return;
-    }
-
-    render_settings_line(
-        frame,
-        inner,
-        0,
-        app.language.text(TextKey::SettingsTitle),
-        theme.title(),
-    );
-
-    let row_start = u16::from(inner.height >= 7);
-    for (index, key) in [
-        SettingKey::Language,
-        SettingKey::Theme,
-        SettingKey::Preview,
-        SettingKey::Color,
-        SettingKey::Mouse,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let offset = row_start + 1 + index as u16;
-        if offset >= inner.height {
-            break;
-        }
-        let style = if index == selected.min(4) {
-            theme.selected()
-        } else {
-            theme.primary()
-        };
-        let text = settings_row_text(app, key, inner.width as usize);
-        render_settings_line(frame, inner, offset, &text, style);
-    }
-
-    if inner.height > 1 {
-        let footer = trim_end(
-            app.language.text(TextKey::SettingsFooter),
-            inner.width as usize,
-        );
-        render_settings_line(frame, inner, inner.height - 1, &footer, theme.dim());
-    }
-}
-
-/// How many entry rows the exclusion panel can show, and whether the footer
-/// fits below them.
-///
-/// Layout is title(0), blank(1), entries(2..), footer(last). Below four rows
-/// there is no room for both an entry and the footer, and an entry is the more
-/// useful of the two -- forcing one row anyway would just let the footer
-/// overwrite it.
-fn excludes_layout(height: u16) -> (usize, bool) {
-    if height >= 4 {
-        (height.saturating_sub(3) as usize, true)
-    } else {
-        (height.saturating_sub(2) as usize, false)
-    }
-}
-
-fn excludes_visible_rows(height: u16) -> usize {
-    excludes_layout(height).0
-}
-
-/// First visible row of the exclusion panel.
-///
-/// The cursor drags the window rather than the window paging: the list has no
-/// fixed bound, and anchoring the top would strand later entries below the panel
-/// with no key that reaches them. Clamped so a short list never scrolls and the
-/// last page is always full.
-fn excludes_window_start(len: usize, rows: usize, selected: usize) -> usize {
-    if len <= rows {
-        return 0;
-    }
-    selected
-        .saturating_sub(rows.saturating_sub(1))
-        .min(len - rows)
-}
-
-fn render_excludes(frame: &mut Frame, app: &App, theme: &Theme, full: Rect, selected: usize) {
-    let width = 72u16.min(full.width.saturating_sub(2));
-    let height = 14u16.min(full.height);
-    if width < 2 || height < 2 {
-        return;
-    }
-
-    let area = centered(full, width, height);
-    frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(theme.panel()), area);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            theme.border(),
-        ))),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    let inner = Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    if inner.is_empty() {
-        return;
-    }
-
-    render_settings_line(
-        frame,
-        inner,
-        0,
-        app.language.text(TextKey::ExcludesTitle),
-        theme.title(),
-    );
-
-    let roots = app.excludes.roots();
-    if roots.is_empty() {
-        render_settings_line(
-            frame,
-            inner,
-            2,
-            app.language.text(TextKey::ExcludesEmpty),
-            theme.dim(),
-        );
-    } else {
-        // Scroll the window with the cursor: the list is unbounded in principle
-        // and a fixed top would strand entries below the panel with no way to
-        // reach them.
-        let rows = excludes_visible_rows(inner.height);
-        let selected = selected.min(roots.len() - 1);
-        let start = excludes_window_start(roots.len(), rows, selected);
-        for (offset, root) in roots[start..].iter().take(rows).enumerate() {
-            let index = start + offset;
-            let style = if index == selected {
-                theme.selected()
-            } else {
-                theme.primary()
-            };
-            let text = format!(
-                " {}",
-                PathDisplay::from_path(root, app.home.as_deref()).text
-            );
-            render_settings_line(
-                frame,
-                inner,
-                2 + offset as u16,
-                &trim_middle(&text, inner.width as usize),
-                style,
-            );
-        }
-    }
-
-    if excludes_layout(inner.height).1 {
-        let footer = trim_end(
-            app.language.text(TextKey::ExcludesFooter),
-            inner.width as usize,
-        );
-        render_settings_line(frame, inner, inner.height - 1, &footer, theme.dim());
-    }
-}
-
-fn render_settings_line(frame: &mut Frame, inner: Rect, offset: u16, text: &str, style: Style) {
-    if offset >= inner.height {
-        return;
-    }
-    let area = Rect::new(inner.x, inner.y + offset, inner.width, 1);
-    frame.render_widget(
-        Paragraph::new(trim_end(text, inner.width as usize)).style(style),
-        area,
-    );
-}
-
-fn settings_row_text(app: &App, key: SettingKey, width: usize) -> String {
-    let effective = app.settings.effective();
-    let (label, value) = match key {
-        SettingKey::Language => (
-            app.language.text(TextKey::SettingLanguage),
-            match effective.language {
-                LanguagePreference::Auto => app.language.text(TextKey::LanguageAuto),
-                LanguagePreference::ZhCn => app.language.text(TextKey::LanguageSimplifiedChinese),
-                LanguagePreference::En => app.language.text(TextKey::LanguageEnglish),
-            },
-        ),
-        SettingKey::Theme => (
-            app.language.text(TextKey::SettingTheme),
-            theme_choice_label(app.language, effective.theme),
-        ),
-        SettingKey::Preview => (
-            app.language.text(TextKey::SettingPreviewStartup),
-            setting_boolean_text(app.language, effective.preview),
-        ),
-        SettingKey::Color => (
-            app.language.text(TextKey::SettingColor),
-            setting_boolean_text(app.language, effective.color),
-        ),
-        SettingKey::Mouse => (
-            app.language.text(TextKey::SettingMouseCapture),
-            setting_boolean_text(app.language, effective.mouse),
-        ),
-    };
-    let marker = app
-        .settings
-        .is_locked(key)
-        .then(|| app.language.text(TextKey::EnvironmentControlled));
-    let right = marker
-        .map(|marker| format!("{value} · {marker}"))
-        .unwrap_or_else(|| value.to_string());
-    let occupied = UnicodeWidthStr::width(label) + UnicodeWidthStr::width(right.as_str());
-    if occupied < width {
-        format!("{label}{}{right}", " ".repeat(width - occupied))
-    } else {
-        trim_end(&format!("{label}  {right}"), width)
-    }
-}
-
-fn theme_choice_label(language: Language, choice: ThemeChoice) -> &'static str {
-    language.text(match choice {
-        ThemeChoice::Graphite => TextKey::ThemeGraphite,
-        ThemeChoice::Nord => TextKey::ThemeNord,
-        ThemeChoice::Daylight => TextKey::ThemeDaylight,
-        ThemeChoice::Mono => TextKey::ThemeMono,
-        ThemeChoice::Dracula => TextKey::ThemeDracula,
-        ThemeChoice::Amber => TextKey::ThemeAmber,
-        ThemeChoice::Forest => TextKey::ThemeForest,
-    })
-}
-
-fn setting_boolean_text(language: Language, value: bool) -> &'static str {
-    language.text(if value {
-        TextKey::SettingOn
-    } else {
-        TextKey::SettingOff
-    })
-}
-
-fn help_section(title: &str, theme: &Theme) -> Line<'static> {
-    Line::from(Span::styled(title.to_string(), theme.accent()))
-}
-
 fn render_confirm_delete(
     frame: &mut Frame,
     app: &App,
@@ -3863,15 +3544,6 @@ fn confirm_delete_message(path: &str, max_width: usize, language: Language) -> S
     }
     let path_width = max_width - fixed_width;
     format!("{prefix}{}{suffix}", trim_middle(path, path_width))
-}
-
-fn help_row(key: &str, description: &str, theme: &Theme) -> Line<'static> {
-    const KEY_WIDTH: usize = 21;
-    let padding = KEY_WIDTH.saturating_sub(UnicodeWidthStr::width(key));
-    Line::from(vec![
-        Span::styled(format!("{key}{}", " ".repeat(padding)), theme.accent()),
-        Span::styled(description.to_string(), theme.primary()),
-    ])
 }
 
 fn centered(full: Rect, width: u16, height: u16) -> Rect {
@@ -4001,7 +3673,10 @@ mod tests {
     }
 
     use crate::{EffectiveConfig, Paths};
-    use ratatui::{backend::TestBackend, buffer::Buffer};
+    use ratatui::{
+        backend::TestBackend,
+        buffer::{Buffer, Cell as BufferCell},
+    };
     use settings::{LanguagePreference, SettingKey, UiEnvironment, UiSettings};
     use std::collections::VecDeque;
     use std::fs;
@@ -4312,6 +3987,43 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    /// Derive the cube gutter from the terminal contract rather than from the
+    /// production `ScreenLayout`. The layout has one side-padding column, three
+    /// fixed rows above content, and two fixed rows below it; the cube constants
+    /// then determine the reserved right-hand footprint.
+    fn independently_derived_cube_gutter(full: Rect) -> Rect {
+        const SIDE_PADDING: u16 = 1;
+        const CONTENT_TOP_ROWS: u16 = 3;
+        const CONTENT_BOTTOM_ROWS: u16 = 2;
+        assert!(full.width >= 81);
+        assert!(full.height >= 12);
+        let content_width = full.width - SIDE_PADDING * 2;
+        let content_height = full.height - CONTENT_TOP_ROWS - CONTENT_BOTTOM_ROWS;
+        assert!(content_height >= cube::HEIGHT);
+        assert!(content_width >= CORNER_3D_GUTTER + CORNER_3D_MIN_CONTENT);
+        Rect::new(
+            full.x + SIDE_PADDING + content_width - CORNER_3D_GUTTER + 1,
+            full.y + CONTENT_TOP_ROWS + content_height - cube::HEIGHT,
+            cube::WIDTH,
+            cube::HEIGHT,
+        )
+    }
+
+    fn cube_render_app(full: Rect) -> App {
+        let mut app = app_with_paths(&[("/home/jason/workspace/project", 0.9)]);
+        app.color_enabled = true;
+        app.corner_3d_env = true;
+        app.home = Some("/home/jason".to_string());
+        app.set_page_size(page_size_for(full, false, true));
+        app
+    }
+
+    fn gutter_cells(buffer: &Buffer, gutter: Rect) -> Vec<BufferCell> {
+        (gutter.y..gutter.y + gutter.height)
+            .flat_map(|y| (gutter.x..gutter.x + gutter.width).map(move |x| buffer[(x, y)].clone()))
+            .collect()
+    }
+
     /// The whole buffer as text, one line per row.
     fn buffer_text(buffer: &Buffer) -> String {
         let area = buffer.area;
@@ -4404,9 +4116,9 @@ mod tests {
     /// a fixed `$HOME` instead of the ambient one, and the page size the real
     /// layout would pick for `full`.
     ///
-    /// The cube is switched off because `draw` paints it only in `Mode::Normal`:
-    /// leaving it on would make a normal frame and an overlay frame differ in the
-    /// gutter for reasons that have nothing to do with the overlay.
+    /// The cube remains visible while an overlay is open, so this helper keeps
+    /// the cube off to isolate ordinary overlay rendering tests from chrome.
+    /// Dedicated cube/overlay guardrails below enable it explicitly.
     fn list_render_app(full: Rect, count: usize) -> App {
         let paths = (0..count)
             .map(|index| format!("/home/jason/workspace/project-{index:02}"))
@@ -4619,7 +4331,7 @@ mod tests {
             assert!(footer.contains("F1"));
             assert!(footer.contains("F2"));
 
-            let help = help_lines(language, &Theme::new(false));
+            let help = overlays::help_lines(language, &Theme::new(false));
             let help_text = help.iter().map(line_text).collect::<String>();
             assert!(help_text.contains("F1 / ? / ？"));
             assert!(help_text.contains("F2"));
@@ -5518,7 +5230,7 @@ mod tests {
     #[test]
     fn english_help_contains_no_chinese_copy() {
         let theme = Theme::new(false);
-        let lines = help_lines(Language::En, &theme);
+        let lines = overlays::help_lines(Language::En, &theme);
         let text = lines
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -6170,7 +5882,7 @@ mod tests {
     #[test]
     fn help_lists_both_page_key_sets_and_query_editing_controls() {
         let theme = Theme::new(false);
-        let text = help_lines(Language::ZhCn, &theme)
+        let text = overlays::help_lines(Language::ZhCn, &theme)
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
@@ -6529,14 +6241,14 @@ mod tests {
     fn exclusion_panel_drops_the_footer_before_it_covers_an_entry() {
         // Layout is title / blank / entries / footer. Below four rows only one
         // of the last two fits, and an entry beats the key hint.
-        assert_eq!(excludes_layout(12), (9, true));
-        assert_eq!(excludes_layout(4), (1, true));
-        assert_eq!(excludes_layout(3), (1, false));
-        assert_eq!(excludes_layout(2), (0, false));
-        assert_eq!(excludes_layout(0), (0, false));
+        assert_eq!(overlays::excludes_layout(12), (9, true));
+        assert_eq!(overlays::excludes_layout(4), (1, true));
+        assert_eq!(overlays::excludes_layout(3), (1, false));
+        assert_eq!(overlays::excludes_layout(2), (0, false));
+        assert_eq!(overlays::excludes_layout(0), (0, false));
         // Rows must never reach the footer row.
         for height in 4..40u16 {
-            let (rows, _) = excludes_layout(height);
+            let (rows, _) = overlays::excludes_layout(height);
             assert!(
                 2 + rows <= (height - 1) as usize,
                 "overlap at height {height}"
@@ -6579,15 +6291,15 @@ mod tests {
     #[test]
     fn exclusion_window_follows_the_cursor_without_overscrolling() {
         // Short list never scrolls.
-        assert_eq!(excludes_window_start(3, 8, 2), 0);
+        assert_eq!(overlays::excludes_window_start(3, 8, 2), 0);
         // Cursor drags the window down one row at a time...
-        assert_eq!(excludes_window_start(20, 5, 4), 0);
-        assert_eq!(excludes_window_start(20, 5, 5), 1);
+        assert_eq!(overlays::excludes_window_start(20, 5, 4), 0);
+        assert_eq!(overlays::excludes_window_start(20, 5, 5), 1);
         // ...and the last page stays full instead of scrolling past the end.
-        assert_eq!(excludes_window_start(20, 5, 19), 15);
+        assert_eq!(overlays::excludes_window_start(20, 5, 19), 15);
         // Degenerate heights must not underflow.
-        assert_eq!(excludes_window_start(0, 1, 0), 0);
-        assert_eq!(excludes_window_start(4, 1, 3), 3);
+        assert_eq!(overlays::excludes_window_start(0, 1, 0), 0);
+        assert_eq!(overlays::excludes_window_start(4, 1, 3), 3);
     }
 
     #[test]
@@ -6880,6 +6592,71 @@ mod tests {
     // results are on the page, and where an overlay lands.
     // ---------------------------------------------------------------------
 
+    #[test]
+    fn overlays_leave_the_independently_derived_cube_gutter_free_of_panel_content() {
+        let full = Rect::new(0, 0, 81, 12);
+        let gutter = independently_derived_cube_gutter(full);
+        let theme = Theme::new(true);
+        let surface_bg = theme.surface().bg.expect("surface fill needs a color");
+
+        for mode in [
+            Mode::Help,
+            Mode::Settings { selected: 2 },
+            Mode::Excludes { selected: 0 },
+            Mode::ConfirmDelete { candidate_idx: 0 },
+        ] {
+            let mut app = cube_render_app(full);
+            app.mode = mode;
+            let buffer = render_buffer(&app, full.width, full.height, true);
+            let cells = gutter_cells(&buffer, gutter);
+
+            assert!(
+                cells.iter().all(|cell| {
+                    let symbol = cell.symbol();
+                    let is_cube_glyph = symbol.is_empty()
+                        || symbol == " "
+                        || symbol
+                            .chars()
+                            .all(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch));
+                    cell.bg == surface_bg && is_cube_glyph
+                }),
+                "{mode:?} painted overlay content into the cube gutter"
+            );
+        }
+    }
+
+    #[test]
+    fn overlays_preserve_cube_gutter_cells_byte_for_byte() {
+        let full = Rect::new(0, 0, 81, 12);
+        let gutter = independently_derived_cube_gutter(full);
+        let mut normal_app = cube_render_app(full);
+        normal_app.mode = Mode::Normal;
+        let normal = render_buffer(&normal_app, full.width, full.height, true);
+        let normal_cells = gutter_cells(&normal, gutter);
+        assert!(
+            normal_cells.iter().any(|cell| cell
+                .symbol()
+                .chars()
+                .any(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))),
+            "the enabled cube must draw into the independently derived gutter"
+        );
+
+        for mode in [
+            Mode::Help,
+            Mode::Settings { selected: 4 },
+            Mode::Excludes { selected: 0 },
+            Mode::ConfirmDelete { candidate_idx: 0 },
+        ] {
+            let mut overlay_app = cube_render_app(full);
+            overlay_app.mode = mode;
+            let overlay = render_buffer(&overlay_app, full.width, full.height, true);
+            assert_eq!(
+                gutter_cells(&overlay, gutter),
+                normal_cells,
+                "{mode:?} changed cells in the independently derived cube gutter"
+            );
+        }
+    }
     #[test]
     fn selected_row_is_the_only_highlighted_row_and_carries_the_marker() {
         let full = Rect::new(0, 0, 80, 24);
