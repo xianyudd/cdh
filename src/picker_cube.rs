@@ -23,7 +23,7 @@ use ratatui::{
     Frame,
 };
 
-use super::Rgb;
+use super::theme::Rgb;
 
 /// Cell footprint the cube asks the layout for. The 2:1 ratio is not cosmetic: a
 /// Braille cell is a 2x4 dot matrix, so 14x7 cells is a 28x28 *dot* canvas, and
