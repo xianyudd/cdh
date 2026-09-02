@@ -3663,9 +3663,9 @@ fn read_git_info_reports_clean_and_modified_status() {
         .status()
         .unwrap()
         .success());
-    assert_eq!(read_git_info(&repo).unwrap().dirty, Some(false));
+    assert_eq!(git::read_git_info(&repo).unwrap().dirty, Some(false));
     fs::write(repo.join("note.txt"), "dirty").unwrap();
-    assert_eq!(read_git_info(&repo).unwrap().dirty, Some(true));
+    assert_eq!(git::read_git_info(&repo).unwrap().dirty, Some(true));
     let _ = fs::remove_dir_all(root);
 }
 
