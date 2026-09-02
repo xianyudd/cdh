@@ -6,6 +6,8 @@
 
 #[path = "picker_cube.rs"]
 mod cube;
+#[path = "picker_git.rs"]
+mod git;
 #[path = "picker_i18n.rs"]
 mod i18n;
 #[path = "picker_overlays.rs"]
@@ -23,9 +25,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{self, IsTerminal, Read};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::io::{self, IsTerminal};
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -77,7 +78,6 @@ const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(100);
 const PREVIEW_SIDE_MIN_WIDTH: u16 = 108;
 const PREVIEW_BOTTOM_MIN_WIDTH: u16 = 70;
 const PREVIEW_BOTTOM_MIN_HEIGHT: u16 = 18;
-const GIT_DIRTY_TIMEOUT: Duration = Duration::from_millis(300);
 const EVENT_POLL_FALLBACK: Duration = Duration::from_millis(100);
 /// Cube columns plus one blank separator column, carved out of the content area.
 const CORNER_3D_GUTTER: u16 = cube::WIDTH + 1;
@@ -87,12 +87,6 @@ const CORNER_3D_GUTTER: u16 = cube::WIDTH + 1;
 const CORNER_3D_MIN_CONTENT: u16 = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct GitInfo {
-    branch: String,
-    dirty: Option<bool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviewEntry {
     name: String,
     is_dir: bool,
@@ -100,7 +94,7 @@ struct PreviewEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviewData {
-    git: Option<GitInfo>,
+    git: Option<git::GitInfo>,
     entries: Vec<PreviewEntry>,
     has_more_entries: bool,
 }
@@ -162,7 +156,7 @@ fn load_preview(path: &str, language: Language) -> PreviewOutcome {
 
     match read_preview_entries(path) {
         Ok((entries, has_more_entries)) => PreviewOutcome::Data(PreviewData {
-            git: read_git_info(path),
+            git: git::read_git_info(path),
             entries,
             has_more_entries,
         }),
@@ -194,89 +188,6 @@ fn read_preview_entries(path: &Path) -> io::Result<(Vec<PreviewEntry>, bool)> {
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok((entries, has_more_entries))
-}
-
-fn read_git_info(path: &Path) -> Option<GitInfo> {
-    let (repo_root, git_dir) = find_git_repo(path)?;
-    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let branch = parse_git_head_branch(&head)?;
-    Some(GitInfo {
-        branch,
-        dirty: read_git_dirty(&repo_root, GIT_DIRTY_TIMEOUT),
-    })
-}
-
-/// Locate a repository without starting a `git` process. A `.git` directory is
-/// the normal case; a `.git` file covers worktrees and submodules.
-fn find_git_repo(start: &Path) -> Option<(PathBuf, PathBuf)> {
-    for ancestor in start.ancestors() {
-        let marker = ancestor.join(".git");
-        if marker.is_dir() {
-            return Some((ancestor.to_path_buf(), marker));
-        }
-        if marker.is_file() {
-            let content = fs::read_to_string(&marker).ok()?;
-            let target = content.trim().strip_prefix("gitdir: ")?;
-            let target = Path::new(target);
-            let git_dir = if target.is_absolute() {
-                target.to_path_buf()
-            } else {
-                marker.parent()?.join(target)
-            };
-            if git_dir.is_dir() {
-                return Some((ancestor.to_path_buf(), git_dir));
-            }
-        }
-    }
-    None
-}
-
-fn parse_git_head_branch(head: &str) -> Option<String> {
-    let head = head.trim();
-    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
-        return Some(branch.to_string());
-    }
-    (!head.is_empty()).then(|| "detached".to_string())
-}
-
-fn read_git_dirty(repo_root: &Path, timeout: Duration) -> Option<bool> {
-    // Spawn `git status` with a piped stdout so a slow filesystem (WSL2, network
-    // mounts) can't stall the picker. On timeout we kill the child and return,
-    // and the reader thread drains the pipe so neither the process nor the
-    // thread lingers after `git` finally exits.
-    let mut child = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(repo_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let mut stdout = child.stdout.take()?;
-    let (tx, rx) = mpsc::channel();
-    let reader = thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let read = stdout.read_to_end(&mut buffer);
-        let _ = tx.send(read.map(|_| !buffer.is_empty()));
-    });
-
-    let dirty = match rx.recv_timeout(timeout) {
-        Ok(read_result) => child
-            .wait()
-            .ok()
-            .and_then(|status| status.success().then_some(()).and(read_result.ok())),
-        Err(_) => {
-            // Timed out: kill the child so `read_to_end` returns and the reader
-            // thread unblocks; joining keeps the pipe alive until then.
-            let _ = child.kill();
-            let _ = child.wait();
-            None
-        }
-    };
-
-    let _ = reader.join();
-    dirty
 }
 
 fn preview_error_message(error: &io::Error, language: Language) -> String {
@@ -3136,7 +3047,7 @@ fn render_preview(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn git_line(git: &GitInfo, language: Language, theme: &Theme, width: usize) -> Line<'static> {
+fn git_line(git: &git::GitInfo, language: Language, theme: &Theme, width: usize) -> Line<'static> {
     let (status, color) = match git.dirty {
         Some(true) => (language.text(TextKey::GitModified), theme.warning_color()),
         Some(false) => (language.text(TextKey::GitClean), theme.success_color()),
