@@ -43,6 +43,12 @@ git config --local core.hooksPath .githooks
 echo "install-hooks: core.hooksPath = $(git config --local --get core.hooksPath)"
 echo "install-hooks: 已接上 .githooks/pre-commit 与 .githooks/commit-msg"
 
+# 相对 hooksPath 解析的是「当前签出的那份 .githooks/」，所以装完不等于一劳永逸：签出点
+# 早于引入该目录时（bisect 走到历史提交、基于旧基线的 linked worktree），目录不存在，
+# git 对「钩子目录不存在」又是静默放过的 —— 钩子无声失效。切回新提交即恢复，无需重装。
+echo "install-hooks: 提醒：生效的是当前签出的那份 .githooks/；若签出点早于该目录引入"
+echo "install-hooks: （bisect 历史提交、旧基线的 worktree），钩子会静默失效，切回新提交即恢复。"
+
 # 旧装法留下的残留只**报告**、不删除：它们在 .git/ 下，不属于本脚本创建的东西，
 # 而且删别人机器上的文件不该由一条安装命令顺手做。它们现在是惰性的（core.hooksPath
 # 一旦指向别处，git 就不看 .git/hooks 了；即便有人取消这里的 --local 设置，落回去的
