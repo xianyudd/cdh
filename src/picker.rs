@@ -1544,8 +1544,9 @@ impl App {
 
     /// Snapshot everything rendering reads, once per frame. Drawing then
     /// consumes only the snapshot, never `App` -- no chance for a render to
-    /// disagree with the state another renderer saw in the same frame.
-    fn view(&self) -> FrameView<'_> {
+    /// disagree with the state another renderer saw in the same frame. The
+    /// wall clock arrives as a parameter so no renderer reads one itself.
+    fn view(&self, now_unix: i64) -> FrameView<'_> {
         let preview_panel = match self.selected_candidate() {
             Some(candidate) => preview_outcome_for_selected(self, candidate),
             // No selection means the preview header shows the no-selection
@@ -1569,6 +1570,7 @@ impl App {
             notice: self.notice.as_deref(),
             mode: self.mode,
             corner: self.corner_3d_enabled(),
+            now_unix,
         }
     }
 
@@ -2353,10 +2355,11 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
         }
         if dirty {
             let corner_angle = app.corner_anim_angle(Instant::now());
+            let now_unix = unix_now();
             let mut list_geometry = None;
             terminal.draw(|frame| {
                 let theme = Theme::with_choice(app.color_enabled, app.theme_choice);
-                let view = app.view();
+                let view = app.view(now_unix);
                 list_geometry = draw(frame, &view, &theme, corner_angle);
             })?;
             if let Some(geometry) = list_geometry {
@@ -2862,6 +2865,9 @@ struct FrameView<'a> {
     mode: Mode,
     /// `corner_3d_enabled()`, resolved once per frame.
     corner: bool,
+    /// The frame's wall clock, supplied by the caller so relative times are
+    /// a pure function of the snapshot (and a test can pin them).
+    now_unix: i64,
 }
 
 impl FrameView<'_> {
@@ -3441,7 +3447,7 @@ fn render_preview(
             lines.push(Line::from(vec![
                 Span::styled(view.language.text(TextKey::LastVisitPrefix), theme.dim()),
                 Span::styled(
-                    relative_time(candidate.last_visit, view.language),
+                    relative_time_at(candidate.last_visit, view.now_unix, view.language),
                     theme.primary(),
                 ),
             ]));
@@ -3524,12 +3530,14 @@ fn preview_outcome_for_selected<'a>(
     PreviewPanelOutcome::Loading
 }
 
-fn relative_time(timestamp: Option<i64>, language: Language) -> String {
-    let now = SystemTime::now()
+/// The wall clock for a frame, read once per frame by the event loop. Render
+/// code never calls this: the time arrives inside the `FrameView` snapshot so
+/// a pinned frame is reproducible.
+fn unix_now() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64;
-    relative_time_at(timestamp, now, language)
+        .as_secs() as i64
 }
 
 fn relative_time_at(timestamp: Option<i64>, now: i64, language: Language) -> String {
@@ -4178,11 +4186,22 @@ mod tests {
     /// composed screen rather than a single widget's `Line`s. The cube angle is
     /// pinned (see `TEST_CUBE_ANGLE`) so a frame is reproducible.
     fn render_buffer(app: &App, width: u16, height: u16, color: bool) -> Buffer {
+        render_buffer_at(app, width, height, color, unix_now())
+    }
+
+    /// `render_buffer` with the frame clock supplied, for assertions that pin
+    /// time-dependent copy.
+    fn render_buffer_at(app: &App, width: u16, height: u16, color: bool, now_unix: i64) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                draw(frame, &app.view(), &Theme::new(color), TEST_CUBE_ANGLE);
+                draw(
+                    frame,
+                    &app.view(now_unix),
+                    &Theme::new(color),
+                    TEST_CUBE_ANGLE,
+                );
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -4235,10 +4254,16 @@ mod tests {
     fn render_frame(app: &mut App, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
+        let now_unix = unix_now();
         let mut list_geometry = None;
         terminal
             .draw(|frame| {
-                list_geometry = draw(frame, &app.view(), &Theme::new(true), TEST_CUBE_ANGLE);
+                list_geometry = draw(
+                    frame,
+                    &app.view(now_unix),
+                    &Theme::new(true),
+                    TEST_CUBE_ANGLE,
+                );
             })
             .unwrap();
         if let Some(geometry) = list_geometry {
@@ -4494,7 +4519,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                draw(frame, &app.view(), &theme, TEST_CUBE_ANGLE);
+                draw(frame, &app.view(0), &theme, TEST_CUBE_ANGLE);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -6087,7 +6112,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_input(frame, &app.view(), &Theme::new(true), frame.area());
+                render_input(frame, &app.view(0), &Theme::new(true), frame.area());
             })
             .unwrap();
     }
@@ -7251,6 +7276,38 @@ mod tests {
             !text.contains("stale-entry"),
             "loading must win over the previous contents"
         );
+    }
+
+    #[test]
+    fn preview_last_visit_line_tracks_the_frame_clock() {
+        // The "last visit" wording must come from the clock the frame was
+        // drawn with, not from a hidden wall-clock read inside the render
+        // path: two frames of the same state, two different verdicts.
+        let full = Rect::new(0, 0, 110, 24);
+        let mut app = preview_panel_app(full, "/home/jason/clock");
+        let last_visit = 1_700_000_000;
+        app.candidates[0].last_visit = Some(last_visit);
+        app.preview_current = Some(("/home/jason/clock".to_string(), preview_data(&["entry"])));
+
+        let recent = buffer_text(&render_buffer_at(
+            &app,
+            full.width,
+            full.height,
+            true,
+            last_visit + 2 * 60,
+        ));
+        assert!(recent.contains("2 分钟前"), "recent frame:\n{recent}");
+        assert!(!recent.contains("3 天前"), "recent frame:\n{recent}");
+
+        let older = buffer_text(&render_buffer_at(
+            &app,
+            full.width,
+            full.height,
+            true,
+            last_visit + 3 * 24 * 3600,
+        ));
+        assert!(older.contains("3 天前"), "older frame:\n{older}");
+        assert!(!older.contains("2 分钟前"), "older frame:\n{older}");
     }
 
     fn preview_data(names: &[&str]) -> PreviewOutcome {
