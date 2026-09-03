@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cdh — frecency directory jumping with a TUI picker</title>
-<meta name="description" content="cdh is a Rust CLI that scores your directory history with frecency (frequency x recency decay) and opens a terminal UI picker: fuzzy search, preview pane, git status, seven themes, bilingual EN/中文.">
+<title>cdh — jump to the directory you mean · frecency terminal picker</title>
+<meta name="description" content="cdh ranks every directory you touch by frecency — frequency × recency — then opens a terminal picker so the right path is one fuzzy search away.">
 <style>
 :root {
   --bg: #0a1014;
@@ -14,16 +14,34 @@
   --line-glow: #1f4a44;
   --text: #d7e3e6;
   --muted: #8aa3a8;
+  --heading: #eef6f4;
   --accent: #35e0b8;
   --accent-dim: #1f8f78;
-  --accent-ink: #062019;
-  --amber: #e8b45a;
-  --blue: #6fc3ff;
+  --btn-bg: #35e0b8;
+  --btn-bg-hover: #5cebcc;
+  --btn-ink: #052019;
+  --ring: rgba(53, 224, 184, 0.1);
+  --spot: rgba(53, 224, 184, 0.11);
+  --glow-1: rgba(53, 224, 184, 0.13);
+  --glow-floor: rgba(53, 224, 184, 0.2);
+  --grid-line: rgba(122, 214, 194, 0.05);
+  --nav-scrim: rgba(10, 16, 20, 0.86);
+  --nav-bg: rgba(10, 16, 20, 0.72);
+  --sheen: rgba(255, 255, 255, 0.028);
+  --ghost-ink: rgba(215, 227, 230, 0.09);
+  --shadow-lg: 0 26px 60px -22px rgba(0, 0, 0, 0.75);
   --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, "DejaVu Sans Mono", monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --wrap: 72rem;
+  --prose: 44rem;
+  --section-y: clamp(4rem, 7.5vw, 7rem);
+  --gap: clamp(0.9rem, 1.4vw, 1.25rem);
 }
 * { box-sizing: border-box; }
-html { scroll-behavior: smooth; }
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 5rem;
+}
 body {
   margin: 0;
   background: var(--bg);
@@ -34,103 +52,225 @@ body {
 }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
+h1, h2, h3, h4 { text-wrap: balance; }
+p, li { text-wrap: pretty; }
 a:focus-visible, button:focus-visible {
   outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline-offset: 3px;
   border-radius: 2px;
 }
-.wrap { max-width: 60rem; margin: 0 auto; padding: 0 1.25rem; }
-
-/* ---------- top nav ---------- */
-nav {
-  display: flex; align-items: center; gap: 1.25rem;
-  padding: 0.9rem 0; font-size: 0.92rem;
+code { font-family: var(--mono); font-size: 0.92em; }
+p code, li code {
+  color: var(--text);
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.05rem 0.32rem;
 }
-nav .logo {
+.wrap { max-width: var(--wrap); margin: 0 auto; padding: 0 clamp(1.25rem, 3.5vw, 2.5rem); }
+.rule {
+  height: 1px; border: 0; margin: 0;
+  background: linear-gradient(90deg, transparent, var(--line) 10%, var(--line) 90%, transparent);
+}
+
+/* ---------- decorative background ---------- */
+.bg-deco {
+  position: fixed; inset: 0; z-index: -1;
+  pointer-events: none; overflow: hidden;
+}
+.bg-grid {
+  position: absolute; inset: 0 -5%;
+  background-image:
+    repeating-linear-gradient(to right, var(--grid-line) 0 1px, transparent 1px 4.5rem),
+    repeating-linear-gradient(to bottom, var(--grid-line) 0 1px, transparent 1px 4.5rem);
+  -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.85), rgba(0, 0, 0, 0) 60%);
+  mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.85), rgba(0, 0, 0, 0) 60%);
+}
+.bg-glow {
+  position: absolute; inset: -6rem -10% auto -10%; height: 62rem;
+  background: radial-gradient(58% 58% at 36% 46%, var(--glow-1), transparent 72%);
+}
+
+/* ---------- scroll progress hairline ---------- */
+.progress {
+  position: fixed; top: 0; left: 0; right: 0; height: 2px;
+  z-index: 60; pointer-events: none;
+}
+.progress i {
+  display: block; width: 100%; height: 100%;
+  transform-origin: left center;
+  /* Resting state: with reduced motion or a blocked script GSAP never scrubs
+     this, and a full-width accent line would sit across the page forever. */
+  transform: scaleX(0);
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+}
+
+/* ---------- sticky nav ---------- */
+.site-nav {
+  position: sticky; top: 0; z-index: 50;
+  border-bottom: 1px solid transparent;
+  background: linear-gradient(to bottom, var(--nav-scrim), transparent);
+  transition: background-color 0.25s ease, border-color 0.25s ease;
+}
+.site-nav.is-stuck {
+  background: var(--nav-bg);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+  backdrop-filter: blur(12px) saturate(140%);
+  border-bottom-color: var(--line);
+}
+nav {
+  display: flex; align-items: center; gap: 1.5rem;
+  padding: 1.05rem 0; font-size: 0.92rem;
+  transition: padding 0.25s ease;
+}
+.site-nav.is-stuck nav { padding: 0.7rem 0; }
+.logo {
   font-family: var(--mono); font-weight: 700; font-size: 1.1rem;
   color: var(--text); letter-spacing: 0.02em;
 }
-nav .logo .tick { color: var(--accent); }
+.logo .tick { color: var(--accent); }
 nav .spacer { flex: 1; }
 nav a { color: var(--muted); }
 nav a:hover { color: var(--accent); }
 
 /* ---------- hero ---------- */
-.hero { padding: 3.5rem 0 2.5rem; text-align: center; }
-.hero .glow {
-  color: var(--accent);
-  font-family: var(--mono);
-  font-size: 0.9rem;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
+.hero {
+  display: flex; align-items: center;
+  min-height: min(92vh, 52rem);
+  min-height: min(92svh, 52rem);
+  padding: clamp(3rem, 6vw, 5.5rem) 0 clamp(2.5rem, 5vw, 4rem);
 }
-.hero h1 {
+.hero .wrap { width: 100%; }
+.eyebrow {
+  margin: 0 0 0.9rem;
+  font-family: var(--mono); font-size: 0.76rem;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--muted);
+}
+.eyebrow .n, .eyebrow .mark { color: var(--accent); }
+.hero-title {
+  margin: 0;
+  max-width: 26ch;
+  font-family: var(--sans);
+  font-size: clamp(2.3rem, 5.6vw, 4.3rem);
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  color: #f4faf8;
+}
+.hero-title .ma {
   font-family: var(--mono);
-  font-size: clamp(3rem, 10vw, 5rem);
-  margin: 0.4rem 0 0.6rem;
+  font-size: 0.92em;
   letter-spacing: -0.02em;
-  color: #f2f8f7;
-  text-shadow: 0 0 26px rgba(53, 224, 184, 0.35);
+  color: var(--accent);
 }
-.hero p.tag { font-size: 1.18rem; color: var(--muted); max-width: 40rem; margin: 0 auto 2rem; }
-.hero p.tag strong { color: var(--text); font-weight: 600; }
+/* Keeps the sans comma glued to the mono accent phrase: a mono comma sits
+   centred in a full advance width and reads as a stray gap. */
+.hero-title .phrase { white-space: nowrap; }
+.hero-title .w { display: inline-block; }
+.hero-rail {
+  margin: 1.2rem 0 0;
+  font-family: var(--mono); font-size: 0.8rem;
+  letter-spacing: 0.04em; color: var(--muted);
+}
+.hero-sub {
+  margin: 1.15rem 0 0;
+  max-width: var(--prose);
+  font-size: 1.15rem; color: var(--muted);
+}
+.hero-actions {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 1rem;
+  margin-top: 2.1rem;
+}
 
 /* install command + copy */
 .install-box {
   display: flex; align-items: stretch;
-  max-width: 40rem; margin: 0 auto;
+  flex: 1 1 28rem; max-width: 40rem;
   border: 1px solid var(--line-glow);
-  border-radius: 8px;
+  border-radius: 12px;
   background: var(--bg-soft);
-  box-shadow: 0 0 24px rgba(53, 224, 184, 0.08);
+  box-shadow: 0 0 0 4px var(--ring), var(--shadow-lg);
   overflow: hidden;
 }
 .install-box code {
-  flex: 1; display: block; padding: 0.85rem 1rem;
-  font-family: var(--mono); font-size: 0.86rem;
+  flex: 1; display: block; padding: 1.05rem 1.15rem;
+  font-family: var(--mono); font-size: 0.88rem;
   color: var(--accent);
-  white-space: nowrap; overflow-x: auto;
+  white-space: pre-wrap; overflow-wrap: anywhere;
   text-align: left;
 }
 .install-box code .sh { color: var(--muted); }
 #copy-btn {
   border: 0; border-left: 1px solid var(--line-glow);
-  background: var(--accent-dim);
-  color: var(--accent-ink);
+  background: var(--btn-bg);
+  color: var(--btn-ink);
   font-family: var(--sans); font-weight: 600; font-size: 0.85rem;
-  padding: 0 1.1rem; cursor: pointer;
+  padding: 0 1.35rem; cursor: pointer;
+  transition: background-color 0.2s ease;
 }
-#copy-btn:hover { background: var(--accent); }
+#copy-btn:hover { background: var(--btn-bg-hover); }
+.ghost-btn {
+  flex: none;
+  display: inline-block; padding: 0.85rem 1.2rem;
+  border: 1px solid var(--line-glow); border-radius: 12px;
+  background: transparent; color: var(--text);
+  font-size: 0.9rem; font-weight: 500;
+  transition: border-color 0.2s ease, color 0.2s ease;
+}
+.ghost-btn:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
 .copy-note {
-  min-height: 1.4em; margin: 0.6rem 0 0;
+  min-height: 1.4em; margin: 0.9rem 0 0;
   font-size: 0.85rem; color: var(--muted);
 }
-.hero .meta {
-  margin-top: 1.6rem; font-size: 0.85rem; color: var(--muted);
-  font-family: var(--mono);
+.scroll-cue {
+  display: inline-flex; align-items: baseline; gap: 0.5rem;
+  margin-top: clamp(2rem, 4vw, 3.2rem);
+  font-family: var(--mono); font-size: 0.82rem;
+  letter-spacing: 0.06em; color: var(--muted);
 }
-.hero .meta span { margin: 0 0.5rem; }
+.scroll-cue:hover { color: var(--accent); }
 
 /* ---------- sections ---------- */
-section { padding: 2.5rem 0 1rem; }
+section { padding: var(--section-y) 0; scroll-margin-top: 4.5rem; }
+.sec-head { margin: 0 0 clamp(2rem, 3.5vw, 3rem); }
 h2 {
-  font-size: 1.5rem; margin: 0 0 0.4rem; color: #eef6f4;
-  letter-spacing: -0.01em;
+  margin: 0;
+  font-size: clamp(1.65rem, 3vw, 2.35rem);
+  line-height: 1.15; letter-spacing: -0.02em;
+  color: var(--heading);
+  max-width: 34ch;
 }
-h2 .k { color: var(--accent); font-family: var(--mono); }
-.sub { color: var(--muted); margin: 0 0 1.8rem; max-width: 46rem; }
+.sub {
+  margin: 1rem 0 0;
+  max-width: var(--prose);
+  font-size: 1.02rem; color: var(--muted);
+}
 
 /* ---------- terminal window ---------- */
+.term-stage {
+  position: relative; isolation: isolate;
+  display: flex; justify-content: center;
+  padding-bottom: 2rem;
+}
+.term-stage::after {
+  content: ""; position: absolute; z-index: 0;
+  left: 50%; bottom: 0.75rem; translate: -50% 0;
+  width: min(46rem, 86%); height: 7rem;
+  border-radius: 50%;
+  background: var(--glow-floor);
+  filter: blur(46px);
+}
+.term-lift { position: relative; z-index: 1; max-width: 100%; }
 .term {
-  margin: 0.25rem 0 0;
+  margin: 0;
   /* Shrink to the recording's own width so it is shown at its native 1x size
      instead of being stretched to the prose column. */
   width: fit-content;
   max-width: 100%;
   border: 1px solid var(--line-glow);
-  border-radius: 10px;
+  border-radius: 12px;
   background: rgb(20, 24, 34);
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45), 0 0 30px rgba(53, 224, 184, 0.06);
+  box-shadow: var(--shadow-lg), 0 0 0 1px var(--ring);
   overflow: hidden;
 }
 .term-bar {
@@ -167,95 +307,186 @@ h2 .k { color: var(--accent); font-family: var(--mono); }
 }
 /* The recording is no longer selectable text, so the beats it walks through are
    spelled out on the page instead. */
-.demo-beats { margin: 0.9rem 0 0; padding: 0; list-style: none; }
-.demo-beats li {
-  position: relative; padding-left: 1.1rem;
-  font-size: 0.85rem; color: var(--muted); margin: 0.25rem 0;
+.beats {
+  display: grid; gap: 0.7rem 2.5rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: clamp(2rem, 3.5vw, 3rem) 0 0; padding: 0; list-style: none;
+  max-width: 62rem;
 }
-.demo-beats li::before {
-  content: "›"; position: absolute; left: 0;
-  font-family: var(--mono); color: var(--accent-dim);
+.beats li {
+  display: flex; gap: 0.75rem; margin: 0;
+  font-size: 0.9rem; color: var(--muted);
 }
-.demo-note { margin: 0.7rem 0 0; font-size: 0.8rem; color: var(--muted); }
+.beats .n {
+  flex: none; font-family: var(--mono); font-size: 0.78rem;
+  color: var(--accent-dim); padding-top: 0.15rem;
+  font-variant-numeric: tabular-nums;
+}
+.demo-note { margin: 1.6rem 0 0; font-size: 0.85rem; color: var(--muted); max-width: var(--prose); }
 
-/* ---------- features ---------- */
-.grid {
-  display: grid; gap: 1rem;
-  grid-template-columns: repeat(auto-fit, minmax(15.5rem, 1fr));
+/* ---------- features bento ---------- */
+.bento {
+  display: grid; gap: var(--gap);
+  grid-template-columns: repeat(12, minmax(0, 1fr));
 }
+.bento > .card { grid-column: span var(--span, 4); }
+.bento > .card:nth-child(1) { --span: 7; --span-md: 6; }
+.bento > .card:nth-child(2) { --span: 5; --span-md: 6; }
+.bento > .card:nth-child(3) { --span: 5; }
+.bento > .card:nth-child(5) { --span: 3; }
 .card {
-  background: var(--bg-card);
+  position: relative; isolation: isolate; overflow: hidden;
+  background: linear-gradient(180deg, var(--sheen), transparent 60%), var(--bg-card);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 1.1rem 1.2rem;
+  border-radius: 14px;
+  padding: 1.35rem 1.4rem 1.5rem;
+  transition: border-color 0.25s ease;
 }
 .card:hover { border-color: var(--line-glow); }
-.card .ic { font-size: 1.35rem; }
-.card h3 { margin: 0.5rem 0 0.35rem; font-size: 1.02rem; color: #eef6f4; }
-.card p { margin: 0; font-size: 0.9rem; color: var(--muted); }
+.card .badge, .card h3, .card p { position: relative; z-index: 1; }
+.badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 2.15rem; height: 2.15rem; padding: 0 0.5rem;
+  border: 1px solid var(--line-glow); border-radius: 9px;
+  background: var(--bg-soft);
+  font-family: var(--mono); font-size: 0.82rem; line-height: 1;
+  color: var(--accent);
+}
+.card h3 {
+  margin: 1rem 0 0.4rem;
+  font-size: 1.04rem; letter-spacing: -0.01em; color: var(--heading);
+}
+.card p { margin: 0; font-size: 0.92rem; color: var(--muted); }
+.card--wide { padding: clamp(1.35rem, 2vw, 1.8rem) clamp(1.4rem, 2.2vw, 1.9rem) clamp(1.5rem, 2.2vw, 1.9rem); }
+.card--wide h3 { font-size: clamp(1.06rem, 1.5vw, 1.24rem); }
+.card--wide p { font-size: clamp(0.92rem, 1.1vw, 0.99rem); }
+@media (hover: hover) {
+  .card::before {
+    content: ""; position: absolute; inset: 0; z-index: 0;
+    pointer-events: none; border-radius: inherit;
+    background: radial-gradient(circle at var(--mx, 50%) var(--my, 0%), var(--spot), transparent 70%);
+    clip-path: circle(0 at var(--mx, 50%) var(--my, 0%));
+    transition: clip-path 0.3s ease;
+  }
+  .card:hover::before { clip-path: circle(17rem at var(--mx, 50%) var(--my, 0%)); }
+}
 
 /* ---------- install ways ---------- */
-.ways { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
+.ways { display: grid; gap: var(--gap); grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); }
 .way {
-  background: var(--bg-card); border: 1px solid var(--line);
-  border-radius: 8px; padding: 1.1rem 1.2rem;
+  position: relative; overflow: hidden;
+  background: linear-gradient(180deg, var(--sheen), transparent 60%), var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: 14px; padding: 1.35rem 1.4rem 1.5rem;
+  transition: border-color 0.25s ease;
 }
-.way h3 { margin: 0 0 0.3rem; font-size: 1.02rem; color: #eef6f4; }
-.way h3 .n { color: var(--accent); font-family: var(--mono); margin-right: 0.4rem; }
-.way p { margin: 0 0 0.7rem; font-size: 0.88rem; color: var(--muted); }
+.way:hover { border-color: var(--line-glow); }
+.way .ghost-n {
+  position: absolute; top: 0.15rem; right: 0.6rem;
+  font-family: var(--mono); font-size: 4.2rem; line-height: 1;
+  font-weight: 700; letter-spacing: -0.04em;
+  color: var(--ghost-ink); pointer-events: none;
+}
+.way h3 {
+  position: relative; margin: 0 3rem 0.35rem 0;
+  font-size: 1.06rem; letter-spacing: -0.01em; color: var(--heading);
+}
+.way p { position: relative; margin: 0 0 0.85rem; font-size: 0.9rem; color: var(--muted); }
 .way pre {
-  margin: 0; padding: 0.7rem 0.85rem;
-  background: #070d11; border: 1px solid var(--line); border-radius: 6px;
-  font-family: var(--mono); font-size: 0.8rem; line-height: 1.5;
-  color: var(--accent); overflow-x: auto;
+  position: relative; margin: 0; padding: 0.85rem 0.95rem;
+  background: #070d11; border: 1px solid var(--line); border-radius: 9px;
+  font-family: var(--mono); font-size: 0.8rem; line-height: 1.55;
+  color: var(--accent);
+  white-space: pre-wrap; overflow-wrap: anywhere;
 }
-.way pre .c { color: #4b6a70; }
-.way .shells { margin-top: 0.6rem; font-size: 0.8rem; color: var(--muted); }
-.way .shells code { font-family: var(--mono); color: var(--text); background: var(--bg-soft); padding: 0.1rem 0.35rem; border-radius: 4px; }
+.way pre .c { color: #68898f; }
+.way .shells { margin: 0.8rem 0 0; font-size: 0.82rem; }
 
 /* ---------- footer ---------- */
 footer {
-  margin-top: 3rem; padding: 2rem 0 3rem;
+  margin-top: 0; padding: clamp(2.5rem, 4vw, 3.5rem) 0 3rem;
   border-top: 1px solid var(--line);
   font-size: 0.9rem; color: var(--muted);
 }
-footer .cols { display: flex; flex-wrap: wrap; gap: 2.5rem; }
-footer h4 { margin: 0 0 0.5rem; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--text); }
+footer .cols {
+  display: grid; gap: 2.5rem 3rem;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+}
+footer h4 { margin: 0 0 0.6rem; font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.16em; color: var(--text); }
 footer ul { list-style: none; margin: 0; padding: 0; }
-footer li { margin: 0.25rem 0; }
-footer .fine { margin-top: 1.8rem; font-size: 0.8rem; font-family: var(--mono); }
+footer li { margin: 0.3rem 0; }
+footer .brand p { margin: 0.7rem 0 0; max-width: 24rem; }
+footer .fine { margin-top: 2.2rem; font-size: 0.78rem; font-family: var(--mono); }
 
 /* ---------- light scheme (optional, dark is primary) ---------- */
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f6f9f8; --bg-soft: #eef4f2; --bg-card: #ffffff;
-    --line: #d5e0dd; --line-glow: #9ed8c9;
-    --text: #22333a; --muted: #5c7278;
-    --accent: #0b8f6f; --accent-dim: #14a683; --accent-ink: #ffffff;
-    --amber: #a06a12; --blue: #12689e;
+    --bg: #f6f9f8;
+    --bg-soft: #eef4f2;
+    --bg-card: #ffffff;
+    --line: #d5e0dd;
+    --line-glow: #86c8b5;
+    --text: #22333a;
+    --muted: #55696e;
+    --heading: #17262b;
+    --accent: #06765c;
+    --accent-dim: #0a7a5f;
+    --btn-bg: #06765c;
+    --btn-bg-hover: #05604b;
+    --btn-ink: #ffffff;
+    --ring: rgba(11, 143, 111, 0.14);
+    --spot: rgba(11, 143, 111, 0.09);
+    --glow-1: rgba(11, 143, 111, 0.1);
+    --glow-floor: rgba(11, 143, 111, 0.16);
+    --grid-line: rgba(11, 143, 111, 0.06);
+    --nav-scrim: rgba(246, 249, 248, 0.88);
+    --nav-bg: rgba(246, 249, 248, 0.8);
+    --sheen: rgba(34, 51, 58, 0.02);
+    --ghost-ink: rgba(34, 51, 58, 0.09);
+    --shadow-lg: 0 24px 55px -26px rgba(20, 51, 44, 0.28);
   }
-  .hero h1 { color: #14332c; text-shadow: none; }
+  .hero-title { color: #14332c; }
   .term, .way pre { background: #ffffff; }
-  h2, h2 + .sub strong, .card h3, .way h3 { color: #17262b; }
-  .hero p.tag strong { color: #17262b; }
-  .way pre .c { color: #8fa6ab; }
+  .way pre .c { color: #5f7880; }
 }
 
+/* ---------- responsive ---------- */
+@media (max-width: 62rem) {
+  .bento { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .bento > .card { grid-column: span var(--span-md, 3); }
+}
+@media (max-width: 48rem) {
+  .beats { grid-template-columns: minmax(0, 1fr); gap: 0.7rem; }
+}
+@media (max-width: 40rem) {
+  .hero-inner { text-align: center; }
+  .hero-title, .hero-sub { margin-inline: auto; }
+  .hero-actions { justify-content: center; }
+  .bento { grid-template-columns: minmax(0, 1fr); }
+  .bento > .card { grid-column: auto; }
+}
 @media (max-width: 34rem) {
   nav { gap: 0.9rem; font-size: 0.85rem; }
-  .hero { padding: 2.5rem 0 1.5rem; }
-  .term { font-size: 0.75rem; }
   .install-box { flex-direction: column; }
-  #copy-btn { border-left: 0; border-top: 1px solid var(--line-glow); padding: 0.6rem; }
+  #copy-btn { border-left: 0; border-top: 1px solid var(--line-glow); padding: 0.7rem; }
+  .way .ghost-n { font-size: 3.4rem; }
+  footer .cols { gap: 2rem; }
 }
 </style>
 </head>
 <body>
 
-<div class="wrap">
-  <nav aria-label="Site">
+<div class="progress" aria-hidden="true"><i></i></div>
+<div class="bg-deco" aria-hidden="true">
+  <div class="bg-grid"></div>
+  <div class="bg-glow"></div>
+</div>
+
+<div class="site-nav" id="site-nav">
+  <nav class="wrap" aria-label="Site">
     <span class="logo"><span class="tick">➜</span> cdh</span>
     <span class="spacer"></span>
+    <a href="#tui">Picker</a>
     <a href="#features">Features</a>
     <a href="#install">Install</a>
     <a href="https://github.com/xianyudd/cdh">GitHub</a>
@@ -263,120 +494,136 @@ footer .fine { margin-top: 1.8rem; font-size: 0.8rem; font-family: var(--mono); 
 </div>
 
 <header class="hero">
-  <div class="wrap">
-    <p class="glow">frequency × recency</p>
-    <h1>cdh</h1>
-    <p class="tag">
-      Jump to the directory you mean, not the one you type.
-      <strong>cdh</strong> scores your shell history with a <strong>frecency</strong>
-      model — visit frequency times recency decay — then opens a terminal UI picker
-      so the right path is one fuzzy search away.
+  <div class="wrap hero-inner">
+    <p class="eyebrow"><span class="mark" aria-hidden="true">✦</span> frequency × recency</p>
+    <h1 class="hero-title">Jump to the directory <span class="phrase"><span class="ma">you mean</span>,</span> not the one you type.</h1>
+    <p class="hero-rail">cdh v0.3.2 · Rust · MIT · MSRV 1.88 · bash · fish · zsh</p>
+    <p class="hero-sub">
+      cdh scores every directory you touch by frequency × recency, then opens a
+      terminal picker so the right path is always one fuzzy search away.
     </p>
-    <div class="install-box">
-      <code id="install-cmd"><span class="sh">$</span> curl -fsSL https://xianyudd.github.io/cdh/install.sh | bash</code>
-      <button id="copy-btn" type="button" aria-describedby="copy-note">Copy</button>
+    <div class="hero-actions">
+      <div class="install-box">
+        <code id="install-cmd"><span class="sh">$</span> curl -fsSL https://xianyudd.github.io/cdh/install.sh | bash</code>
+        <button id="copy-btn" type="button" aria-describedby="copy-note">Copy</button>
+      </div>
+      <a class="ghost-btn" href="#install">Other install options →</a>
     </div>
     <p class="copy-note" id="copy-note" aria-live="polite">Works with bash, fish and zsh — the installer auto-detects your shell.</p>
-    <p class="meta">
-      <span>v0.3.2</span>·<span>Rust</span>·<span>MIT</span>·<span>MSRV 1.88</span>
-    </p>
+    <a class="scroll-cue" href="#tui"><span aria-hidden="true">↓</span> watch a real session</a>
   </div>
 </header>
+
+<div class="wrap"><hr class="rule"></div>
 
 <main>
 <div class="wrap">
 
-<section id="tui" aria-label="The TUI picker">
-  <h2><span class="k">$</span> A picker that looks like your terminal, because it is one</h2>
-  <p class="sub">
-    One keybinding opens the picker inside your shell. Fuzzy-filter the candidates,
-    read the preview, hit <code>Enter</code> — cdh performs the jump, hands the
-    terminal back, and gets out of the way.
-  </p>
-  <figure class="term">
-    <div class="term-bar">
-      <span class="dot r" aria-hidden="true"></span><span class="dot y" aria-hidden="true"></span><span class="dot g" aria-hidden="true"></span>
-      <span class="title">cdh — recorded session</span>
+<section id="tui" aria-labelledby="tui-h">
+  <div class="sec-head">
+    <p class="eyebrow"><span class="n">01</span> / the picker</p>
+    <h2 id="tui-h">It looks like your terminal because it is one</h2>
+    <p class="sub">
+      One keybinding opens the picker inside your shell. Fuzzy-filter the candidates,
+      read the preview, hit <code>Enter</code> — cdh performs the jump, hands the
+      terminal back, and gets out of the way.
+    </p>
+  </div>
+  <div class="term-stage">
+    <div class="term-lift">
+      <figure class="term">
+        <div class="term-bar">
+          <span class="dot r" aria-hidden="true"></span><span class="dot y" aria-hidden="true"></span><span class="dot g" aria-hidden="true"></span>
+          <span class="title">cdh — recorded session</span>
+        </div>
+        <div class="demo">
+          <video width="880" height="540" autoplay loop muted playsinline preload="metadata" poster="./demo-poster.png">
+            <source src="./demo.webm" type="video/webm">
+            <source src="./demo.mp4" type="video/mp4">
+          </video>
+          <img src="./demo-poster.png" width="880" height="540" alt="The cdh picker in a 110-column terminal: a search prompt above a list of 21 ranked directories with ~/projects/awesome-app selected, a preview pane showing its git branch, last visit and contents, and a keybinding hint bar along the bottom.">
+        </div>
+        <figcaption class="demo-caption">
+          <span class="tag">recorded demo</span>
+          <span>A real cdh session captured in tmux — isolated demo home, no mock-up</span>
+        </figcaption>
+      </figure>
     </div>
-    <div class="demo">
-      <video width="880" height="540" autoplay loop muted playsinline preload="metadata" poster="./demo-poster.png">
-        <source src="./demo.webm" type="video/webm">
-        <source src="./demo.mp4" type="video/mp4">
-      </video>
-      <img src="./demo-poster.png" width="880" height="540" alt="The cdh picker in a 110-column terminal: a search prompt above a list of 21 ranked directories with ~/projects/awesome-app selected, a preview pane showing its git branch, last visit and contents, and a keybinding hint bar along the bottom.">
-    </div>
-    <figcaption class="demo-caption">
-      <span class="tag">recorded demo</span>
-      <span>A real cdh session captured in tmux — isolated demo home, no mock-up</span>
-    </figcaption>
-  </figure>
-  <ul class="demo-beats">
-    <li>Candidates ranked by frecency — most-used paths float to the top</li>
-    <li>Type to fuzzy-filter across history and discovered directories</li>
-    <li>Move the selection — the preview follows with git status and last visit</li>
-    <li>Tab toggles the preview off for a full-width list, Tab again brings it back</li>
-    <li>F1 opens help; F2 opens settings: theme, language, preview, mouse</li>
-    <li>Esc clears the query — Enter jumps</li>
-  </ul>
+  </div>
+  <ol class="beats">
+    <li><span class="n" aria-hidden="true">01</span><span>Candidates arrive ranked by frecency, so the paths you actually live in float to the top</span></li>
+    <li><span class="n" aria-hidden="true">02</span><span>Type to fuzzy-filter across your history and the directories cdh discovered</span></li>
+    <li><span class="n" aria-hidden="true">03</span><span>Move the selection and the preview follows, with git status and last visit</span></li>
+    <li><span class="n" aria-hidden="true">04</span><span><code>Tab</code> drops the preview for a full-width list, <code>Tab</code> again brings it back</span></li>
+    <li><span class="n" aria-hidden="true">05</span><span><code>F1</code> opens help, <code>F2</code> opens settings: theme, language, preview, mouse</span></li>
+    <li><span class="n" aria-hidden="true">06</span><span><code>Esc</code> clears the query, <code>Enter</code> jumps and gives the shell back</span></li>
+  </ol>
   <p class="demo-note">
     The loop plays on its own and carries no audio. If your system prefers reduced
     motion you get the still frame instead.
   </p>
 </section>
 
-<section id="features" aria-label="Features">
-  <h2><span class="k">#</span> What you get</h2>
-  <p class="sub">A small binary with a few opinions, all of them about getting you to the right directory faster.</p>
-  <div class="grid">
-    <div class="card">
-      <span class="ic" aria-hidden="true">📉</span>
+<section id="features" aria-labelledby="features-h">
+  <div class="sec-head">
+    <p class="eyebrow"><span class="n">02</span> / what you get</p>
+    <h2 id="features-h">The parts that do the work</h2>
+    <p class="sub">One binary, one scoring model, one picker. Here is what each of them gives you.</p>
+  </div>
+  <div class="bento">
+    <div class="card card--wide">
+      <span class="badge" aria-hidden="true">f×r</span>
       <h3>Frecency scoring that decays</h3>
-      <p>Visit frequency is blended with a recency half-life and fused across multiple signals — so a directory you lived in last month stops crowding out the one you opened five minutes ago, and <code>$HOME</code> no longer bosses the leaderboard.</p>
+      <p>Visit frequency is blended with a recency half-life, so the directory you lived in last month stops crowding out the one you opened five minutes ago. <code>$HOME</code> no longer owns the top of the list.</p>
+    </div>
+    <div class="card card--wide">
+      <span class="badge" aria-hidden="true">Tab</span>
+      <h3>Fuzzy search, live preview</h3>
+      <p>Type a fragment and the list re-filters as you go. The preview pane shows contents, git branch and dirty state, and when you were last there — before you commit to the jump.</p>
     </div>
     <div class="card">
-      <span class="ic" aria-hidden="true">🔍</span>
-      <h3>Fuzzy search with live preview</h3>
-      <p>Type a fragment, get instant re-filtering. The preview pane shows directory contents, the git branch and dirty state, and when you last visited — before you commit to the jump.</p>
+      <span class="badge" aria-hidden="true">Ctrl+D</span>
+      <h3>History plus the whole tree</h3>
+      <p>The candidate pool merges your cd history with a background scan of the tree, so paths you have never visited are still findable. <code>Ctrl+D</code> excludes a subtree for good.</p>
     </div>
     <div class="card">
-      <span class="ic" aria-hidden="true">🌳</span>
-      <h3>History plus directory tree</h3>
-      <p>The candidate pool merges your cd history with a background scan of the tree, so directories you have never visited are still findable. <code>Ctrl+D</code> excludes a subtree for good.</p>
-    </div>
-    <div class="card">
-      <span class="ic" aria-hidden="true">🎨</span>
+      <span class="badge" aria-hidden="true">F2</span>
       <h3>Seven themes</h3>
-      <p>Graphite, Nord, Daylight, Mono, Dracula, Amber and Forest — with full no-colour fallback, because a picker should respect your terminal, not fight it.</p>
+      <p>Graphite, Nord, Daylight, Mono, Dracula, Amber and Forest, switched in settings (<code>F2</code>) or cycled with <code>Ctrl+T</code> or <code>F3</code>. No-colour terminals get a full fallback.</p>
     </div>
     <div class="card">
-      <span class="ic" aria-hidden="true">🌏</span>
-      <h3>Bilingual interface</h3>
-      <p>The whole TUI speaks English and 中文, switchable in settings. Fullwidth input like <code>？</code> works in the query line too.</p>
+      <span class="badge" aria-hidden="true">文A</span>
+      <h3>English and 中文</h3>
+      <p>The whole TUI speaks both, switchable in settings. Fullwidth input like <code>？</code> works in the query line too.</p>
     </div>
     <div class="card">
-      <span class="ic" aria-hidden="true">🖱️</span>
-      <h3>Mouse support, honest keys</h3>
-      <p>Click to select, double-click to jump, wheel to scroll — and a complete keyboard map (<code>F1</code> help, <code>F2</code> settings, <code>F4</code> exclusion list) for when you never leave the home row.</p>
+      <span class="badge" aria-hidden="true">F1</span>
+      <h3>Mouse, and honest keys</h3>
+      <p>Click to select, double-click to jump, wheel to scroll. The keyboard map is complete: <code>F1</code> help, <code>F4</code> exclusions, <code>Ctrl+H</code> or <code>F5</code> for hidden directories.</p>
     </div>
     <div class="card">
-      <span class="ic" aria-hidden="true">🧊</span>
+      <span class="badge" aria-hidden="true">◇</span>
       <h3>A quiet corner cube</h3>
-      <p>A small ambient 3D cube animates in the corner — non-blocking, off in no-colour mode, disableable via environment variable, and never in front of your selected row. Terminal bling with manners.</p>
+      <p>A small ambient cube animates in the corner: non-blocking, off in no-colour mode, disabled by an environment variable if you want it gone. It never covers the selected row.</p>
     </div>
     <div class="card">
-      <span class="ic" aria-hidden="true">🦀</span>
+      <span class="badge" aria-hidden="true">~/</span>
       <h3>One Rust binary, XDG-clean</h3>
-      <p>Single static-friendly binary from Rust with MSRV 1.88. History and state live under <code>~/.local/share/cdh</code> and <code>~/.local/state/cdh</code>; shell integration is a lightweight hook for bash, fish and zsh.</p>
+      <p>A single static-friendly binary built at MSRV 1.88. History and state live under <code>~/.local/share/cdh</code> and <code>~/.local/state/cdh</code>; the shell hook is a few lines for bash, fish or zsh.</p>
     </div>
   </div>
 </section>
 
-<section id="install" aria-label="Installation">
-  <h2><span class="k">λ</span> Three ways in</h2>
-  <p class="sub">Pick whichever fits your machine. The curl installer auto-detects your shell and wires up the hook.</p>
+<section id="install" aria-labelledby="install-h">
+  <div class="sec-head">
+    <p class="eyebrow"><span class="n">03</span> / install</p>
+    <h2 id="install-h">Three ways in</h2>
+    <p class="sub">Pick whichever fits your machine. The curl installer auto-detects your shell and wires up the hook.</p>
+  </div>
   <div class="ways">
     <div class="way">
-      <h3><span class="n">01</span>Curl installer</h3>
+      <span class="ghost-n" aria-hidden="true">01</span>
+      <h3>Curl installer</h3>
       <p>One line, any of the three shells.</p>
       <pre><span class="c"># auto-detect shell</span>
 curl -fsSL https://xianyudd.github.io/cdh/install.sh | bash
@@ -387,13 +634,15 @@ curl -fsSL https://xianyudd.github.io/cdh/install.sh \
       <p class="shells">Shell hooks: <code>bash</code> <code>fish</code> <code>zsh</code></p>
     </div>
     <div class="way">
-      <h3><span class="n">02</span>cargo install</h3>
+      <span class="ghost-n" aria-hidden="true">02</span>
+      <h3>cargo install</h3>
       <p>If you already live in Cargo.</p>
       <pre>cargo install cdh</pre>
       <p class="shells">Then add the shell hook with the curl installer, or follow the <a href="https://github.com/xianyudd/cdh/blob/main/README.en.md">README</a>.</p>
     </div>
     <div class="way">
-      <h3><span class="n">03</span>GitHub Releases</h3>
+      <span class="ghost-n" aria-hidden="true">03</span>
+      <h3>GitHub Releases</h3>
       <p>Prebuilt binaries, no toolchain needed.</p>
       <pre><span class="c"># example: Linux x86_64</span>
 curl -fsSL https://github.com/xianyudd/cdh/releases/download/\
@@ -430,8 +679,15 @@ v0.3.2/cdh-v0.3.2-x86_64-unknown-linux-gnu.tar.gz \
           <li><a href="./install.sh">install.sh</a></li>
         </ul>
       </div>
+      <div class="brand">
+        <span class="logo"><span class="tick">➜</span> cdh</span>
+        <p>
+          cdh scores every directory you touch by frequency × recency, then opens a
+          terminal picker so the right path is always one fuzzy search away.
+        </p>
+      </div>
     </div>
-    <p class="fine">cdh v0.3.2 · MIT · Rust (MSRV 1.88) · this page has no external dependencies</p>
+    <p class="fine">cdh v0.3.2 · MIT · Rust (MSRV 1.88) · no third-party requests — GSAP bundled locally</p>
   </div>
 </footer>
 
@@ -468,6 +724,132 @@ v0.3.2/cdh-v0.3.2-x86_64-unknown-linux-gnu.tar.gz \
       }
       document.body.removeChild(ta);
     }
+  });
+})();
+</script>
+
+<script src="./vendor/gsap.min.js"></script>
+<script src="./vendor/ScrollTrigger.min.js"></script>
+<script>
+/* Pointer spotlight on the feature cards. Independent of GSAP: it only writes
+   --mx / --my, which a radial-gradient in .card::before reads. */
+(function () {
+  var grid = document.querySelector(".bento");
+  if (!grid || !window.matchMedia) { return; }
+  if (!window.matchMedia("(hover: hover)").matches) { return; }
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) { return; }
+  grid.addEventListener("pointermove", function (ev) {
+    var card = ev.target && ev.target.closest ? ev.target.closest(".card") : null;
+    if (!card) { return; }
+    var box = card.getBoundingClientRect();
+    if (!box.width || !box.height) { return; }
+    card.style.setProperty("--mx", ((ev.clientX - box.left) / box.width * 100).toFixed(2) + "%");
+    card.style.setProperty("--my", ((ev.clientY - box.top) / box.height * 100).toFixed(2) + "%");
+  });
+})();
+
+(function () {
+  if (!window.gsap || !window.ScrollTrigger) { return; }
+  gsap.registerPlugin(ScrollTrigger);
+
+  var nav = document.getElementById("site-nav");
+  var bar = document.querySelector(".progress i");
+  var heroWords = null;
+
+  /* Wrap each word of the headline in a span so it can be staggered. Built from
+     textContent, never markup, and the accent fragment keeps its own element. */
+  function wordsOf(root) {
+    var out = [];
+    (function walk(node) {
+      Array.prototype.slice.call(node.childNodes).forEach(function (kid) {
+        if (kid.nodeType === 3) {
+          var frag = document.createDocumentFragment();
+          kid.nodeValue.split(/(\s+)/).forEach(function (piece) {
+            if (!piece) { return; }
+            if (/^\s+$/.test(piece)) { frag.appendChild(document.createTextNode(" ")); return; }
+            var span = document.createElement("span");
+            span.className = "w";
+            span.textContent = piece;
+            frag.appendChild(span);
+            out.push(span);
+          });
+          node.replaceChild(frag, kid);
+        } else if (kid.nodeType === 1) {
+          walk(kid);
+        }
+      });
+    })(root);
+    return out;
+  }
+
+  gsap.matchMedia().add("(prefers-reduced-motion: no-preference)", function () {
+    var title = document.querySelector(".hero-title");
+    if (title && !heroWords) { heroWords = wordsOf(title); }
+
+    gsap.timeline({ defaults: { ease: "power3.out" } })
+      .from(".hero .eyebrow", { y: 16, opacity: 0, duration: 0.45, clearProps: "transform,opacity" }, 0)
+      .from(heroWords || [], { y: 16, opacity: 0, duration: 0.45, stagger: 0.035, clearProps: "transform,opacity" }, 0.1)
+      .from([".hero-rail", ".hero-sub", ".install-box", ".copy-note", ".ghost-btn", ".scroll-cue"],
+        { y: 16, opacity: 0, duration: 0.5, stagger: 0.045, clearProps: "transform,opacity" }, 0.42);
+
+    gsap.from(".term-lift", {
+      y: 60, scale: 0.94, rotationX: 8, opacity: 0,
+      transformPerspective: 1200, transformOrigin: "50% 100%",
+      duration: 0.85, ease: "power3.out",
+      /* The recording is pixel-exact at 1x; a leftover fractional transform would
+         make the compositor resample it, so drop it the moment we land. */
+      clearProps: "transform,transformOrigin,opacity",
+      scrollTrigger: { trigger: ".term-stage", start: "top 85%", once: true }
+    });
+
+    gsap.utils.toArray(".sec-head").forEach(function (head) {
+      gsap.from(head.children, {
+        y: 20, opacity: 0, duration: 0.55, stagger: 0.08, ease: "power3.out",
+        clearProps: "transform,opacity",
+        scrollTrigger: { trigger: head, start: "top 88%", once: true }
+      });
+    });
+
+    gsap.from(".beats li", {
+      x: -16, opacity: 0, duration: 0.5, stagger: 0.06, ease: "power3.out",
+      clearProps: "transform,opacity",
+      scrollTrigger: { trigger: ".beats", start: "top 88%", once: true }
+    });
+
+    gsap.from(".bento > .card", {
+      y: 24, opacity: 0, duration: 0.55, stagger: 0.05, ease: "power3.out",
+      clearProps: "transform,opacity",
+      scrollTrigger: { trigger: ".bento", start: "top 82%", once: true }
+    });
+
+    gsap.from(".ways > .way", {
+      y: 24, opacity: 0, duration: 0.55, stagger: 0.05, ease: "power3.out",
+      clearProps: "transform,opacity",
+      scrollTrigger: { trigger: ".ways", start: "top 82%", once: true }
+    });
+
+    gsap.to(".bg-glow", {
+      yPercent: 10, ease: "none",
+      scrollTrigger: { start: 0, end: "max", scrub: true }
+    });
+
+    if (bar) {
+      gsap.fromTo(bar, { scaleX: 0 }, {
+        scaleX: 1, ease: "none",
+        scrollTrigger: { start: 0, end: "max", scrub: true }
+      });
+    }
+
+    if (nav) {
+      ScrollTrigger.create({
+        start: 40, end: 99999,
+        toggleClass: { targets: nav, className: "is-stuck" }
+      });
+    }
+
+    return function () {
+      if (nav) { nav.classList.remove("is-stuck"); }
+    };
   });
 })();
 </script>
