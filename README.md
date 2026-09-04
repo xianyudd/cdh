@@ -181,18 +181,20 @@ fzf 风格的模糊搜索，只渲染当前页。每行显示完整路径，Home
 | `CDH_MOUSE` | `1` | 设为 `0` 关闭鼠标捕获 |
 | `CDH_PREVIEW` | `0` | 设为 `1` 启动时默认打开预览；也可按 `Tab` 切换 |
 | `CDH_LANG` | 自动 | TUI 语言；支持 `zh-CN` / `zh` 和 `en` / `en-US`；无法识别的值会被忽略 |
+| `CDH_THEME` | `graphite` | TUI 配色主题；可选 `graphite` / `nord` / `daylight` / `mono` / `dracula` / `amber` / `forest`；无法识别的值会被忽略 |
 | `CDH_CORNER_3D` | `1` | 设为 `0` 关闭主界面右下角环境 3D 线框立方体（仅彩色模式） |
 | `CDH_DISCOVER` | `1` | 目录树发现层总开关；设为 `0` 只用历史候选，不扫描目录树 |
 | `CDH_SCAN_ROOTS` | 自动 | 冒号分隔，覆盖扫描根列表（默认：历史锚点 → `$HOME` 全树 → `$HOME` 外锚点级联） |
 | `CDH_SCAN_DEPTH` | 不限 | 可选硬深度上限；不设时历史锚点下探 1 层、`$HOME` 全树不限深、`$HOME` 外锚点下探 4 层 |
 | `CDH_ANIM` | 任意 | 保留兼容；TUI 已改为事件驱动，不再使用固定刷新动画 |
 
-按 `F2` 可持久化四项 TUI 设置：语言、启动时预览、颜色和鼠标捕获。配置文件位于
+按 `F2` 可持久化五项 TUI 设置：语言、配色主题、启动时预览、颜色和鼠标捕获。配置文件位于
 `$XDG_CONFIG_HOME/cdh/tui.toml`（未设置 `XDG_CONFIG_HOME` 时使用 cdh 已解析的用户配置目录），
 格式如下：
 
 ```toml
 language = "auto" # auto、zh-CN 或 en
+theme = "graphite" # graphite、nord、daylight、mono、dracula、amber 或 forest
 preview = false
 color = true
 mouse = true
@@ -200,7 +202,7 @@ mouse = true
 
 有效值按“环境变量 > 配置文件 > 内置默认值”的优先级解析。`CDH_PREVIEW`、
 `CDH_COLOR` 或 `CDH_MOUSE` 存在时，对应设置行会标记为环境控制/只读；`CDH_LANG`
-只有在值能识别时才会锁定语言行，无法识别的值会被忽略。设置浮层中的修改会写入文件；
+和 `CDH_THEME` 只有在值能识别时才会锁定对应行，无法识别的值会被忽略。设置浮层中的修改会写入文件；
 `Tab` 切换预览只影响当前 TUI 会话，不会改变 `preview`。持久化通过同目录临时文件和
 原子重命名完成，保证范围为 Unix 及 WSL；不承诺原生 Windows 文件系统语义。
 

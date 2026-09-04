@@ -166,6 +166,7 @@ The ones you are most likely to touch:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CDH_LANG` | auto | TUI language; accepts `zh-CN` / `zh` and `en` / `en-US`; unrecognised values are ignored |
+| `CDH_THEME` | `graphite` | TUI colour theme; one of `graphite` / `nord` / `daylight` / `mono` / `dracula` / `amber` / `forest`; unrecognised values are ignored |
 | `CDH_COLOR` | `1` | `0` turns colour off (the selected row falls back to reverse video) |
 | `CDH_MOUSE` | `1` | `0` turns mouse capture off |
 | `CDH_PREVIEW` | `0` | `1` opens the preview pane at startup; `Tab` still toggles it |
@@ -179,22 +180,23 @@ The ones you are most likely to touch:
 variables `CDH_W_FRECENCY` / `CDH_W_RECENCY` / `CDH_W_CONTEXT` / `CDH_W_UNIQ` are in
 [排序算法 — scoring](./README.md#排序算法).
 
-`F2` persists four TUI settings — language, preview at startup, colour and mouse
-capture — to `$XDG_CONFIG_HOME/cdh/tui.toml`:
+`F2` persists five TUI settings — language, colour theme, preview at startup, colour
+and mouse capture — to `$XDG_CONFIG_HOME/cdh/tui.toml`:
 
 ```toml
 language = "auto" # auto, zh-CN or en
+theme = "graphite" # graphite, nord, daylight, mono, dracula, amber or forest
 preview = false
 color = true
 mouse = true
 ```
 
 Values resolve as **environment variable > config file > built-in default**, and a
-setting whose variable is in effect is shown read-only in the overlay (`CDH_LANG`
-counts only when its value is recognised). Toggling the preview with `Tab` never
-rewrites `preview`. Writes go through a temporary file in the same directory plus an
-atomic rename, guaranteed on Unix and WSL — native Windows filesystem semantics are
-not promised.
+setting whose variable is in effect is shown read-only in the overlay (`CDH_LANG` and
+`CDH_THEME` count only when their values are recognised). Toggling the preview with
+`Tab` never rewrites `preview`. Writes go through a temporary file in the same
+directory plus an atomic rename, guaranteed on Unix and WSL — native Windows
+filesystem semantics are not promised.
 
 ### Command line
 
