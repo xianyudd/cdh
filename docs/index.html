@@ -65,7 +65,7 @@
     <p class="eyebrow">the picker</p>
     <h2 id="tui-h">It looks like your terminal because it is one</h2>
     <p class="sub">
-      One keybinding opens the picker inside your shell. Fuzzy-filter the candidates,
+      One command opens the picker inside your shell. Fuzzy-filter the candidates,
       read the preview, hit <code>Enter</code>. cdh performs the jump, hands the
       terminal back, and gets out of the way.
     </p>
@@ -96,7 +96,7 @@
     <li><span class="n" aria-hidden="true">02</span><span>Type to fuzzy-filter across your history and the directories cdh discovered</span></li>
     <li><span class="n" aria-hidden="true">03</span><span>Move the selection and the preview follows, with git status and last visit</span></li>
     <li><span class="n" aria-hidden="true">04</span><span><code>Tab</code> drops the preview for a full-width list, <code>Tab</code> again brings it back</span></li>
-    <li><span class="n" aria-hidden="true">05</span><span><code>F1</code> opens help, <code>F2</code> opens settings: theme, language, preview, mouse</span></li>
+    <li><span class="n" aria-hidden="true">05</span><span><code>F1</code> opens help, <code>F2</code> opens settings: language, theme, preview, colour, mouse</span></li>
     <li><span class="n" aria-hidden="true">06</span><span><code>Esc</code> clears the query, <code>Enter</code> jumps and gives the shell back</span></li>
   </ol>
   <p class="demo-note">
@@ -152,15 +152,16 @@
       <dl>
         <div><dt>↑ ↓</dt><dd>move</dd></div>
         <div><dt>Ctrl+P Ctrl+N</dt><dd>move, without arrows</dd></div>
-        <div><dt>PgUp PgDn</dt><dd>page</dd></div>
+        <div><dt>Ctrl+↑ Ctrl+↓ PgUp PgDn</dt><dd>page</dd></div>
         <div><dt>Home End</dt><dd>first, last</dd></div>
         <div><dt>← →</dt><dd>move the query cursor</dd></div>
+        <div><dt>Backspace Delete</dt><dd>delete before, at the cursor</dd></div>
         <div><dt>Ctrl+U</dt><dd>clear the query</dd></div>
         <div><dt>Enter</dt><dd>jump</dd></div>
         <div><dt>Tab</dt><dd>toggle the preview</dd></div>
-        <div><dt>Ctrl+D</dt><dd>forget this entry</dd></div>
+        <div><dt>Ctrl+D</dt><dd>exclude directory and subtree</dd></div>
         <div><dt>Ctrl+H F5</dt><dd>hidden directories</dd></div>
-        <div><dt>F1 ?</dt><dd>help</dd></div>
+        <div><dt>F1 ?</dt><dd>help, fullwidth ？ too</dd></div>
         <div><dt>F2</dt><dd>settings</dd></div>
         <div><dt>F3 Ctrl+T</dt><dd>cycle the theme</dd></div>
         <div><dt>F4</dt><dd>exclusions</dd></div>
