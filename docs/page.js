@@ -112,6 +112,11 @@
   var bar = document.querySelector(".progress i");
   var heroWords = null;
 
+  var CJK = "぀-ヿ㐀-䶿一-鿿豈-﫿";
+  /* Closing punctuation glues to the character before it so it can never begin a line. */
+  var GLUE = "、。…》」』】〕！），．：；？｝";
+  var TOKEN = new RegExp("[" + CJK + "][" + GLUE + "]*|[^\\s" + CJK + "]+|\\s+", "g");
+
   /* Wrap each word of the headline in a span so it can be staggered. Built from
      textContent, never markup, and the accent fragment keeps its own element. */
   function wordsOf(root) {
@@ -120,8 +125,7 @@
       Array.prototype.slice.call(node.childNodes).forEach(function (kid) {
         if (kid.nodeType === 3) {
           var frag = document.createDocumentFragment();
-          kid.nodeValue.split(/(\s+)/).forEach(function (piece) {
-            if (!piece) { return; }
+          (kid.nodeValue.match(TOKEN) || []).forEach(function (piece) {
             if (/^\s+$/.test(piece)) { frag.appendChild(document.createTextNode(" ")); return; }
             var span = document.createElement("span");
             span.className = "w";
