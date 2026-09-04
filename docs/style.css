@@ -1,0 +1,565 @@
+:root {
+  color-scheme: dark;
+
+  /* The light palette is spelled out once, here. The two blocks at the bottom of
+     the file only remap these onto the live tokens, so no colour value exists in
+     two places where the two copies could drift apart. */
+  --l-bg: #f6f9f8;
+  --l-bg-soft: #eef4f2;
+  --l-bg-card: #ffffff;
+  --l-line: #d5e0dd;
+  --l-line-glow: #86c8b5;
+  --l-text: #22333a;
+  --l-muted: #55696e;
+  --l-heading: #17262b;
+  --l-accent: #06765c;
+  --l-accent-dim: #0a7a5f;
+  --l-btn-bg: #06765c;
+  --l-btn-bg-hover: #05604b;
+  --l-btn-ink: #ffffff;
+  --l-ring: rgba(11, 143, 111, 0.14);
+  --l-spot: rgba(11, 143, 111, 0.09);
+  --l-glow-1: rgba(11, 143, 111, 0.1);
+  --l-glow-floor: rgba(11, 143, 111, 0.16);
+  --l-grid-line: rgba(11, 143, 111, 0.06);
+  --l-nav-scrim: rgba(246, 249, 248, 0.88);
+  --l-nav-bg: rgba(246, 249, 248, 0.8);
+  --l-sheen: rgba(34, 51, 58, 0.02);
+  --l-shadow-lg: 0 24px 55px -26px rgba(20, 51, 44, 0.28);
+  --l-hero-ink: #14332c;
+  --l-term-bg: #ffffff;
+
+  --bg: #0a1014;
+  --bg-soft: #0e161c;
+  --bg-card: #101a21;
+  --line: #1d2b33;
+  --line-glow: #1f4a44;
+  --text: #d7e3e6;
+  --muted: #8aa3a8;
+  --heading: #eef6f4;
+  --accent: #35e0b8;
+  --accent-dim: #1f8f78;
+  --btn-bg: #35e0b8;
+  --btn-bg-hover: #5cebcc;
+  --btn-ink: #052019;
+  --ring: rgba(53, 224, 184, 0.1);
+  --spot: rgba(53, 224, 184, 0.11);
+  --glow-1: rgba(53, 224, 184, 0.13);
+  --glow-floor: rgba(53, 224, 184, 0.2);
+  --grid-line: rgba(122, 214, 194, 0.05);
+  --nav-scrim: rgba(10, 16, 20, 0.86);
+  --nav-bg: rgba(10, 16, 20, 0.72);
+  --sheen: rgba(255, 255, 255, 0.028);
+  --shadow-lg: 0 26px 60px -22px rgba(0, 0, 0, 0.75);
+  --hero-ink: #f4faf8;
+  --term-bg: rgb(20, 24, 34);
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --wrap: 72rem;
+  --prose: 44rem;
+  --section-y: clamp(4rem, 7.5vw, 7rem);
+  --gap: clamp(0.9rem, 1.4vw, 1.25rem);
+}
+* { box-sizing: border-box; }
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 5rem;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  line-height: 1.6;
+  -webkit-text-size-adjust: 100%;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+h1, h2, h3, h4 { text-wrap: balance; }
+p, li { text-wrap: pretty; }
+a:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+code { font-family: var(--mono); font-size: 0.92em; }
+/* Mono plus colour, no box: a bordered pill needs horizontal padding, and that
+   padding reads as a stray space next to adjacent punctuation. nowrap keeps a
+   token like --shell from breaking after its own leading dashes. */
+p code, li code { color: var(--accent-dim); white-space: nowrap; }
+.wrap { max-width: var(--wrap); margin: 0 auto; padding: 0 clamp(1.25rem, 3.5vw, 2.5rem); }
+.rule {
+  height: 1px; border: 0; margin: 0;
+  background: linear-gradient(90deg, transparent, var(--line) 10%, var(--line) 90%, transparent);
+}
+
+/* ---------- decorative background ---------- */
+.bg-deco {
+  position: fixed; inset: 0; z-index: -1;
+  pointer-events: none; overflow: hidden;
+}
+.bg-grid {
+  position: absolute; inset: 0 -5%;
+  background-image:
+    repeating-linear-gradient(to right, var(--grid-line) 0 1px, transparent 1px 4.5rem),
+    repeating-linear-gradient(to bottom, var(--grid-line) 0 1px, transparent 1px 4.5rem);
+  -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.85), rgba(0, 0, 0, 0) 60%);
+  mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.85), rgba(0, 0, 0, 0) 60%);
+}
+.bg-glow {
+  position: absolute; inset: -6rem -10% auto -10%; height: 62rem;
+  background: radial-gradient(58% 58% at 36% 46%, var(--glow-1), transparent 72%);
+}
+
+/* ---------- scroll progress hairline ---------- */
+.progress {
+  position: fixed; top: 0; left: 0; right: 0; height: 2px;
+  z-index: 60; pointer-events: none;
+}
+.progress i {
+  display: block; width: 100%; height: 100%;
+  transform-origin: left center;
+  /* Resting state: with reduced motion or a blocked script GSAP never scrubs
+     this, and a full-width accent line would sit across the page forever. */
+  transform: scaleX(0);
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+}
+
+/* ---------- sticky nav ---------- */
+.site-nav {
+  position: sticky; top: 0; z-index: 50;
+  border-bottom: 1px solid transparent;
+  background: linear-gradient(to bottom, var(--nav-scrim), transparent);
+  transition: background-color 0.25s ease, border-color 0.25s ease;
+}
+.site-nav.is-stuck {
+  background: var(--nav-bg);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+  backdrop-filter: blur(12px) saturate(140%);
+  border-bottom-color: var(--line);
+}
+/* justify-content only bites on a wrapped row: on the first row .spacer has
+   already eaten the free space, so this just keeps a wrapped nav item aligned
+   under the links instead of orphaned at the left edge. */
+nav {
+  display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end;
+  gap: 1.5rem;
+  padding: 1.05rem 0; font-size: 0.92rem;
+  transition: padding 0.25s ease;
+}
+.site-nav.is-stuck nav { padding: 0.7rem 0; }
+.logo {
+  font-family: var(--mono); font-weight: 700; font-size: 1.1rem;
+  color: var(--text); letter-spacing: 0.02em;
+}
+.logo .tick { color: var(--accent); }
+nav .spacer { flex: 1; }
+nav a { color: var(--muted); }
+nav a:hover { color: var(--accent); }
+.theme-mount { display: inline-flex; }
+.theme-btn {
+  margin: 0; padding: 0; border: 0;
+  background: none; color: var(--muted);
+  font: inherit; cursor: pointer;
+  /* Sized to the widest label in any language that ships this sheet: without it,
+     cycling the state changes the button's width and shoves every nav link
+     sideways. The ceiling is 跟随系统 — four full-width glyphs at the nav's
+     0.92rem, so 3.68rem — not the shorter English labels. */
+  min-width: 4rem; text-align: right;
+}
+.theme-btn:hover { color: var(--accent); }
+
+/* ---------- hero ---------- */
+.hero {
+  display: flex; align-items: center;
+  min-height: min(92vh, 52rem);
+  min-height: min(92svh, 52rem);
+  padding: clamp(3rem, 6vw, 5.5rem) 0 clamp(2.5rem, 5vw, 4rem);
+}
+.hero .wrap { width: 100%; }
+.eyebrow {
+  margin: 0 0 0.9rem;
+  font-family: var(--mono); font-size: 0.76rem;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--muted);
+}
+.eyebrow .mark { color: var(--accent); }
+.hero-title {
+  margin: 0;
+  max-width: 26ch;
+  font-family: var(--sans);
+  font-size: clamp(2.3rem, 5.6vw, 4.3rem);
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  color: var(--hero-ink);
+}
+.hero-title .ma {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  letter-spacing: -0.02em;
+  color: var(--accent);
+}
+/* Keeps the sans comma glued to the mono accent phrase: a mono comma sits
+   centred in a full advance width and reads as a stray gap. */
+.hero-title .phrase { white-space: nowrap; }
+.hero-title .w { display: inline-block; }
+.hero-rail {
+  margin: 1.2rem 0 0;
+  font-family: var(--mono); font-size: 0.8rem;
+  letter-spacing: 0.04em; color: var(--muted);
+}
+.hero-sub {
+  margin: 1.15rem 0 0;
+  max-width: var(--prose);
+  font-size: 1.15rem; color: var(--muted);
+}
+.hero-actions {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 1rem;
+  margin-top: 2.1rem;
+}
+
+/* install command + copy */
+.install-box {
+  display: flex; align-items: stretch;
+  flex: 1 1 28rem; max-width: 40rem;
+  border: 1px solid var(--line-glow);
+  border-radius: 12px;
+  background: var(--bg-soft);
+  box-shadow: 0 0 0 4px var(--ring), var(--shadow-lg);
+  overflow: hidden;
+}
+.install-box code {
+  flex: 1; display: block; padding: 1.05rem 1.15rem;
+  font-family: var(--mono); font-size: 0.88rem;
+  color: var(--accent);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  text-align: left;
+}
+.install-box code .sh { color: var(--muted); }
+#copy-btn {
+  border: 0; border-left: 1px solid var(--line-glow);
+  background: var(--btn-bg);
+  color: var(--btn-ink);
+  font-family: var(--sans); font-weight: 600; font-size: 0.85rem;
+  padding: 0 1.35rem; cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+#copy-btn:hover { background: var(--btn-bg-hover); }
+.ghost-btn {
+  flex: none;
+  display: inline-block; padding: 0.85rem 1.2rem;
+  border: 1px solid var(--line-glow); border-radius: 12px;
+  background: transparent; color: var(--text);
+  font-size: 0.9rem; font-weight: 500;
+  transition: border-color 0.2s ease, color 0.2s ease;
+}
+.ghost-btn:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
+.copy-note {
+  min-height: 1.4em; margin: 0.9rem 0 0;
+  font-size: 0.85rem; color: var(--muted);
+}
+
+/* ---------- sections ---------- */
+section { padding: var(--section-y) 0; scroll-margin-top: 4.5rem; }
+.sec-head { margin: 0 0 clamp(2rem, 3.5vw, 3rem); }
+h2 {
+  margin: 0;
+  font-size: clamp(1.65rem, 3vw, 2.35rem);
+  line-height: 1.15; letter-spacing: -0.02em;
+  color: var(--heading);
+  max-width: 34ch;
+}
+.sub {
+  margin: 1rem 0 0;
+  max-width: var(--prose);
+  font-size: 1.02rem; color: var(--muted);
+}
+
+/* ---------- terminal window ---------- */
+.term-stage {
+  position: relative; isolation: isolate;
+  display: flex; justify-content: center;
+  padding-bottom: 2rem;
+}
+.term-stage::after {
+  content: ""; position: absolute; z-index: 0;
+  left: 50%; bottom: 0.75rem; translate: -50% 0;
+  width: min(46rem, 86%); height: 7rem;
+  border-radius: 50%;
+  background: var(--glow-floor);
+  filter: blur(46px);
+}
+.term-lift { position: relative; z-index: 1; max-width: 100%; }
+.term {
+  margin: 0;
+  /* Shrink to the recording's own width so it is shown at its native 1x size
+     instead of being stretched to the prose column. */
+  width: fit-content;
+  max-width: 100%;
+  border: 1px solid var(--line-glow);
+  border-radius: 12px;
+  background: var(--term-bg);
+  box-shadow: var(--shadow-lg), 0 0 0 1px var(--ring);
+  overflow: hidden;
+}
+.term-bar {
+  display: flex; align-items: center; gap: 0.45rem;
+  padding: 0.5rem 0.8rem;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--line);
+}
+.dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; opacity: 0.85; }
+.dot.r { background: #e0655a; } .dot.y { background: #e0b355; } .dot.g { background: #58c47a; }
+.term-bar .title { margin-left: 0.6rem; font-family: var(--mono); font-size: 0.78rem; color: var(--muted); }
+
+/* recorded demo screen: the asset is rendered at 2x and shown at 1x, so it stays
+   sharp on HiDPI and is only ever scaled down, never up. */
+.demo { background: rgb(20, 24, 34); }
+.demo video, .demo img { display: block; max-width: 100%; height: auto; }
+.demo img { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .demo video { display: none; }
+  .demo img { display: block; }
+}
+.demo-caption {
+  display: flex; align-items: baseline; gap: 0.6rem; margin: 0;
+  border-top: 1px solid var(--line);
+  background: var(--bg-soft);
+  padding: 0.45rem 0.9rem;
+  font-size: 0.82rem; color: var(--muted);
+}
+.demo-caption .tag {
+  flex: none; font-family: var(--mono); font-size: 0.68rem;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--accent-dim); border: 1px solid var(--line-glow);
+  border-radius: 4px; padding: 0.05rem 0.4rem;
+}
+/* The recording is no longer selectable text, so the beats it walks through are
+   spelled out on the page instead. */
+.beats {
+  display: grid; gap: 0.7rem 2.5rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: clamp(2rem, 3.5vw, 3rem) 0 0; padding: 0; list-style: none;
+  max-width: 62rem;
+}
+.beats li {
+  display: flex; gap: 0.75rem; margin: 0;
+  font-size: 0.9rem; color: var(--muted);
+}
+.beats .n {
+  flex: none; font-family: var(--mono); font-size: 0.78rem;
+  color: var(--accent-dim); padding-top: 0.15rem;
+  font-variant-numeric: tabular-nums;
+}
+.demo-note { margin: 1.6rem 0 0; font-size: 0.85rem; color: var(--muted); max-width: var(--prose); }
+
+/* ---------- features bento ---------- */
+.bento {
+  display: grid; gap: var(--gap);
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+}
+/* Three bands, three rhythms: 7+5, 5+4+3, then 8 beside a stack of two 4s. No
+   two bands share a column edge, so the grid never resolves into a uniform card
+   matrix. */
+.bento > .card { grid-column: span var(--span, 4); }
+.bento > .card:nth-child(1) { --span: 7; --span-md: 6; }
+.bento > .card:nth-child(2) { --span: 5; --span-md: 6; }
+.bento > .card:nth-child(3) { --span: 5; --span-md: 6; }
+.bento > .card:nth-child(4) { --span: 4; --span-md: 3; }
+.bento > .card:nth-child(5) { --span: 3; --span-md: 3; }
+/* The band is twice as tall as either card beside it, so it claims two rows and
+   the two short cards split that height between them. One short card alone left
+   a hole in columns 9-12. */
+.bento > .card:nth-child(6) { --span: 8; --span-md: 6; grid-row: span 2; }
+.bento > .card:nth-child(7) { --span: 4; --span-md: 3; }
+.bento > .card:nth-child(8) { --span: 4; --span-md: 3; }
+.card {
+  position: relative; isolation: isolate; overflow: hidden;
+  background: linear-gradient(180deg, var(--sheen), transparent 60%), var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 1.35rem 1.4rem 1.5rem;
+  transition: border-color 0.25s ease;
+}
+.card:hover { border-color: var(--line-glow); }
+/* Lifted above the .card::before pointer spotlight. */
+.card .card-head, .card .badge, .card h3, .card p, .keymap dl { position: relative; z-index: 1; }
+.card-head {
+  display: flex; align-items: center; gap: 0.7rem;
+  margin: 0 0 0.55rem;
+}
+.card-head .badge { flex: none; }
+.badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 2.15rem; height: 2.15rem; padding: 0 0.5rem;
+  border: 1px solid var(--line-glow); border-radius: 9px;
+  background: var(--bg-soft);
+  font-family: var(--mono); font-size: 0.82rem; line-height: 1;
+  color: var(--accent);
+}
+.card h3 {
+  margin: 0;
+  font-size: 1.04rem; letter-spacing: -0.01em; color: var(--heading);
+}
+.card p { margin: 0; font-size: 0.92rem; color: var(--muted); }
+
+/* Keymap band: the full binding table in one dense component, instead of keys
+   sprinkled through the prose of every other card. */
+.keymap h3 { margin: 0 0 0.9rem; }
+.keymap dl {
+  display: grid; margin: 0;
+  /* 14rem, not 12: at 12rem a third column fits and squeezes every action onto
+     three wrapped lines, which is what made the band read as airy. */
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.4rem 1.8rem;
+}
+.keymap dl > div { display: grid; grid-template-columns: 7.2rem minmax(0, 1fr); align-items: baseline; gap: 0.5rem; }
+.keymap dt { font-family: var(--mono); font-size: 0.76rem; color: var(--accent); }
+.keymap dd { margin: 0; font-size: 0.84rem; color: var(--muted); }
+.keymap .mouse { margin: 1.1rem 0 0; font-size: 0.84rem; color: var(--muted); }
+@media (hover: hover) {
+  .card::before {
+    content: ""; position: absolute; inset: 0; z-index: 0;
+    pointer-events: none; border-radius: inherit;
+    background: radial-gradient(circle at var(--mx, 50%) var(--my, 0%), var(--spot), transparent 70%);
+    clip-path: circle(0 at var(--mx, 50%) var(--my, 0%));
+    transition: clip-path 0.3s ease;
+  }
+  .card:hover::before { clip-path: circle(17rem at var(--mx, 50%) var(--my, 0%)); }
+}
+
+/* ---------- install ---------- */
+.install-grid { display: grid; gap: var(--gap); grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); align-items: start; }
+.way {
+  overflow: hidden;
+  background: linear-gradient(180deg, var(--sheen), transparent 60%), var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: 14px; padding: 1.35rem 1.4rem 1.5rem;
+  transition: border-color 0.25s ease;
+}
+.way:hover { border-color: var(--line-glow); }
+.way h3 {
+  margin: 0 0 0.35rem;
+  font-size: 1.06rem; letter-spacing: -0.01em; color: var(--heading);
+}
+.way p { margin: 0 0 0.85rem; font-size: 0.9rem; color: var(--muted); }
+.way .shells { margin: 0.8rem 0 0; font-size: 0.82rem; }
+.touch { list-style: none; margin: 0.5rem 0 0; padding: 0; }
+.touch li { margin: 0 0 0.5rem; font-size: 0.9rem; color: var(--muted); }
+.touch li:last-child { margin-bottom: 0; }
+/* Sized to the command, not to the row: a panel wider than its payload is what
+   made the old three-panel layout read as empty. Element-qualified so it wins
+   over .way p, which is equally specific. */
+p.cmd {
+  display: flex; align-items: center; gap: 0.6rem;
+  width: fit-content; max-width: 100%; min-height: 2.75rem;
+  margin: 0.6rem 0 0; padding: 0 0.9rem;
+  background: var(--bg-soft); border: 1px solid var(--line); border-radius: 10px;
+  font-family: var(--mono); font-size: 0.8rem;
+}
+.cmd .sh { flex: none; color: var(--muted); }
+.cmd code { white-space: nowrap; overflow-x: auto; scrollbar-width: thin; color: var(--text); }
+
+/* ---------- footer ---------- */
+footer {
+  margin-top: 0; padding: clamp(2.5rem, 4vw, 3.5rem) 0 3rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.9rem; color: var(--muted);
+}
+footer .cols {
+  display: grid; gap: 2.5rem 3rem;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+}
+footer h4 { margin: 0 0 0.6rem; font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.16em; color: var(--text); }
+footer ul { list-style: none; margin: 0; padding: 0; }
+footer li { margin: 0.3rem 0; }
+footer .brand p { margin: 0.7rem 0 0; max-width: 24rem; }
+footer .fine { margin-top: 2.2rem; font-size: 0.78rem; font-family: var(--mono); }
+
+/* ---------- light scheme (dark is primary) ----------
+   Two selectors, one identical mapping: an explicit light choice, and system
+   light for everyone who has not explicitly chosen dark. CSS cannot express
+   "attribute OR media query" in a single selector, so the mapping is written
+   twice and the two copies are kept adjacent to stop them drifting. Edit both. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: var(--l-bg);
+  --bg-soft: var(--l-bg-soft);
+  --bg-card: var(--l-bg-card);
+  --line: var(--l-line);
+  --line-glow: var(--l-line-glow);
+  --text: var(--l-text);
+  --muted: var(--l-muted);
+  --heading: var(--l-heading);
+  --accent: var(--l-accent);
+  --accent-dim: var(--l-accent-dim);
+  --btn-bg: var(--l-btn-bg);
+  --btn-bg-hover: var(--l-btn-bg-hover);
+  --btn-ink: var(--l-btn-ink);
+  --ring: var(--l-ring);
+  --spot: var(--l-spot);
+  --glow-1: var(--l-glow-1);
+  --glow-floor: var(--l-glow-floor);
+  --grid-line: var(--l-grid-line);
+  --nav-scrim: var(--l-nav-scrim);
+  --nav-bg: var(--l-nav-bg);
+  --sheen: var(--l-sheen);
+  --shadow-lg: var(--l-shadow-lg);
+  --hero-ink: var(--l-hero-ink);
+  --term-bg: var(--l-term-bg);
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: var(--l-bg);
+    --bg-soft: var(--l-bg-soft);
+    --bg-card: var(--l-bg-card);
+    --line: var(--l-line);
+    --line-glow: var(--l-line-glow);
+    --text: var(--l-text);
+    --muted: var(--l-muted);
+    --heading: var(--l-heading);
+    --accent: var(--l-accent);
+    --accent-dim: var(--l-accent-dim);
+    --btn-bg: var(--l-btn-bg);
+    --btn-bg-hover: var(--l-btn-bg-hover);
+    --btn-ink: var(--l-btn-ink);
+    --ring: var(--l-ring);
+    --spot: var(--l-spot);
+    --glow-1: var(--l-glow-1);
+    --glow-floor: var(--l-glow-floor);
+    --grid-line: var(--l-grid-line);
+    --nav-scrim: var(--l-nav-scrim);
+    --nav-bg: var(--l-nav-bg);
+    --sheen: var(--l-sheen);
+    --shadow-lg: var(--l-shadow-lg);
+    --hero-ink: var(--l-hero-ink);
+    --term-bg: var(--l-term-bg);
+  }
+}
+
+/* ---------- responsive ---------- */
+@media (max-width: 62rem) {
+  .bento { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .bento > .card { grid-column: span var(--span-md, 3); }
+  /* Six columns leave nothing beside the band, so a two-row span would just
+     stretch it over the pair below. */
+  .bento > .card:nth-child(6) { grid-row: auto; }
+  .install-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 48rem) {
+  .beats { grid-template-columns: minmax(0, 1fr); gap: 0.7rem; }
+}
+@media (max-width: 40rem) {
+  .hero-inner { text-align: center; }
+  .hero-title, .hero-sub { margin-inline: auto; }
+  .hero-actions { justify-content: center; }
+  .bento { grid-template-columns: minmax(0, 1fr); }
+  .bento > .card { grid-column: auto; }
+}
+@media (max-width: 34rem) {
+  nav { gap: 0.9rem; font-size: 0.85rem; }
+  .install-box { flex-direction: column; }
+  #copy-btn { border-left: 0; border-top: 1px solid var(--line-glow); padding: 0.7rem; }
+  footer .cols { gap: 2rem; }
+}

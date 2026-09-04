@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cdh — 跳到你想去的目录 · frecency 终端选择器</title>
+<meta name="description" content="cdh 按 frecency（访问频次 × 最近性）给你去过的每个目录打分，再开一个终端选择器，让对的那条路径永远只差一次模糊搜索。">
+<script>try{var t=localStorage.getItem('cdh-theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;}catch(e){}</script>
+<link rel="stylesheet" href="../style.css">
+<link rel="alternate" hreflang="en" href="https://xianyudd.github.io/cdh/">
+<link rel="alternate" hreflang="zh-Hans" href="https://xianyudd.github.io/cdh/zh/">
+<link rel="alternate" hreflang="x-default" href="https://xianyudd.github.io/cdh/">
+</head>
+<body>
+
+<div class="progress" aria-hidden="true"><i></i></div>
+<div class="bg-deco" aria-hidden="true">
+  <div class="bg-grid"></div>
+  <div class="bg-glow"></div>
+</div>
+
+<div class="site-nav" id="site-nav">
+  <nav class="wrap" aria-label="站内导航">
+    <span class="logo"><span class="tick">➜</span> cdh</span>
+    <span class="spacer"></span>
+    <a href="#tui">选择器</a>
+    <a href="#features">功能</a>
+    <a href="#install">安装</a>
+    <a href="https://github.com/xianyudd/cdh">GitHub</a>
+    <a href="../" lang="en" hreflang="en">English</a>
+    <span class="theme-mount" data-label-system="跟随系统" data-label-light="浅色" data-label-dark="深色" data-aria="配色主题"></span>
+  </nav>
+</div>
+
+<header class="hero">
+  <div class="wrap hero-inner">
+    <p class="eyebrow"><span class="mark" aria-hidden="true">✦</span> 频次 × 最近性</p>
+    <h1 class="hero-title">跳到你<span class="phrase"><span class="ma">想去</span>的</span>目录，而不是你敲出来的那个。</h1>
+    <p class="hero-rail">cdh v0.3.2 · Rust · MIT · MSRV 1.88 · bash · fish · zsh</p>
+    <p class="hero-sub">
+      cdh 按访问频次 × 最近性给你去过的每个目录打分，再开一个终端选择器，让对的那条路径永远只差一次模糊搜索。
+    </p>
+    <div class="hero-actions">
+      <div class="install-box">
+        <code id="install-cmd"><span class="sh">$</span> curl -fsSL https://xianyudd.github.io/cdh/install.sh | bash</code>
+        <button id="copy-btn" type="button" aria-describedby="copy-note" hidden
+          data-label-done="已复制"
+          data-note-done="已复制到剪贴板，粘到终端里执行即可。"
+          data-note-fail="复制失败，请手动选中这条命令。">复制</button>
+      </div>
+      <a class="ghost-btn" href="#install">其他安装方式 →</a>
+    </div>
+    <p class="copy-note" id="copy-note" aria-live="polite">支持 bash、fish 和 zsh，安装器会自动识别你当前的 shell。</p>
+  </div>
+</header>
+
+<div class="wrap"><hr class="rule"></div>
+
+<main>
+<div class="wrap">
+
+<section id="tui" aria-labelledby="tui-h">
+  <div class="sec-head">
+    <p class="eyebrow">选择器</p>
+    <h2 id="tui-h">它长得像你的终端，因为它就在你的终端里</h2>
+    <p class="sub">
+      一条命令就在当前 shell 里打开选择器。模糊过滤候选，看一眼预览，按
+      <code>Enter</code>。cdh 完成跳转，把终端交还给你，然后退场。
+    </p>
+  </div>
+  <div class="term-stage">
+    <div class="term-lift">
+      <figure class="term">
+        <div class="term-bar">
+          <span class="dot r" aria-hidden="true"></span><span class="dot y" aria-hidden="true"></span><span class="dot g" aria-hidden="true"></span>
+          <span class="title">cdh — 真实会话录屏</span>
+        </div>
+        <div class="demo">
+          <video width="880" height="540" autoplay loop muted playsinline preload="metadata" poster="../demo-poster.png">
+            <source src="../demo.webm" type="video/webm">
+            <source src="../demo.mp4" type="video/mp4">
+          </video>
+          <img src="../demo-poster.png" width="880" height="540" alt="110 列终端里的 cdh 选择器：顶部是搜索行，下面是按分数排好序的 21 个目录，当前选中 ~/projects/awesome-app，右侧预览面板显示它的 git 分支、上次访问时间和目录内容，底部是一条键位提示栏。">
+        </div>
+        <figcaption class="demo-caption">
+          <span class="tag">实录演示</span>
+          <span>在 tmux 里录下的真实 cdh 会话：独立的演示 home，不是效果图</span>
+        </figcaption>
+      </figure>
+    </div>
+  </div>
+  <ol class="beats">
+    <li><span class="n" aria-hidden="true">01</span><span>候选进来时已经按 frecency 排好序，你真正常待的路径自然浮到最上面</span></li>
+    <li><span class="n" aria-hidden="true">02</span><span>直接输入，就在历史候选和 cdh 扫出来的目录里一起模糊过滤</span></li>
+    <li><span class="n" aria-hidden="true">03</span><span>移动选中行，预览跟着走，带 git 状态和上次访问时间</span></li>
+    <li><span class="n" aria-hidden="true">04</span><span><code>Tab</code> 收起预览让列表占满整宽，再按一次 <code>Tab</code> 把预览叫回来</span></li>
+    <li><span class="n" aria-hidden="true">05</span><span><code>F1</code> 打开帮助，<code>F2</code> 打开设置：配色、语言、预览、鼠标</span></li>
+    <li><span class="n" aria-hidden="true">06</span><span><code>Esc</code> 清空查询，<code>Enter</code> 跳转并把 shell 交回来</span></li>
+  </ol>
+  <p class="demo-note">
+    这段循环自己播放，也没有声音。如果你的系统偏好减少动效，看到的会是那一帧静图。
+  </p>
+</section>
+
+<section id="features" aria-labelledby="features-h">
+  <div class="sec-head">
+    <p class="eyebrow">你会得到什么</p>
+    <h2 id="features-h">真正干活的那几块</h2>
+    <p class="sub">二进制、打分模型和选择器，各自给你什么。</p>
+  </div>
+  <div class="bento">
+    <div class="card">
+      <div class="card-head">
+        <span class="badge" aria-hidden="true">f×r</span>
+        <h3>会衰减的 frecency 打分</h3>
+      </div>
+      <p>访问频次和最近性半衰期融合成一个分数，上个月常待的目录不会再挤掉你五分钟前打开的那个。<code>$HOME</code> 也不再霸占列表顶端。</p>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <span class="badge" aria-hidden="true">fz</span>
+        <h3>模糊搜索，实时预览</h3>
+      </div>
+      <p>敲一小段，列表边打边过滤。预览面板在你决定跳转之前，先给你看目录内容、git 分支、有没有改动，以及上次到这儿是什么时候。</p>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <span class="badge" aria-hidden="true">scan</span>
+        <h3>历史之外，还有整棵目录树</h3>
+      </div>
+      <p>候选池是「历史 ∪ 目录树」：后台扫描把你从没 cd 过的路径也补进来，一样搜得到。而排除一棵子树之后，它就真的不再出现。</p>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <span class="badge" aria-hidden="true">~/</span>
+        <h3>一个 Rust 二进制，遵守 XDG</h3>
+      </div>
+      <p>单个便于静态链接的二进制，MSRV 1.88。历史和状态分别落在 <code>XDG_DATA_HOME</code> 与 <code>XDG_STATE_HOME</code> 下，bash、fish、zsh 的 hook 各自只有几行。</p>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <span class="badge" aria-hidden="true">◐</span>
+        <h3>七套配色</h3>
+      </div>
+      <p>Graphite、Nord、Daylight、Mono、Dracula、Amber、Forest。不支持颜色的终端有一整套降级方案。</p>
+    </div>
+    <div class="card keymap">
+      <h3>完整键位表</h3>
+      <dl>
+        <div><dt>↑ ↓</dt><dd>上下移动</dd></div>
+        <div><dt>Ctrl+P Ctrl+N</dt><dd>不用方向键移动</dd></div>
+        <div><dt>PgUp PgDn</dt><dd>翻页</dd></div>
+        <div><dt>Home End</dt><dd>首项，末项</dd></div>
+        <div><dt>← →</dt><dd>移动搜索光标</dd></div>
+        <div><dt>Ctrl+U</dt><dd>清空搜索</dd></div>
+        <div><dt>Enter</dt><dd>跳转</dd></div>
+        <div><dt>Tab</dt><dd>开关预览</dd></div>
+        <div><dt>Ctrl+D</dt><dd>排除这一条</dd></div>
+        <div><dt>Ctrl+H F5</dt><dd>隐藏目录</dd></div>
+        <div><dt>F1 ?</dt><dd>帮助</dd></div>
+        <div><dt>F2</dt><dd>设置</dd></div>
+        <div><dt>F3 Ctrl+T</dt><dd>切换配色</dd></div>
+        <div><dt>F4</dt><dd>排除清单</dd></div>
+        <div><dt>Esc</dt><dd>关闭、清空、退出</dd></div>
+      </dl>
+      <p class="mouse">鼠标也能用：单击选中，双击跳转，滚轮滚动。</p>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <span class="badge" aria-hidden="true">文A</span>
+        <h3>中文与 English</h3>
+      </div>
+      <p>整个 TUI 两种语言都讲，在设置里随时切换。搜索行也能正常处理全角输入。</p>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <span class="badge" aria-hidden="true">◇</span>
+        <h3>右下角一个安静的立方体</h3>
+      </div>
+      <p>一个线框立方体在右下角慢慢翻转，它待在列表排版之前就预留好的边槽里，所以永远不会盖住任何一行。无颜色模式下自动关掉，<code>CDH_CORNER_3D=0</code> 则彻底不出现。</p>
+    </div>
+  </div>
+</section>
+
+<section id="install" aria-labelledby="install-h">
+  <div class="sec-head">
+    <p class="eyebrow">安装</p>
+    <h2 id="install-h">安装器到底动了什么</h2>
+    <p class="sub">开头那条命令是最快的路。如果你想先看清楚再 pipe，或者干脆不 pipe，这里是全貌。</p>
+  </div>
+  <div class="install-grid">
+    <div class="way">
+      <h3>那一行命令，拆开看</h3>
+      <ul class="touch">
+        <li>把对应平台的 release 二进制下载到 <code>~/.local/bin/cdh</code>。</li>
+        <li>读 <code>$SHELL</code> 判断你用哪个 shell，也接受 <code>--shell bash|zsh|fish</code>。</li>
+        <li>把 hook 写进 <code>~/.config/cdh/</code>，并在 rc 文件里加一段带标记的引用。</li>
+        <li>历史和状态留在 <code>XDG_DATA_HOME</code> 与 <code>XDG_STATE_HOME</code> 下。</li>
+      </ul>
+      <p class="shells">全程不需要 root，也不会往 home 之外写任何东西。<a href="https://github.com/xianyudd/cdh/blob/main/scripts/install.sh">先读一遍脚本</a>，再决定要不要 pipe。</p>
+    </div>
+    <div class="way">
+      <h3>或者不走 pipe</h3>
+      <p>已经发到 Cargo 了：</p>
+      <p class="cmd"><span class="sh" aria-hidden="true">$</span><code>cargo install cdh</code></p>
+      <p class="shells">x86_64 与 aarch64 的 Linux gnu、musl 预编译包，以及 macOS 版，都在 <a href="https://github.com/xianyudd/cdh/releases">Releases</a> 里。这两条路都要照 <a href="https://github.com/xianyudd/cdh/blob/main/README.md">README</a> 手动挂一次 hook。</p>
+    </div>
+  </div>
+</section>
+
+</div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="cols">
+      <div>
+        <h4>项目</h4>
+        <ul>
+          <li><a href="https://github.com/xianyudd/cdh">GitHub 仓库</a></li>
+          <li><a href="https://github.com/xianyudd/cdh/releases">Releases</a></li>
+          <li><a href="https://github.com/xianyudd/cdh/blob/main/CHANGELOG.md">CHANGELOG</a></li>
+          <li><a href="https://github.com/xianyudd/cdh/blob/main/LICENSE">MIT 许可证</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>文档</h4>
+        <ul>
+          <li><a href="https://github.com/xianyudd/cdh/blob/main/README.en.md">README (English)</a></li>
+          <li><a href="https://github.com/xianyudd/cdh/blob/main/README.md">README（中文）</a></li>
+          <li><a href="../roadmap.md">路线图</a></li>
+          <li><a href="../design/tui-design-principles.md">TUI 设计原则</a></li>
+          <li><a href="../design/tree-discovery.md">目录树发现层笔记</a></li>
+          <li><a href="../install.sh">install.sh</a></li>
+        </ul>
+      </div>
+      <div class="brand">
+        <span class="logo"><span class="tick">➜</span> cdh</span>
+        <p>
+          cdh 按访问频次 × 最近性给你去过的每个目录打分，再开一个终端选择器，让对的那条路径永远只差一次模糊搜索。
+        </p>
+      </div>
+    </div>
+    <p class="fine">cdh v0.3.2 · MIT · Rust (MSRV 1.88) · 无第三方请求，GSAP 已在本地打包</p>
+  </div>
+</footer>
+
+<script src="../vendor/gsap.min.js"></script>
+<script src="../vendor/ScrollTrigger.min.js"></script>
+<script src="../page.js" defer></script>
+
+</body>
+</html>
