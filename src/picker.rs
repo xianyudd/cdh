@@ -1109,6 +1109,26 @@ impl App {
         self.total_pages = page.page_count;
     }
 
+    /// Remember where the last frame drew its result list, so the next mouse
+    /// click can map a screen row back to a result index. `run_ui` calls this
+    /// after every `draw`; the `render_frame` test harness calls the same seam,
+    /// so the click tests drive this exact write-back rather than a private
+    /// copy of it (issue #33: the in-loop store used to survive mutation).
+    ///
+    /// `None` means nothing drew a list this frame (e.g. the terminal was too
+    /// small for the layout). Keep the previous geometry rather than zeroing
+    /// it: a zeroed `last_list_area` has `height == 0`, and the click handler
+    /// treats a zero-height list area as a click that missed the list and
+    /// drops the click (returns `None`) -- it never maps onto row 0 of an
+    /// empty area. Reusing the last real geometry instead lets a click during
+    /// a transient listless frame keep mapping to the right row.
+    fn record_list_geometry(&mut self, geometry: Option<ListGeometry>) {
+        if let Some(geometry) = geometry {
+            self.last_list_area = geometry.area;
+            self.last_list_start = geometry.start;
+        }
+    }
+
     /// Snapshot everything rendering reads, once per frame. Drawing then
     /// consumes only the snapshot, never `App` -- no chance for a render to
     /// disagree with the state another renderer saw in the same frame. The
@@ -1929,10 +1949,7 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
                 let view = app.view(now_unix);
                 list_geometry = draw(frame, &view, &theme, corner_angle);
             })?;
-            if let Some(geometry) = list_geometry {
-                app.last_list_area = geometry.area;
-                app.last_list_start = geometry.start;
-            }
+            app.record_list_geometry(list_geometry);
             dirty = false;
         }
 

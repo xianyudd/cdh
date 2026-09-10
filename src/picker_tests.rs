@@ -346,6 +346,35 @@ fn mouse_click_maps_screen_rows_through_the_page_start() {
 }
 
 #[test]
+fn record_list_geometry_stores_a_frame_and_keeps_the_last_one_on_none() {
+    // Issue #33: the event loop's list-geometry store-back used to survive
+    // mutation -- deleting it left the whole suite green, because the click
+    // tests drove a private copy of the write-back. `run_ui` and `render_frame`
+    // now both funnel through `record_list_geometry`, so this pins its two jobs
+    // directly. Delete either assignment inside the seam and this goes red.
+    let mut app = app_with_paths(&[("/a", 0.9), ("/b", 0.8)]);
+    assert_eq!(app.last_list_area, Rect::new(0, 0, 0, 0));
+    assert_eq!(app.last_list_start, 0);
+
+    // A drawn list publishes its area and page start verbatim; the next click
+    // maps screen rows through exactly these two values.
+    let drawn = ListGeometry {
+        area: Rect::new(2, 5, 40, 7),
+        start: 12,
+    };
+    app.record_list_geometry(Some(drawn));
+    assert_eq!(app.last_list_area, Rect::new(2, 5, 40, 7));
+    assert_eq!(app.last_list_start, 12);
+
+    // A frame that drew no list (terminal too small for the layout) must leave
+    // the last real geometry in place -- zeroing it would send a click during
+    // that frame to row 0 of a 0x0 area.
+    app.record_list_geometry(None);
+    assert_eq!(app.last_list_area, Rect::new(2, 5, 40, 7));
+    assert_eq!(app.last_list_start, 12);
+}
+
+#[test]
 fn restore_screen_emits_mouse_cleanup_before_leaving_the_alternate_screen() {
     // The panic hook passes `true` unconditionally because it cannot see the
     // guard; `Drop` passes the real flag. The mouse bytes must be the only
@@ -528,10 +557,7 @@ fn render_frame(app: &mut App, width: u16, height: u16) -> Buffer {
             );
         })
         .unwrap();
-    if let Some(geometry) = list_geometry {
-        app.last_list_area = geometry.area;
-        app.last_list_start = geometry.start;
-    }
+    app.record_list_geometry(list_geometry);
     terminal.backend().buffer().clone()
 }
 
