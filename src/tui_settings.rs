@@ -445,6 +445,7 @@ fn parse_boolean_environment(value: &str) -> bool {
 mod tests {
     use super::super::ThemeChoice;
     use super::*;
+    use crate::test_support::TempDir;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -461,17 +462,20 @@ mod tests {
     }
 
     fn load_text(name: &str, text: &str, environment: UiEnvironment) -> SettingsLoad {
-        let path = test_path(name);
+        let dir = TempDir::new(&format!("settings-{name}"));
+        fs::create_dir_all(dir.path()).unwrap();
+        let path = dir.path().join("tui.toml");
         fs::write(&path, text).unwrap();
-        let loaded = UiSettings::load(path.clone(), environment);
-        let _ = fs::remove_file(path);
-        loaded
+        // `dir` drops at the end of this scope, removing the tree even if the
+        // load below panics; the returned `SettingsLoad` owns its data.
+        UiSettings::load(path, environment)
     }
 
-    fn test_settings_path(name: &str) -> PathBuf {
-        let directory = test_path(name);
-        fs::create_dir_all(&directory).unwrap();
-        directory.join("tui.toml")
+    fn test_settings_path(name: &str) -> (TempDir, PathBuf) {
+        let directory = TempDir::new(&format!("settings-{name}"));
+        fs::create_dir_all(directory.path()).unwrap();
+        let path = directory.path().join("tui.toml");
+        (directory, path)
     }
 
     #[test]
@@ -483,7 +487,7 @@ mod tests {
         ];
 
         for (index, (language, token)) in cases.into_iter().enumerate() {
-            let path = test_settings_path(&format!("round-trip-{index}"));
+            let (_dir, path) = test_settings_path(&format!("round-trip-{index}"));
             let candidate = UiPreferences {
                 language,
                 preview: true,
@@ -502,7 +506,6 @@ mod tests {
             let reloaded = UiSettings::load(path.clone(), UiEnvironment::default());
             assert_eq!(reloaded.settings.saved(), candidate);
             assert!(reloaded.warning.is_none());
-            fs::remove_dir_all(path.parent().unwrap()).unwrap();
         }
     }
 
@@ -519,7 +522,7 @@ mod tests {
         ];
 
         for (index, theme) in cases.into_iter().enumerate() {
-            let path = test_settings_path(&format!("theme-round-trip-{index}"));
+            let (_dir, path) = test_settings_path(&format!("theme-round-trip-{index}"));
             let candidate = UiPreferences {
                 language: LanguagePreference::En,
                 preview: false,
@@ -539,13 +542,12 @@ mod tests {
             let reloaded = UiSettings::load(path.clone(), UiEnvironment::default());
             assert_eq!(reloaded.settings.saved(), candidate);
             assert!(reloaded.warning.is_none());
-            fs::remove_dir_all(path.parent().unwrap()).unwrap();
         }
     }
 
     #[test]
     fn settings_persistence_candidate_updates_saved_and_effective_only_after_success() {
-        let path = test_settings_path("candidate-success");
+        let (_dir, path) = test_settings_path("candidate-success");
         let environment = UiEnvironment {
             preview: Some(false),
             ..UiEnvironment::default()
@@ -567,12 +569,11 @@ mod tests {
         assert!(settings.saved().preview);
         assert_eq!(settings.effective().color, candidate.color);
         assert!(!settings.effective().preview);
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn settings_persistence_replacement_failure_preserves_memory_and_disk() {
-        let path = test_settings_path("replacement-failure");
+        let (_dir, path) = test_settings_path("replacement-failure");
         let original = "language = \"auto\"\npreview = false\ncolor = true\nmouse = true\n";
         fs::write(&path, original).unwrap();
         let mut settings = UiSettings::load(path.clone(), UiEnvironment::default()).settings;
@@ -600,12 +601,11 @@ mod tests {
             .filter(|entry| entry.path() != path)
             .collect();
         assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn settings_persistence_retries_after_stale_temp_collision() {
-        let path = test_settings_path("stale-temp-collision");
+        let (_dir, path) = test_settings_path("stale-temp-collision");
         let mut attempted_paths = Vec::new();
 
         let (temp_path, temp_file) = open_unique_temp_with(&path, |candidate_path| {
@@ -630,7 +630,6 @@ mod tests {
         assert_ne!(attempted_paths[0], attempted_paths[1]);
         assert_eq!(temp_path, attempted_paths[1]);
         assert_eq!(fs::read_to_string(&attempted_paths[0]).unwrap(), "stale");
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -671,7 +670,8 @@ mod tests {
 
     #[test]
     fn settings_persistence_uses_unique_temp_names_under_concurrent_writes() {
-        let path = Arc::new(test_settings_path("concurrent-temp-names"));
+        let (_dir, path) = test_settings_path("concurrent-temp-names");
+        let path = Arc::new(path);
         let handles: Vec<_> = (0..64)
             .map(|_| {
                 let path = Arc::clone(&path);
@@ -686,12 +686,11 @@ mod tests {
         for handle in handles {
             handle.join().unwrap().unwrap();
         }
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn settings_persistence_success_leaves_no_temp_files() {
-        let path = test_settings_path("temp-cleanup");
+        let (_dir, path) = test_settings_path("temp-cleanup");
         let mut settings = UiSettings::load(path.clone(), UiEnvironment::default()).settings;
 
         settings.persist(UiPreferences::default()).unwrap();
@@ -705,7 +704,6 @@ mod tests {
             })
             .collect();
         assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -810,14 +808,13 @@ mod tests {
 
     #[test]
     fn settings_parser_read_error_includes_path_and_reason() {
-        let path = test_path("read-error");
-        fs::create_dir(&path).unwrap();
+        let dir = TempDir::new("settings-read-error");
+        fs::create_dir_all(dir.path()).unwrap();
 
-        let loaded = UiSettings::load(path.clone(), UiEnvironment::default());
-        let _ = fs::remove_dir(&path);
+        let loaded = UiSettings::load(dir.path().to_path_buf(), UiEnvironment::default());
 
         let warning = loaded.warning.expect("read error should warn");
-        assert!(warning.contains(path.to_string_lossy().as_ref()));
+        assert!(warning.contains(dir.to_string_lossy().as_ref()));
         assert!(warning.contains("read"));
     }
 
