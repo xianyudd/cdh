@@ -3667,6 +3667,402 @@ fn preview_layout_uses_side_then_bottom_then_notice() {
     );
 }
 
+/// What preview panel a given terminal size should resolve to. Kept
+/// test-local because the renderer's `PreviewPlacement` is deliberately opaque
+/// (no `PartialEq`/`Debug`), so the matrix rows spell out the expected panel
+/// here instead of comparing it directly.
+#[derive(Clone, Copy)]
+enum ExpectPreview {
+    None,
+    Side,
+    Bottom,
+}
+
+/// Assert the solved `ScreenLayout` partitions the terminal the way the
+/// renderer depends on, deriving every expectation from `full` and the layout
+/// contract rather than pinning solver output. Fixed chrome lands on exact
+/// rows, the content band between the dividers is tiled by the list, the
+/// preview, and the cube gutter with no overlaps or gaps, and the gutter sits
+/// one blank column right of the content. These invariants outlive a
+/// constraint-solver swap (cassowary -> kasuari) yet still fail on the
+/// off-by-one reflow such a swap could introduce.
+fn assert_screen_layout_tiles(
+    full: Rect,
+    preview_visible: bool,
+    corner_enabled: bool,
+    expect_preview: ExpectPreview,
+    expect_corner: bool,
+) {
+    let layout = screen_layout(full, preview_visible, corner_enabled)
+        .unwrap_or_else(|| panic!("{full:?} should produce a layout"));
+
+    // Fixed chrome: three one-row bands on top, two on the bottom, each inset
+    // by the single side-padding column. Pinning these rows is the boundary
+    // check the task asks for -- a divider that drifts a line fails here.
+    let band_x = full.x + 1;
+    let band_w = full.width - 2;
+    assert_eq!(
+        layout.header,
+        Rect::new(band_x, full.y, band_w, 1),
+        "{full:?} header row"
+    );
+    assert_eq!(
+        layout.input,
+        Rect::new(band_x, full.y + 1, band_w, 1),
+        "{full:?} input row"
+    );
+    assert_eq!(
+        layout.top_divider,
+        Rect::new(band_x, full.y + 2, band_w, 1),
+        "{full:?} top divider row"
+    );
+    assert_eq!(
+        layout.bottom_divider,
+        Rect::new(band_x, full.y + full.height - 2, band_w, 1),
+        "{full:?} bottom divider row"
+    );
+    assert_eq!(
+        layout.footer,
+        Rect::new(band_x, full.y + full.height - 1, band_w, 1),
+        "{full:?} footer row"
+    );
+
+    // The content band is exactly what the dividers leave between them.
+    let content_full = Rect::new(band_x, full.y + 3, band_w, full.height - 5);
+
+    // The cube gutter, when reserved, is carved off the right of the band with
+    // one blank separator column; the list/preview content shrinks by exactly
+    // the gutter width and never reaches into it.
+    let content = match layout.corner {
+        Some(corner) => {
+            assert!(
+                expect_corner,
+                "{full:?} reserved a cube gutter unexpectedly"
+            );
+            assert_eq!(corner.width, cube::WIDTH, "{full:?} cube gutter width");
+            assert_eq!(corner.height, cube::HEIGHT, "{full:?} cube gutter height");
+            let content = Rect::new(
+                content_full.x,
+                content_full.y,
+                content_full.width - CORNER_3D_GUTTER,
+                content_full.height,
+            );
+            assert_eq!(
+                corner.x,
+                content.right() + 1,
+                "{full:?} one blank column between content and cube"
+            );
+            assert_eq!(
+                corner.bottom(),
+                content.bottom(),
+                "{full:?} cube sits flush to the content bottom"
+            );
+            assert!(
+                corner.right() <= full.right(),
+                "{full:?} cube stays on screen"
+            );
+            content
+        }
+        None => {
+            assert!(
+                !expect_corner,
+                "{full:?} should have reserved a cube gutter"
+            );
+            content_full
+        }
+    };
+
+    let preview = layout.preview.map(|(rect, _)| rect);
+    match expect_preview {
+        ExpectPreview::None => {
+            assert!(preview.is_none(), "{full:?} expected no preview panel");
+            // The notice appears exactly when a preview was requested but the
+            // terminal was too small to place it.
+            assert_eq!(
+                layout.preview_unavailable, preview_visible,
+                "{full:?} notice iff a requested preview was dropped"
+            );
+            assert_eq!(
+                layout.list, content,
+                "{full:?} the list fills the whole content band"
+            );
+        }
+        ExpectPreview::Side => {
+            let preview = preview.expect("side preview rect");
+            assert!(
+                matches!(layout.preview, Some((_, PreviewPlacement::Side))),
+                "{full:?} expected a side preview"
+            );
+            assert!(
+                !layout.preview_unavailable,
+                "{full:?} a placed preview leaves no notice"
+            );
+            // List and preview split the band left-to-right, edge to edge.
+            assert_eq!(
+                layout.list.x, content.x,
+                "{full:?} side list starts the band"
+            );
+            assert_eq!(layout.list.y, content.y, "{full:?} side list top");
+            assert_eq!(
+                layout.list.height, content.height,
+                "{full:?} side list spans the band height"
+            );
+            assert_eq!(preview.y, content.y, "{full:?} side preview top");
+            assert_eq!(
+                preview.height, content.height,
+                "{full:?} side preview spans the band height"
+            );
+            assert_eq!(
+                layout.list.right(),
+                preview.x,
+                "{full:?} side columns abut with no gap"
+            );
+            assert_eq!(
+                preview.right(),
+                content.right(),
+                "{full:?} side preview ends the band"
+            );
+            assert!(
+                layout.list.width >= 1 && preview.width >= 1,
+                "{full:?} neither side column collapses"
+            );
+        }
+        ExpectPreview::Bottom => {
+            let preview = preview.expect("bottom preview rect");
+            assert!(
+                matches!(layout.preview, Some((_, PreviewPlacement::Bottom))),
+                "{full:?} expected a bottom preview"
+            );
+            assert!(
+                !layout.preview_unavailable,
+                "{full:?} a placed preview leaves no notice"
+            );
+            // List on top, preview below, with the one-row divider gap between.
+            assert_eq!(layout.list.x, content.x, "{full:?} bottom list left edge");
+            assert_eq!(
+                layout.list.width, content.width,
+                "{full:?} bottom list spans the band width"
+            );
+            assert_eq!(preview.x, content.x, "{full:?} bottom preview left edge");
+            assert_eq!(
+                preview.width, content.width,
+                "{full:?} bottom preview spans the band width"
+            );
+            assert_eq!(
+                layout.list.y, content.y,
+                "{full:?} bottom list starts the band"
+            );
+            assert_eq!(
+                preview.y,
+                layout.list.y + layout.list.height + 1,
+                "{full:?} one divider row between list and preview"
+            );
+            assert_eq!(
+                preview.bottom(),
+                content.bottom(),
+                "{full:?} bottom preview ends the band"
+            );
+            assert!(
+                layout.list.height >= 1 && preview.height >= 1,
+                "{full:?} neither row band collapses"
+            );
+        }
+    }
+
+    // Whatever panels exist must be pairwise disjoint and must never intrude on
+    // the chrome rows -- the list/preview/footer non-overlap the task calls
+    // out, checked with ratatui's own intersection test.
+    let panels: Vec<Rect> = [Some(layout.list), preview, layout.corner]
+        .into_iter()
+        .flatten()
+        .collect();
+    let chrome = [
+        layout.header,
+        layout.input,
+        layout.top_divider,
+        layout.bottom_divider,
+        layout.footer,
+    ];
+    for (i, panel) in panels.iter().enumerate() {
+        for other in &panels[i + 1..] {
+            assert!(
+                !panel.intersects(*other),
+                "{full:?} panels {panel:?} and {other:?} overlap"
+            );
+        }
+        for band in chrome {
+            assert!(
+                !panel.intersects(band),
+                "{full:?} panel {panel:?} overlaps chrome {band:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn screen_layout_tiles_list_preview_and_gutter_across_odd_sizes() {
+    // Odd widths and heights push the percentage constraints onto fractional
+    // boundaries, which is exactly where a constraint-solver swap could drift a
+    // column or row. Each case pins the structural invariants (see
+    // `assert_screen_layout_tiles`) rather than raw bytes, so it survives the
+    // swap while still catching an overlap or off-by-one.
+    let cases = [
+        // (full, preview_visible, corner_enabled, expected preview, expects gutter)
+        (
+            Rect::new(0, 0, 81, 23),
+            true,
+            true,
+            ExpectPreview::Bottom,
+            true,
+        ), // width == cube minimum
+        (
+            Rect::new(0, 0, 83, 41),
+            true,
+            true,
+            ExpectPreview::Bottom,
+            true,
+        ), // tall, odd both ways
+        (
+            Rect::new(0, 0, 71, 19),
+            true,
+            true,
+            ExpectPreview::Bottom,
+            false,
+        ), // too narrow for the cube
+        (
+            Rect::new(0, 0, 107, 21),
+            true,
+            false,
+            ExpectPreview::Bottom,
+            false,
+        ), // just below side threshold
+        (
+            Rect::new(0, 0, 109, 19),
+            true,
+            true,
+            ExpectPreview::Side,
+            true,
+        ),
+        (
+            Rect::new(0, 0, 137, 25),
+            true,
+            true,
+            ExpectPreview::Side,
+            true,
+        ),
+        (
+            Rect::new(0, 0, 111, 45),
+            true,
+            true,
+            ExpectPreview::Side,
+            true,
+        ),
+        (
+            Rect::new(0, 0, 95, 15),
+            false,
+            true,
+            ExpectPreview::None,
+            true,
+        ),
+        (
+            Rect::new(0, 0, 95, 11),
+            false,
+            true,
+            ExpectPreview::None,
+            false,
+        ), // too short for the cube
+        (
+            Rect::new(0, 0, 45, 13),
+            false,
+            true,
+            ExpectPreview::None,
+            false,
+        ), // too narrow for the cube
+        (
+            Rect::new(0, 0, 63, 9),
+            false,
+            false,
+            ExpectPreview::None,
+            false,
+        ), // near MIN_HEIGHT
+    ];
+    for (full, preview_visible, corner_enabled, expect_preview, expect_corner) in cases {
+        assert_screen_layout_tiles(
+            full,
+            preview_visible,
+            corner_enabled,
+            expect_preview,
+            expect_corner,
+        );
+    }
+}
+
+#[test]
+fn screen_layout_promotes_preview_to_the_side_at_width_108() {
+    // At 107 columns the side preview cannot meet PREVIEW_SIDE_MIN_WIDTH, so the
+    // panel stays docked at the bottom; one column wider crosses the threshold
+    // and it swings to the side. (Mutation check: lower the constant to 107 and
+    // the 107 case would already report Side.)
+    let below = screen_layout(Rect::new(0, 0, 107, 30), true, false).unwrap();
+    assert!(
+        matches!(below.preview, Some((_, PreviewPlacement::Bottom))),
+        "107 columns keeps the preview docked at the bottom"
+    );
+    let at = screen_layout(Rect::new(0, 0, 108, 30), true, false).unwrap();
+    assert!(
+        matches!(at.preview, Some((_, PreviewPlacement::Side))),
+        "108 columns promotes the preview to the side"
+    );
+}
+
+#[test]
+fn screen_layout_admits_bottom_preview_at_width_70() {
+    // Below PREVIEW_BOTTOM_MIN_WIDTH no panel fits, so a requested preview
+    // degrades to the notice; at exactly 70 the bottom preview appears.
+    let below = screen_layout(Rect::new(0, 0, 69, 18), true, false).unwrap();
+    assert!(
+        below.preview.is_none(),
+        "69 columns is too narrow for any preview panel"
+    );
+    assert!(
+        below.preview_unavailable,
+        "the requested-but-unplaced preview shows a notice"
+    );
+    let at = screen_layout(Rect::new(0, 0, 70, 18), true, false).unwrap();
+    assert!(
+        matches!(at.preview, Some((_, PreviewPlacement::Bottom))),
+        "70 columns admits the bottom preview"
+    );
+    assert!(
+        !at.preview_unavailable,
+        "a placed preview clears the notice"
+    );
+}
+
+#[test]
+fn screen_layout_admits_bottom_preview_at_height_18() {
+    // In the bottom-preview width band the panel still needs the minimum
+    // height: 17 rows shows only the notice, 18 rows admits the panel.
+    let below = screen_layout(Rect::new(0, 0, 80, 17), true, false).unwrap();
+    assert!(
+        below.preview.is_none(),
+        "17 rows is too short for a bottom preview"
+    );
+    assert!(
+        below.preview_unavailable,
+        "the requested-but-unplaced preview shows a notice"
+    );
+    let at = screen_layout(Rect::new(0, 0, 80, 18), true, false).unwrap();
+    assert!(
+        matches!(at.preview, Some((_, PreviewPlacement::Bottom))),
+        "18 rows admits the bottom preview"
+    );
+    assert!(
+        !at.preview_unavailable,
+        "a placed preview clears the notice"
+    );
+}
+
 #[test]
 fn read_git_info_reports_clean_and_modified_status() {
     if Command::new("git").arg("--version").output().is_err() {
