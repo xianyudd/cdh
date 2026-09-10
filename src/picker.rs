@@ -1077,18 +1077,18 @@ impl App {
     }
 
     fn page(&self) -> PageWindow {
-        let total = self.filtered_results.len();
-        if total == 0 {
-            return PageWindow::new(0, 0, self.page_size);
-        }
-        let start = self.current_page.saturating_sub(1) * self.page_size;
-        PageWindow {
-            start,
-            end: (start + self.page_size).min(total),
-            page: self.current_page,
-            page_count: self.total_pages,
-            page_size: self.page_size,
-        }
+        // `PageWindow::new` is the single source for the window math, including
+        // the short last-page clamp (`end = (start + page_size).min(total)`).
+        // `page()` used to hand-roll the same `start`/`end` computation, so the
+        // last-page clamp lived in two places and could drift apart (issue #32).
+        // Delegating keeps it in one spot. `current_page`/`total_pages` stay in
+        // sync with `selected_index` via `sync_pagination`, so deriving the
+        // window straight from `selected_index` returns the same window.
+        PageWindow::new(
+            self.filtered_results.len(),
+            self.selected_index,
+            self.page_size,
+        )
     }
 
     fn sync_pagination(&mut self) {
@@ -1415,7 +1415,7 @@ impl App {
         let page = self.page();
         let current = self.current_page.saturating_sub(1) as isize;
         let target_page =
-            (current + delta).clamp(0, page.page_count.saturating_sub(1) as isize) as usize;
+            (current + delta).clamp(0, self.total_pages.saturating_sub(1) as isize) as usize;
         let row_in_page = self.selected_index.saturating_sub(page.start);
         self.set_selected(target_page * page.page_size + row_in_page)
     }
