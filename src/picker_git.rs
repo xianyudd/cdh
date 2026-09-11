@@ -138,15 +138,11 @@ fn read_git_dirty(repo_root: &Path, timeout: Duration) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
     use std::env;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_root(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("cdh_picker_git_test_{name}_{unique}"))
+    fn temp_root(name: &str) -> TempDir {
+        TempDir::new(&format!("picker_git_test_{name}"))
     }
 
     /// The dirty check must judge the directory it was given, not whatever
@@ -187,7 +183,6 @@ mod tests {
 
         assert_eq!(dirty, Some(true));
         assert_eq!(fs::read(decoy.join("config")).unwrap(), decoy_config_before);
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// Pins the exact set of variables `git_command` strips: dropping one

@@ -11,6 +11,9 @@ pub mod paths;
 pub mod picker;
 pub mod recommend;
 
+#[cfg(test)]
+mod test_support;
+
 pub use app::AppContext;
 pub use config::EffectiveConfig;
 pub use frecency::{Frecency, FrecencyIndex, FrecencyState};

@@ -25,6 +25,7 @@ fn candidate_name_borrows_the_last_segment() {
     }
 }
 
+use crate::test_support::TempDir;
 use crate::{EffectiveConfig, Paths};
 use ratatui::{
     backend::TestBackend,
@@ -34,10 +35,7 @@ use settings::{LanguagePreference, SettingKey, UiEnvironment, UiSettings};
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 #[derive(Debug)]
 struct FakeMouseCaptureControl {
     actual: bool,
@@ -78,15 +76,11 @@ impl MouseCaptureControl for FakeMouseCaptureControl {
     }
 }
 
-fn mouse_test_root(name: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("cdh_settings_mouse_{name}_{unique}"))
+fn mouse_test_root(name: &str) -> TempDir {
+    TempDir::new(&format!("settings_mouse_{name}"))
 }
 
-fn mouse_test_settings(name: &str, contents: Option<&str>) -> (PathBuf, UiSettings) {
+fn mouse_test_settings(name: &str, contents: Option<&str>) -> (TempDir, UiSettings) {
     let root = mouse_test_root(name);
     let path = root.join("tui.toml");
     if let Some(contents) = contents {
@@ -113,7 +107,6 @@ fn settings_mouse_successful_enable_updates_actual_and_persisted_state() {
     assert!(fs::read_to_string(root.join("tui.toml"))
         .unwrap()
         .contains("mouse = true"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -129,7 +122,6 @@ fn settings_mouse_successful_disable_updates_actual_and_persisted_state() {
     assert!(fs::read_to_string(root.join("tui.toml"))
         .unwrap()
         .contains("mouse = false"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -182,7 +174,6 @@ fn settings_mouse_persistence_failure_rolls_terminal_back() {
     assert_eq!(control.transitions, vec![false, true]);
     assert!(control.mouse_capture_enabled());
     assert_eq!(settings.saved(), original);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -214,7 +205,6 @@ fn settings_mouse_persistence_and_rollback_failure_tracks_actual_state() {
     assert_eq!(control.transitions, vec![false, true]);
     assert!(!control.mouse_capture_enabled());
     assert_eq!(settings.saved(), original);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -356,6 +346,35 @@ fn mouse_click_maps_screen_rows_through_the_page_start() {
 }
 
 #[test]
+fn record_list_geometry_stores_a_frame_and_keeps_the_last_one_on_none() {
+    // Issue #33: the event loop's list-geometry store-back used to survive
+    // mutation -- deleting it left the whole suite green, because the click
+    // tests drove a private copy of the write-back. `run_ui` and `render_frame`
+    // now both funnel through `record_list_geometry`, so this pins its two jobs
+    // directly. Delete either assignment inside the seam and this goes red.
+    let mut app = app_with_paths(&[("/a", 0.9), ("/b", 0.8)]);
+    assert_eq!(app.last_list_area, Rect::new(0, 0, 0, 0));
+    assert_eq!(app.last_list_start, 0);
+
+    // A drawn list publishes its area and page start verbatim; the next click
+    // maps screen rows through exactly these two values.
+    let drawn = ListGeometry {
+        area: Rect::new(2, 5, 40, 7),
+        start: 12,
+    };
+    app.record_list_geometry(Some(drawn));
+    assert_eq!(app.last_list_area, Rect::new(2, 5, 40, 7));
+    assert_eq!(app.last_list_start, 12);
+
+    // A frame that drew no list (terminal too small for the layout) must leave
+    // the last real geometry in place -- zeroing it would send a click during
+    // that frame to row 0 of a 0x0 area.
+    app.record_list_geometry(None);
+    assert_eq!(app.last_list_area, Rect::new(2, 5, 40, 7));
+    assert_eq!(app.last_list_start, 12);
+}
+
+#[test]
 fn restore_screen_emits_mouse_cleanup_before_leaving_the_alternate_screen() {
     // The panic hook passes `true` unconditionally because it cannot see the
     // guard; `Drop` passes the real flag. The mouse bytes must be the only
@@ -432,7 +451,7 @@ fn settings_mode_app(
     contents: Option<&str>,
     environment: UiEnvironment,
     locale_language: Language,
-) -> (PathBuf, App) {
+) -> (TempDir, App) {
     let root = mouse_test_root(name);
     let path = root.join("tui.toml");
     if let Some(contents) = contents {
@@ -538,10 +557,7 @@ fn render_frame(app: &mut App, width: u16, height: u16) -> Buffer {
             );
         })
         .unwrap();
-    if let Some(geometry) = list_geometry {
-        app.last_list_area = geometry.area;
-        app.last_list_start = geometry.start;
-    }
+    app.record_list_geometry(list_geometry);
     terminal.backend().buffer().clone()
 }
 
@@ -757,9 +773,6 @@ fn settings_panel_bilingual_labels_values_and_hints() {
                 "missing {expected:?} in {language:?}"
             );
         }
-        for root in roots {
-            let _ = fs::remove_dir_all(root);
-        }
     }
 }
 
@@ -769,19 +782,18 @@ fn settings_panel_locked_row_has_environment_read_only_marker() {
         preview: Some(true),
         ..UiEnvironment::default()
     };
-    let (root, mut app) = settings_mode_app("panel-lock", None, environment, Language::En);
+    let (_root, mut app) = settings_mode_app("panel-lock", None, environment, Language::En);
     settings_mode_select(&mut app, 2);
 
     let text = buffer_text(&render_buffer(&app, 80, 24, true));
 
     assert!(text.contains("Preview on startup"));
     assert!(text.contains("Environment controlled/read-only"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn main_screen_is_flat_with_surface_fill_and_no_outer_box_corners() {
-    let (root, app) = settings_mode_app("flat-main", None, UiEnvironment::default(), Language::En);
+    let (_root, app) = settings_mode_app("flat-main", None, UiEnvironment::default(), Language::En);
     // Leave settings mode so draw paints the main chrome.
     let mut app = app;
     app.mode = Mode::Normal;
@@ -809,12 +821,11 @@ fn main_screen_is_flat_with_surface_fill_and_no_outer_box_corners() {
     // Horizontal dividers still provide hierarchy without a frame.
     let divider = buffer.content.iter().any(|cell| cell.symbol() == "─");
     assert!(divider, "expected flat dividers");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_panel_selected_row_uses_one_continuous_background() {
-    let (root, mut app) = settings_mode_app(
+    let (_root, mut app) = settings_mode_app(
         "panel-selected",
         None,
         UiEnvironment::default(),
@@ -831,12 +842,11 @@ fn settings_panel_selected_row_uses_one_continuous_background() {
 
     assert!(selected_x.len() >= 40);
     assert!(selected_x.windows(2).all(|pair| pair[1] == pair[0] + 1));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_panel_colorless_selected_row_is_continuously_reversed() {
-    let (root, mut app) = settings_mode_app(
+    let (_root, mut app) = settings_mode_app(
         "panel-colorless",
         None,
         UiEnvironment::default(),
@@ -851,12 +861,11 @@ fn settings_panel_colorless_selected_row_is_continuously_reversed() {
 
     assert!(reversed_x.len() >= 40);
     assert!(reversed_x.windows(2).all(|pair| pair[1] == pair[0] + 1));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_panel_narrow_and_tiny_terminals_render_safely() {
-    let (root, mut app) = settings_mode_app(
+    let (_root, mut app) = settings_mode_app(
         "panel-small",
         None,
         UiEnvironment::default(),
@@ -871,7 +880,6 @@ fn settings_panel_narrow_and_tiny_terminals_render_safely() {
     }
     let narrow = buffer_text(&render_buffer(&app, 24, 12, true));
     assert!(narrow.contains("设置"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -896,7 +904,7 @@ fn settings_panel_f2_copy_is_distinct_in_footer_and_help() {
 
 #[test]
 fn settings_mode_f2_opens_and_f2_or_escape_closes_without_editing_query() {
-    let (root, mut app) =
+    let (_root, mut app) =
         settings_mode_app("open-close", None, UiEnvironment::default(), Language::En);
     app.query = "keep".to_string();
     app.query_cursor = 4;
@@ -913,7 +921,6 @@ fn settings_mode_f2_opens_and_f2_or_escape_closes_without_editing_query() {
     assert_eq!(app.mode, Mode::Settings { selected: 0 });
     handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, None);
     assert_eq!(app.mode, Mode::Normal);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -938,7 +945,7 @@ fn settings_mode_ctrl_c_and_ctrl_g_exit_from_every_mode() {
 
 #[test]
 fn settings_mode_up_down_selects_exactly_five_rows_and_clamps() {
-    let (root, mut app) =
+    let (_root, mut app) =
         settings_mode_app("selection", None, UiEnvironment::default(), Language::En);
     settings_mode_select(&mut app, 0);
 
@@ -950,12 +957,11 @@ fn settings_mode_up_down_selects_exactly_five_rows_and_clamps() {
     }
     handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE, None);
     assert_eq!(app.mode, Mode::Settings { selected: 4 });
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_mode_edit_keys_cycle_language_and_toggle_boolean_values() {
-    let (root, mut app) =
+    let (_root, mut app) =
         settings_mode_app("edit-keys", None, UiEnvironment::default(), Language::En);
     settings_mode_select(&mut app, 0);
 
@@ -990,7 +996,6 @@ fn settings_mode_edit_keys_cycle_language_and_toggle_boolean_values() {
         };
         assert_ne!(before, after);
     }
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1007,7 +1012,6 @@ fn settings_mode_unlocked_edit_persists_before_updating_runtime() {
     assert!(fs::read_to_string(root.join("tui.toml"))
         .unwrap()
         .contains("color = false"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1050,7 +1054,6 @@ fn settings_mode_theme_cycles_and_persists_from_settings_and_shortcuts() {
     assert!(fs::read_to_string(root.join("tui.toml"))
         .unwrap()
         .contains("theme = \"graphite\""));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1074,12 +1077,11 @@ fn settings_mode_theme_env_lock_rejects_cycle_without_disk_change() {
     assert_eq!(app.theme_choice, ThemeChoice::Nord);
     assert!(!root.join("tui.toml").exists());
     assert_eq!(app.notice.as_deref(), Some("此设置由环境变量锁定"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_mode_persisted_theme_and_environment_override_seed_runtime() {
-    let (persisted_root, persisted_app) = settings_mode_app(
+    let (_persisted_root, persisted_app) = settings_mode_app(
         "theme-persisted",
         Some(
             "language = \"en\"\ntheme = \"daylight\"\npreview = false\ncolor = true\nmouse = true\n",
@@ -1089,13 +1091,12 @@ fn settings_mode_persisted_theme_and_environment_override_seed_runtime() {
     );
     assert_eq!(persisted_app.theme_choice, ThemeChoice::Daylight);
     assert_eq!(persisted_app.settings.saved().theme, ThemeChoice::Daylight);
-    let _ = fs::remove_dir_all(persisted_root);
 
     let environment = UiEnvironment {
         theme: Some(ThemeChoice::Mono),
         ..UiEnvironment::default()
     };
-    let (root, app) = settings_mode_app(
+    let (_root, app) = settings_mode_app(
         "theme-env-override",
         Some("language = \"en\"\ntheme = \"nord\"\npreview = false\ncolor = true\nmouse = true\n"),
         environment,
@@ -1105,7 +1106,6 @@ fn settings_mode_persisted_theme_and_environment_override_seed_runtime() {
     assert_eq!(app.settings.saved().theme, ThemeChoice::Nord);
     assert_eq!(app.settings.effective().theme, ThemeChoice::Mono);
     assert!(app.settings.is_locked(SettingKey::Theme));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1122,7 +1122,6 @@ fn settings_mode_locked_edit_is_rejected_without_disk_change() {
     assert!(app.settings.effective().preview);
     assert!(!root.join("tui.toml").exists());
     assert_eq!(app.notice.as_deref(), Some("此设置由环境变量锁定"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1150,12 +1149,11 @@ fn settings_mode_write_failure_preserves_runtime_and_saved_value() {
         .as_deref()
         .unwrap()
         .starts_with("Failed to save settings: "));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn settings_mode_persisted_defaults_and_environment_overrides_seed_runtime() {
-    let (persisted_root, persisted_app) = settings_mode_app(
+    let (_persisted_root, persisted_app) = settings_mode_app(
         "startup-persisted",
         Some("language = \"en\"\npreview = true\ncolor = false\nmouse = false\n"),
         UiEnvironment::default(),
@@ -1165,7 +1163,6 @@ fn settings_mode_persisted_defaults_and_environment_overrides_seed_runtime() {
     assert!(persisted_app.preview_visible);
     assert!(!persisted_app.color_enabled);
     assert!(!persisted_app.settings.effective().mouse);
-    let _ = fs::remove_dir_all(persisted_root);
 
     let environment = UiEnvironment {
         language: Some(LanguagePreference::En),
@@ -1174,7 +1171,7 @@ fn settings_mode_persisted_defaults_and_environment_overrides_seed_runtime() {
         mouse: Some(false),
         theme: None,
     };
-    let (root, app) = settings_mode_app(
+    let (_root, app) = settings_mode_app(
         "startup",
         Some("language = \"zh-CN\"\npreview = true\ncolor = false\nmouse = true\n"),
         environment,
@@ -1185,7 +1182,6 @@ fn settings_mode_persisted_defaults_and_environment_overrides_seed_runtime() {
     assert!(!app.preview_visible);
     assert!(app.color_enabled);
     assert!(!app.settings.effective().mouse);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1207,12 +1203,11 @@ fn settings_mode_preview_edit_persists_but_tab_remains_session_only() {
         persisted
     );
     assert!(app.settings.saved().preview);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_mode_load_warning_becomes_localized_notice() {
-    let (root, app) = settings_mode_app(
+    let (_root, app) = settings_mode_app(
         "load-warning",
         Some("language = ["),
         UiEnvironment::default(),
@@ -1223,7 +1218,6 @@ fn settings_mode_load_warning_becomes_localized_notice() {
         .as_deref()
         .unwrap()
         .starts_with("TUI 设置加载失败: "));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1249,12 +1243,11 @@ fn settings_mouse_staged_candidate_applies_and_reports_runtime_results() {
     assert!(fs::read_to_string(root.join("tui.toml"))
         .unwrap()
         .contains("mouse = false"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_mouse_terminal_and_persistence_failures_are_localized_and_gate_actual_state() {
-    let (root, mut app) = settings_mode_app(
+    let (_root, mut app) = settings_mode_app(
         "mouse-terminal",
         None,
         UiEnvironment::default(),
@@ -1271,7 +1264,6 @@ fn settings_mouse_terminal_and_persistence_failures_are_localized_and_gate_actua
         .as_deref()
         .unwrap()
         .starts_with("Failed to change terminal mouse capture: "));
-    let _ = fs::remove_dir_all(root);
 
     let root = mouse_test_root("mouse-persist-rollback-runtime");
     fs::create_dir_all(&root).unwrap();
@@ -1294,7 +1286,6 @@ fn settings_mouse_terminal_and_persistence_failures_are_localized_and_gate_actua
         .as_deref()
         .unwrap()
         .starts_with("保存鼠标设置失败: "));
-    fs::remove_dir_all(root).unwrap();
 
     let root = mouse_test_root("mouse-persist-runtime");
     fs::create_dir_all(&root).unwrap();
@@ -1317,7 +1308,6 @@ fn settings_mouse_terminal_and_persistence_failures_are_localized_and_gate_actua
     assert!(!mouse_event_enabled(&rollback_failure, Mode::Normal));
     assert!(app.settings.saved().mouse);
     assert!(app.notice.as_deref().unwrap().contains("rollback failed"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1372,7 +1362,6 @@ fn settings_language_change_invalidates_old_preview() {
         outcome: preview_data(&["stale-language"]),
     }));
     assert!(app.preview_current.is_none());
-    let _ = fs::remove_dir_all(root);
 }
 
 fn line_text(line: &Line<'_>) -> String {
@@ -1392,12 +1381,8 @@ fn row_options(index: usize, total: usize, selected: bool, width: usize) -> List
     }
 }
 
-fn test_ctx(name: &str) -> (PathBuf, AppContext) {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("cdh_picker_test_{name}_{unique}"));
+fn test_ctx(name: &str) -> (TempDir, AppContext) {
+    let root = TempDir::new(&format!("picker_test_{name}"));
     let paths = Paths {
         config_dir: root.join("config"),
         data_dir: root.join("data"),
@@ -2680,7 +2665,6 @@ fn ctrl_d_confirmation_removes_history_and_candidate() {
     // directory walks straight back in as a discovered row on next launch --
     // and discovered rows carry no history entry to delete a second time.
     assert!(crate::excludes::Excludes::load(&ctx.paths.excludes).contains(stale.to_str().unwrap()));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2734,7 +2718,6 @@ fn ctrl_d_on_discovered_row_excludes_without_touching_history() {
         fs::read_to_string(&ctx.paths.history_uniq).unwrap(),
         history_line
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2860,7 +2843,7 @@ fn exclusion_window_follows_the_cursor_without_overscrolling() {
 
 #[test]
 fn unexclude_rewrites_the_file_and_shrinks_the_panel() {
-    let (root, ctx) = test_ctx("unexclude");
+    let (_root, ctx) = test_ctx("unexclude");
     crate::excludes::add(&ctx.paths.excludes, "/noise/one").unwrap();
     crate::excludes::add(&ctx.paths.excludes, "/noise/two").unwrap();
     let mut app = App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, false);
@@ -2898,7 +2881,6 @@ fn unexclude_rewrites_the_file_and_shrinks_the_panel() {
         KeyModifiers::CONTROL,
         Some(&ctx),
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3688,7 +3670,6 @@ fn read_git_info_reports_clean_and_modified_status() {
     assert_eq!(git::read_git_info(&repo).unwrap().dirty, Some(false));
     fs::write(repo.join("note.txt"), "dirty").unwrap();
     assert_eq!(git::read_git_info(&repo).unwrap().dirty, Some(true));
-    let _ = fs::remove_dir_all(root);
 }
 
 // ---- Directory-tree discovery layer ----
@@ -3837,13 +3818,7 @@ fn ctrl_d_on_history_row_still_arms_confirmation() {
 
 #[test]
 fn bootstrap_seeds_pwd_ancestors_and_children() {
-    let tree = {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("cdh-bootstrap-{}-{stamp}", std::process::id()))
-    };
+    let tree = TempDir::new("bootstrap");
     fs::create_dir_all(tree.join("child_a")).unwrap();
     fs::create_dir_all(tree.join("child_b")).unwrap();
     let mut app = App::with_preview_worker(Vec::new(), None, false);
@@ -3857,7 +3832,6 @@ fn bootstrap_seeds_pwd_ancestors_and_children() {
         .candidates
         .iter()
         .all(|c| c.source == CandidateSource::Discovered));
-    let _ = fs::remove_dir_all(&tree);
 }
 
 #[test]
