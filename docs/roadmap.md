@@ -608,22 +608,28 @@ DAG 收官时在案的 11 项挂起事项，在 GATE-13 逐项裁定。**A 类�
 2026-09-02 更新：A4、A6 已随第二战役 PR #27 销账，在案剩 9 项。
 2026-09-03 更新：B10 已随第三战役销账（PR #28/#19/#20/#29），在案剩 8 项；同批补录三条 P2
 缺口（12–14，A 类候选，源自 PR #29 对抗验证）与一条 C 类备注（15）。
+2026-09-11 更新：A2、A3、A5 已随 PR #38 销账（issue #30/#32/#33 随合并自动关闭），
+A13、A14 已随 PR #39 销账（issue #35/#36 同）。A 类在案仅剩 1（issue #31，待定 notice
+过期行为）与 12（issue #34，PTY 输入路径覆盖）。
 
 ### A 类：转 issue 候选（技术债有明确动作）
 
 1. **`app.notice` 无过期机制** —— 转新 issue：notice 没有过期/清除路径，可能长期挂在页脚；
    PR-8 期间发现，按「零夹带」护栏未顺手修。（issue #31）
-2. **34 处临时目录泄漏缺 `Drop` guard** —— 转新 issue：清理挂在成功路径上、断言一失败就泄漏，
-   每轮测试都在 `/tmp` 留目录，修法明确（换成失败路径也能清的 guard）。（issue #30）
-3. **`App::page` 末页 clamp 与调用处重复** —— 转新 issue：同一不变量在 `PageWindow::new` 与
-   `App::page` 各写了一遍，小重构、动作明确。（issue #32）
+2. **34 处临时目录泄漏缺 `Drop` guard** —— 已解决（PR #38，2026-09-11）：`1ef2159` 新增
+   `src/test_support.rs` 统一 Drop 守卫 `TempDir`（栈展开即清理，`Deref`/`AsRef<Path>` 顶替裸
+   `PathBuf`），迁移全部裸 `remove_dir_all` 站点，配 panic 中途也会清目录的回归测试。
+   原委：清理挂在成功路径上、断言一失败就泄漏；现账已收。（issue #30，已关闭）
+3. **`App::page` 末页 clamp 与调用处重复** —— 已解决（PR #38，2026-09-11）：`c80bd2f` 让
+   `page()` 委托 `PageWindow::new`，`end` 钳制只此一处，`move_page` 改读 `total_pages`。
+   原委：同一不变量写两遍易漂移；现账已收。（issue #32，已关闭）
 4. **`render_confirm_delete` 未搬进 `picker_overlays.rs`** —— 已解决（PR #27，2026-09-02）：
    `47c5bde` 补完 4.3 验收，浮层各自成模块。原委：4.3 验收「四个浮层各自成模块」当时实际
    只搬了三个，roadmap 留痕由本条归口收账，现账已收。
-5. **`run_ui` 几何存回第一跳是变异幸存者** —— 转新 issue：
-   `app.last_list_start = geometry.start`（`src/picker.rs:2367`，基线 `5c9a2cd`）这一步在
-   PR-10 对抗验证（P2-1）中变异全绿——跨页点击测试锁的是 `render_list` 层，没锁到这步存回，
-   补一条状态级测试即可关上。（issue #33）
+5. **`run_ui` 几何存回第一跳是变异幸存者** —— 已解决（PR #38，2026-09-11）：`f32a8eb` 把
+   几何存回收敛到 `record_list_geometry` 一条 seam，run_ui 与测试同路径，配状态级测试
+   （存帧、None 保留末帧）关上变异缺口。原委：`app.last_list_start = geometry.start`
+   （基线 `5c9a2cd`）在 PR-10 对抗验证（P2-1）中变异全绿；现账已收。（issue #33，已关闭）
 6. **`read_git_info` 测试 spawn 的 `git init` 应硬化子进程环境** —— 已解决（PR #27，2026-09-02）：
    `e3f48ce` 的 `git_command` helper 剥 9 个 `GIT_*` 变量，配两个承重测试 + bare 诱饵仓库回归
    测试。原委：2026-09-02 两次 `.git/config` 损坏的根因即此注入链，钩子侧 unset 已先行修过，
@@ -635,12 +641,15 @@ DAG 收官时在案的 11 项挂起事项，在 GATE-13 逐项裁定。**A 类�
     测试，键盘/鼠标事件从 crossterm 到 cdh 键位映射的整条路径无自动化回归。changelog 已核
     无 cdh 可感的语义变化，但那是「没测」而非「测过」——changelog 核查排除的是已知风险，
     不产生对未知风险的覆盖。（issue #34）
-13. **ratatui 0.30 布局求解器换血（cassowary → kasuari）无异常尺寸专项** —— 转新 issue：
-    渲染逐字节等价只在已测尺寸上成立，极窄/极宽/单行这类边界尺寸没有专项断言，而布局求解器
-    的差异恰恰在约束过紧或退化的尺寸上现形。（issue #35）
-14. **渲染等价的验证层是 TestBackend buffer，终端字节流层无覆盖** —— 转新 issue：等价断言
-    停在 buffer 单元格层，ratatui → crossterm 的 diff 输出（最终写进终端的字节流）没有任何
-    测试经过；后端在序列化层的差异（若有）在现有测试下全绿不可见。（issue #36）
+13. **ratatui 0.30 布局求解器换血（cassowary → kasuari）无异常尺寸专项** —— 已解决
+    （PR #39，2026-09-11）：`d714a0d` 补奇数尺寸与阈值边界矩阵（107↔108、69↔70、17↔18），
+    断言由布局契约独立推导的结构不变式（chrome 行精确落位、面板两两不重叠、gutter 恰隔
+    一列），不 pin 求解器输出——off-by-one 可抓、求解器再换可活。（issue #35，已关闭）
+14. **渲染等价的验证层是 TestBackend buffer，终端字节流层无覆盖** —— 已解决
+    （PR #39，2026-09-11）：`91a9309` 用 `CrosstermBackend<Vec<u8>>` + `Viewport::Fixed`
+    捕获真实 wire 字节，pin 完整 golden（30×8 全固定 fixture，CI 双平台逐字节一致），承重
+    不变式（颜色批处理、teardown 序列）先行断言——依赖 bump 令其变红正是设计目的。
+    （issue #36，已关闭）
 
 ### B 类：挂起——产品/发布决策，属用户，不是代码任务
 
