@@ -1129,6 +1129,30 @@ impl App {
         }
     }
 
+    /// Issue #31: `notice` had no expiry -- it lingered until some later
+    /// handler happened to overwrite it. The agreed semantics are
+    /// clear-on-next-interactive-input, applied uniformly to every notice
+    /// source (startup settings warnings, toggle feedback, save
+    /// confirmations): the event loop funnels each event through here
+    /// *before* dispatching its handler, and a key press/repeat or a real
+    /// mouse action (not a bare `Moved`, which fires as the cursor merely
+    /// crosses the pane) wipes the notice. Clearing first means a handler
+    /// that sets its own notice on the same event still shows it. Events
+    /// that are not interaction -- Resize, focus changes, key Release
+    /// (kitty keyboard protocol only) -- never clear. `mouse_enabled`
+    /// mirrors the event loop's match-arm gate: when mouse capture is off
+    /// or the mode is not Normal, mouse events are not dispatched and must
+    /// not clear either.
+    fn clear_notice_for_input(&mut self, event: &Event, mouse_enabled: bool) {
+        match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => self.notice = None,
+            Event::Mouse(mouse) if mouse_enabled && mouse.kind != MouseEventKind::Moved => {
+                self.notice = None;
+            }
+            _ => {}
+        }
+    }
+
     /// Snapshot everything rendering reads, once per frame. Drawing then
     /// consumes only the snapshot, never `App` -- no chance for a render to
     /// disagree with the state another renderer saw in the same frame. The
@@ -1978,26 +2002,68 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
             continue;
         }
 
-        match event::read()? {
-            Event::Key(key) if key.kind != KeyEventKind::Release => {
-                let result = handle_key(&mut app, key.code, key.modifiers, ctx);
-                app.apply_pending_mouse_setting(&mut guard);
-                if let Some(result) = result {
-                    return Ok(result);
-                }
-                dirty = true;
-            }
-            Event::Resize(_, _) => {
-                dirty = true;
-            }
-            Event::Mouse(mouse_event) if mouse_event_enabled(&guard, app.mode) => {
-                if let Some(result) = handle_mouse(&mut app, mouse_event) {
-                    return Ok(result);
-                }
-                dirty = true;
-            }
-            _ => {}
+        let event = event::read()?;
+        match dispatch_event(&mut app, event, &mut guard, ctx) {
+            EventOutcome::Finished(result) => return Ok(result),
+            EventOutcome::Redraw => dirty = true,
+            EventOutcome::Unhandled => {}
         }
+    }
+}
+
+/// What `dispatch_event` asks the run loop to do next. The loop keeps the
+/// terminal-side duties -- returning the selection, marking the frame dirty
+/// -- while the seam owns event semantics.
+#[derive(Debug, PartialEq, Eq)]
+enum EventOutcome {
+    /// The event changed something on screen; redraw.
+    Redraw,
+    /// Nothing consumed this event; leave the dirty flag untouched.
+    Unhandled,
+    /// The session finished: the chosen path, or `None` for a bare exit.
+    Finished(Option<String>),
+}
+
+/// Issue #31's dispatch seam: everything between `event::read()` and the
+/// run loop's bookkeeping, in exactly the order the notice contract depends
+/// on --
+/// 1. expire any pending notice (interactive input only),
+/// 2. evaluate the mouse dispatch gate,
+/// 3. run the handler, which may set a fresh notice into the just-cleared
+///    slot (toggle feedback, save confirmation),
+/// 4. apply a mouse-capture toggle the key handler staged.
+///
+/// `run_ui` and the tests drive crossterm events through this same
+/// function, so the clear-before-dispatch ordering is pinned against the
+/// real wiring, not a hand-copied replay. Generic over `MouseCaptureControl`
+/// so tests substitute a fake instead of a real terminal.
+fn dispatch_event<C: MouseCaptureControl>(
+    app: &mut App,
+    event: Event,
+    mouse: &mut C,
+    ctx: Option<&AppContext>,
+) -> EventOutcome {
+    app.clear_notice_for_input(&event, mouse_event_enabled(mouse, app.mode));
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Release => {
+            let result = handle_key(app, key.code, key.modifiers, ctx);
+            // A key may stage a mouse-capture change (settings panel); apply
+            // it before deciding the outcome, so its own notice lands even
+            // when the key also ends the session.
+            app.apply_pending_mouse_setting(mouse);
+            match result {
+                Some(result) => EventOutcome::Finished(result),
+                None => EventOutcome::Redraw,
+            }
+        }
+        Event::Resize(_, _) => EventOutcome::Redraw,
+        Event::Mouse(mouse_event) if mouse_event_enabled(mouse, app.mode) => {
+            match handle_mouse(app, mouse_event) {
+                Some(result) => EventOutcome::Finished(result),
+                None => EventOutcome::Redraw,
+            }
+        }
+        _ => EventOutcome::Unhandled,
     }
 }
 

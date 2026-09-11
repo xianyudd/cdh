@@ -27,6 +27,7 @@ fn candidate_name_borrows_the_last_segment() {
 
 use crate::test_support::TempDir;
 use crate::{EffectiveConfig, Paths};
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::{
     backend::TestBackend,
     buffer::{Buffer, Cell as BufferCell},
@@ -372,6 +373,273 @@ fn record_list_geometry_stores_a_frame_and_keeps_the_last_one_on_none() {
     app.record_list_geometry(None);
     assert_eq!(app.last_list_area, Rect::new(2, 5, 40, 7));
     assert_eq!(app.last_list_start, 12);
+}
+
+#[test]
+fn clear_notice_for_input_expires_a_notice_on_key_press() {
+    // Issue #31: the user's next key press is a notice's expiry. Until this
+    // seam existed the notice had no lifecycle at all -- it lingered until
+    // some later handler happened to overwrite it. Delete the Key arm's
+    // assignment inside the seam and this goes red.
+    let mut app = app_with_paths(&[("/a", 0.9)]);
+    app.notice = Some("old notice".to_string());
+    app.clear_notice_for_input(
+        &Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+        false,
+    );
+    assert_eq!(app.notice, None);
+}
+
+#[test]
+fn clear_notice_for_input_keeps_a_notice_across_release_resize_and_focus_events() {
+    // Key Release only ever arrives under the kitty keyboard protocol, but it
+    // is not interaction -- and neither is a resize (the terminal moved, the
+    // user did not act) nor a focus change. Wiping on any of these would let
+    // the notice vanish without a single user action.
+    let mut app = app_with_paths(&[("/a", 0.9)]);
+    app.notice = Some("old notice".to_string());
+    let non_interactive = [
+        Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        )),
+        Event::Resize(80, 24),
+        Event::FocusGained,
+        Event::FocusLost,
+    ];
+    // Repeat *is* interaction -- a held key re-firing -- so unlike Release it
+    // must clear, matching the `kind != Release` arm guard in the event loop.
+    app.notice = Some("old notice".to_string());
+    app.clear_notice_for_input(
+        &Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        )),
+        false,
+    );
+    assert_eq!(app.notice, None);
+
+    for event in non_interactive {
+        app.notice = Some("old notice".to_string());
+        app.clear_notice_for_input(&event, true);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("old notice"),
+            "notice was cleared by non-interactive event {event:?}"
+        );
+    }
+}
+
+#[test]
+fn clear_notice_for_input_expires_on_mouse_action_but_not_cursor_movement() {
+    // A click or a scroll is the user acting; `Moved` fires whenever the
+    // cursor merely crosses the pane and must not flicker a notice away.
+    let moved = Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 3,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    });
+    let click = Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 3,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    });
+    let scroll = Event::Mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 3,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    let mut app = app_with_paths(&[("/a", 0.9)]);
+    app.notice = Some("old notice".to_string());
+    app.clear_notice_for_input(&moved, true);
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("old notice"),
+        "a bare cursor move must not clear the notice"
+    );
+
+    for event in [click, scroll] {
+        app.notice = Some("old notice".to_string());
+        app.clear_notice_for_input(&event, true);
+        assert_eq!(app.notice, None, "mouse action {event:?} should clear");
+    }
+}
+
+#[test]
+fn clear_notice_for_input_respects_the_mouse_dispatch_gate() {
+    // The event loop only dispatches mouse events when capture is enabled and
+    // the mode is Normal (`mouse_event_enabled`); it hands that verdict to
+    // the seam so a mouse event that would never reach a handler also never
+    // clears the notice.
+    let mut app = app_with_paths(&[("/a", 0.9)]);
+    app.notice = Some("old notice".to_string());
+    app.clear_notice_for_input(
+        &Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        }),
+        false,
+    );
+    assert_eq!(app.notice.as_deref(), Some("old notice"));
+}
+
+#[test]
+fn dispatch_event_expires_a_pending_notice_on_the_next_key_press() {
+    // Issue #31 wiring pin (mutation: delete the clear inside
+    // `dispatch_event`): with the clear gone the stale notice survives the
+    // key press and this goes red. Driven through the same `dispatch_event`
+    // that `run_ui` calls, so the mutation cannot hide behind a hand-copied
+    // replay of the ordering.
+    let mut app = app_with_paths(&[("/a", 0.9), ("/b", 0.8)]);
+    let mut mouse = FakeMouseCaptureControl::succeeding(false);
+    app.notice = Some("old notice".to_string());
+    let outcome = dispatch_event(
+        &mut app,
+        Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+        &mut mouse,
+        None,
+    );
+    // F(1) opens the help overlay and touches no notice state itself --
+    // `set_selected`-style keys (arrows, clicks on rows) clear the notice on
+    // their own and would make this assertion vacuously green. The only way
+    // `notice` ends up None here is the seam's pre-dispatch clear.
+    assert_eq!(outcome, EventOutcome::Redraw);
+    assert_eq!(app.mode, Mode::Help);
+    assert_eq!(app.notice, None);
+}
+
+#[test]
+fn notice_set_by_the_handler_for_the_clearing_key_survives_dispatch() {
+    // Issue #31 ordering pin (mutation: move the clear inside
+    // `dispatch_event` to after the handler): `run_ui` must clear the notice
+    // *before* dispatching, so a handler that sets its own notice on the
+    // same key (toggle feedback, save confirmation) still shows it. Ctrl+D
+    // with no candidates sets NoDeletableHistory; if the clear ever ran
+    // after dispatch it would wipe that fresh notice and this goes red.
+    let mut app = app_with_paths(&[]);
+    let mut mouse = FakeMouseCaptureControl::succeeding(false);
+    app.notice = Some("old notice".to_string());
+    let expected = app.language.text(TextKey::NoDeletableHistory).to_string();
+    let outcome = dispatch_event(
+        &mut app,
+        Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+        &mut mouse,
+        None,
+    );
+    assert_eq!(outcome, EventOutcome::Redraw);
+    assert_eq!(
+        app.notice.as_deref(),
+        Some(expected.as_str()),
+        "the handler's own notice must survive the pre-dispatch clear"
+    );
+}
+
+#[test]
+fn notice_set_by_the_mouse_handlers_double_click_survives_dispatch() {
+    // The mouse arm of the same ordering contract as
+    // `notice_set_by_the_handler_for_the_clearing_key_survives_dispatch`: a
+    // double-click on a missing directory sets MissingDeleteHint inside
+    // `handle_mouse`, and the seam's clear must run *before* the handler. If
+    // the clear were moved after `handle_mouse` (the mouse-arm variant of the
+    // ordering mutation, which the Ctrl+D test cannot see), the fresh notice
+    // would be wiped and this goes red.
+    let mut app = App::with_preview_worker(
+        build_candidates(&recs_with_exists(&[("/gone", 0.9, false)])),
+        None,
+        false,
+    );
+    // Publish a list geometry so clicks at row 0 map onto the candidate; the
+    // real loop gets this from draw, tests inject it directly (#33 seam).
+    app.record_list_geometry(Some(ListGeometry {
+        area: Rect::new(0, 0, 40, 7),
+        start: 0,
+    }));
+    let mut mouse = FakeMouseCaptureControl::succeeding(true);
+    let click = Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 3,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    // First click only arms `last_click`; the notice is pinned after it so
+    // the assertion below sees exactly the second (double-click) dispatch.
+    assert_eq!(
+        dispatch_event(&mut app, click.clone(), &mut mouse, None),
+        EventOutcome::Redraw
+    );
+    app.notice = Some("old notice".to_string());
+    let expected = app.language.text(TextKey::MissingDeleteHint).to_string();
+    assert_eq!(
+        dispatch_event(&mut app, click, &mut mouse, None),
+        EventOutcome::Redraw
+    );
+    assert_eq!(
+        app.notice.as_deref(),
+        Some(expected.as_str()),
+        "the double-click handler's notice must survive the pre-dispatch clear"
+    );
+}
+
+#[test]
+fn dispatch_event_gates_mouse_on_capture_and_finishes_the_session_on_enter() {
+    // Wiring pin for the other two arms of the dispatch seam: a mouse event
+    // only reaches its handler (and only clears a notice) when capture is on
+    // and the mode is Normal; Enter returns the selection as the session
+    // outcome; a resize redraws without touching the notice.
+    let click = Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 3,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    });
+    let mut app = app_with_paths(&[("/a", 0.9)]);
+    app.notice = Some("old notice".to_string());
+
+    // Capture off: the event is not dispatched, so it must not clear.
+    let mut mouse = FakeMouseCaptureControl::succeeding(false);
+    assert_eq!(
+        dispatch_event(&mut app, click.clone(), &mut mouse, None),
+        EventOutcome::Unhandled
+    );
+    assert_eq!(app.notice.as_deref(), Some("old notice"));
+
+    // Capture on: the click dispatches and clears.
+    let mut mouse = FakeMouseCaptureControl::succeeding(true);
+    assert_eq!(
+        dispatch_event(&mut app, click, &mut mouse, None),
+        EventOutcome::Redraw
+    );
+    assert_eq!(app.notice, None);
+
+    // Resize redraws but is not interaction -- the notice survives.
+    app.notice = Some("old notice".to_string());
+    let mut mouse = FakeMouseCaptureControl::succeeding(true);
+    assert_eq!(
+        dispatch_event(&mut app, Event::Resize(80, 24), &mut mouse, None),
+        EventOutcome::Redraw
+    );
+    assert_eq!(app.notice.as_deref(), Some("old notice"));
+
+    // Enter finishes the session with the selected path.
+    let mut mouse = FakeMouseCaptureControl::succeeding(true);
+    assert_eq!(
+        dispatch_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut mouse,
+            None
+        ),
+        EventOutcome::Finished(Some("/a".to_string()))
+    );
 }
 
 #[test]
