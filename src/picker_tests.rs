@@ -25,6 +25,7 @@ fn candidate_name_borrows_the_last_segment() {
     }
 }
 
+use crate::test_support::TempDir;
 use crate::{EffectiveConfig, Paths};
 use ratatui::{
     backend::TestBackend,
@@ -34,10 +35,7 @@ use settings::{LanguagePreference, SettingKey, UiEnvironment, UiSettings};
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 #[derive(Debug)]
 struct FakeMouseCaptureControl {
     actual: bool,
@@ -78,15 +76,11 @@ impl MouseCaptureControl for FakeMouseCaptureControl {
     }
 }
 
-fn mouse_test_root(name: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("cdh_settings_mouse_{name}_{unique}"))
+fn mouse_test_root(name: &str) -> TempDir {
+    TempDir::new(&format!("settings_mouse_{name}"))
 }
 
-fn mouse_test_settings(name: &str, contents: Option<&str>) -> (PathBuf, UiSettings) {
+fn mouse_test_settings(name: &str, contents: Option<&str>) -> (TempDir, UiSettings) {
     let root = mouse_test_root(name);
     let path = root.join("tui.toml");
     if let Some(contents) = contents {
@@ -113,7 +107,6 @@ fn settings_mouse_successful_enable_updates_actual_and_persisted_state() {
     assert!(fs::read_to_string(root.join("tui.toml"))
         .unwrap()
         .contains("mouse = true"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -129,7 +122,6 @@ fn settings_mouse_successful_disable_updates_actual_and_persisted_state() {
     assert!(fs::read_to_string(root.join("tui.toml"))
         .unwrap()
         .contains("mouse = false"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -182,7 +174,6 @@ fn settings_mouse_persistence_failure_rolls_terminal_back() {
     assert_eq!(control.transitions, vec![false, true]);
     assert!(control.mouse_capture_enabled());
     assert_eq!(settings.saved(), original);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -214,7 +205,6 @@ fn settings_mouse_persistence_and_rollback_failure_tracks_actual_state() {
     assert_eq!(control.transitions, vec![false, true]);
     assert!(!control.mouse_capture_enabled());
     assert_eq!(settings.saved(), original);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -356,6 +346,35 @@ fn mouse_click_maps_screen_rows_through_the_page_start() {
 }
 
 #[test]
+fn record_list_geometry_stores_a_frame_and_keeps_the_last_one_on_none() {
+    // Issue #33: the event loop's list-geometry store-back used to survive
+    // mutation -- deleting it left the whole suite green, because the click
+    // tests drove a private copy of the write-back. `run_ui` and `render_frame`
+    // now both funnel through `record_list_geometry`, so this pins its two jobs
+    // directly. Delete either assignment inside the seam and this goes red.
+    let mut app = app_with_paths(&[("/a", 0.9), ("/b", 0.8)]);
+    assert_eq!(app.last_list_area, Rect::new(0, 0, 0, 0));
+    assert_eq!(app.last_list_start, 0);
+
+    // A drawn list publishes its area and page start verbatim; the next click
+    // maps screen rows through exactly these two values.
+    let drawn = ListGeometry {
+        area: Rect::new(2, 5, 40, 7),
+        start: 12,
+    };
+    app.record_list_geometry(Some(drawn));
+    assert_eq!(app.last_list_area, Rect::new(2, 5, 40, 7));
+    assert_eq!(app.last_list_start, 12);
+
+    // A frame that drew no list (terminal too small for the layout) must leave
+    // the last real geometry in place -- zeroing it would send a click during
+    // that frame to row 0 of a 0x0 area.
+    app.record_list_geometry(None);
+    assert_eq!(app.last_list_area, Rect::new(2, 5, 40, 7));
+    assert_eq!(app.last_list_start, 12);
+}
+
+#[test]
 fn restore_screen_emits_mouse_cleanup_before_leaving_the_alternate_screen() {
     // The panic hook passes `true` unconditionally because it cannot see the
     // guard; `Drop` passes the real flag. The mouse bytes must be the only
@@ -389,6 +408,145 @@ fn restore_screen_returns_to_the_primary_screen_last() {
     assert!(
         emitted.ends_with(&leave),
         "expected the output to end with LeaveAlternateScreen"
+    );
+}
+
+/// Capture the exact byte stream `CrosstermBackend` writes for one frame, the
+/// way the real event loop emits it to the terminal. A `Fixed` viewport pins
+/// the size without querying a tty (so this runs headless), and the clock plus
+/// cube angle arrive as arguments, keeping the frame a pure function of state.
+fn crossterm_frame_bytes(app: &App, full: Rect, color: bool, now_unix: i64) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let backend = CrosstermBackend::new(&mut buf);
+        let mut terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(full),
+            },
+        )
+        .unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app.view(now_unix),
+                    &Theme::new(color),
+                    TEST_CUBE_ANGLE,
+                );
+            })
+            .unwrap();
+    }
+    buf
+}
+
+/// The escape sequences `CrosstermBackend` writes for a fixed 30x8 colored
+/// frame. The other frame tests inspect the `TestBackend` *buffer*; this pins
+/// the *wire* bytes instead -- the SGR run batching, the truecolor codes, and
+/// the underline-color reset that a buffer-level assertion is blind to. Both CI
+/// targets (Linux and macOS) drive crossterm's ANSI writer, so the bytes are
+/// portable across the matrix; the one non-ANSI path (a legacy Windows console
+/// that would divert to winapi) is not on the matrix. A dependency bump that
+/// reshapes the stream is *meant* to fail here so the change gets a look.
+/// (Regenerate by re-capturing `crossterm_frame_bytes` for the fixture below.)
+const GOLDEN_30X8: &[u8] = b"\
+        \x1b[1;1H\x1b[39;48;2;20;24;34m \x1b[1m\x1b[38;2;232;238;255;48;2;20;24;34mcdh\
+        \x1b[22m\x1b[39;48;2;20;24;34m       \x1b[38;2;125;137;166;48;2;20;24;34m1\xe2\x80\x933 / 3 \xc2\xb7 Page 1/1\
+        \x1b[39;48;2;20;24;34m \x1b[2;1H \x1b[38;2;168;184;255;48;2;20;24;34m\xe2\x9d\xaf \xe2\x96\x8f\
+        \x1b[38;2;125;137;166;48;2;20;24;34mSearch paths\xe2\x80\xa6\
+        \x1b[39;48;2;20;24;34m             \x1b[3;1H \x1b[38;2;81;95;125;48;2;20;24;34m\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\
+        \x1b[39;48;2;20;24;34m \x1b[4;1H \x1b[1m\x1b[38;2;195;232;141;48;2;53;69;106m\xe2\x80\xba\
+        \x1b[22m\x1b[38;2;247;249;255;48;2;53;69;106m 1  \
+        \x1b[38;2;125;137;166;48;2;53;69;106m/opt/cdh/\x1b[1m\
+        \x1b[38;2;247;249;255;48;2;53;69;106malpha\x1b[22m         \
+        \x1b[39;48;2;20;24;34m \x1b[5;1H \x1b[38;2;216;225;245;48;2;20;24;34m  2  \
+        \x1b[38;2;125;137;166;48;2;20;24;34m/opt/cdh/\x1b[1m\
+        \x1b[38;2;216;225;245;48;2;20;24;34mbeta\x1b[22m          \
+        \x1b[39;48;2;20;24;34m \x1b[6;1H \x1b[38;2;216;225;245;48;2;20;24;34m  3  \
+        \x1b[38;2;125;137;166;48;2;20;24;34m/opt/cdh/\x1b[1m\
+        \x1b[38;2;216;225;245;48;2;20;24;34mgamma\x1b[22m         \
+        \x1b[39;48;2;20;24;34m \x1b[7;1H \x1b[38;2;81;95;125;48;2;20;24;34m\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\
+        \x1b[39;48;2;20;24;34m \x1b[8;1H \x1b[1m\x1b[38;2;168;184;255;48;2;20;24;34mCtrl+H\
+        \x1b[22m\x1b[38;2;125;137;166;48;2;20;24;34m Hidden dirs\
+        \x1b[38;2;81;95;125;48;2;20;24;34m \xc2\xb7 \x1b[1m\
+        \x1b[38;2;168;184;255;48;2;20;24;34mEnter\x1b[22m\
+        \x1b[38;2;125;137;166;48;2;20;24;34m \xe2\x80\xa6\
+        \x1b[39;48;2;20;24;34m \x1b[39m\x1b[49m\x1b[59m\x1b[0m\
+        \x1b[?25l\x1b[?25h";
+
+#[test]
+fn crossterm_writes_the_pinned_byte_stream_for_a_fixed_frame() {
+    // A fully pinned fixture: fixed paths outside any $HOME (so no `~`
+    // abbreviation can leak the environment), English copy, the cube disabled,
+    // a fixed clock, and the fixed test cube angle. Everything the wire bytes
+    // depend on is nailed down here so the frame is reproducible everywhere.
+    let full = Rect::new(0, 0, 30, 8);
+    let mut app = App::with_preview_worker_language(
+        build_candidates(&recs(&[
+            ("/opt/cdh/alpha", 0.90),
+            ("/opt/cdh/beta", 0.60),
+            ("/opt/cdh/gamma", 0.30),
+        ])),
+        None,
+        false,
+        Language::En,
+    );
+    app.home = None;
+    app.corner_3d_env = false;
+    app.set_page_size(page_size_for(
+        full,
+        app.preview_visible,
+        app.corner_3d_enabled(),
+    ));
+
+    let bytes = crossterm_frame_bytes(&app, full, true, 1_700_000_000);
+    let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+
+    // Load-bearing invariants, spelled out so a failure names the regression
+    // rather than only dumping a 1.3 KB byte diff.
+    // Total volume: falling back to per-cell SGR instead of batched runs would
+    // blow this up, and dropping a panel would shrink it.
+    assert_eq!(
+        bytes.len(),
+        1389,
+        "byte volume drifted -- SGR batching or panel content changed"
+    );
+    // The frame opens at the home cell and closes with the full teardown:
+    // reset fg, bg, underline color, and attributes, then the cursor toggles.
+    assert!(
+        bytes.starts_with(b"\x1b[1;1H"),
+        "frame must open at the home cell"
+    );
+    assert!(
+        bytes.ends_with(b"\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?25l\x1b[?25h"),
+        "frame must close by resetting fg/bg/underline/attrs then toggling the cursor"
+    );
+    // Truecolor foreground and background codes are emitted, not indexed ones.
+    // The foreground opens its SGR run; the background is always batched in
+    // after another attribute (`;48;2;` never `\x1b[48;2;`), which is the run
+    // coalescing a per-cell regression would undo.
+    assert!(
+        contains(b"\x1b[38;2;"),
+        "expected a truecolor SetForegroundColor opening an SGR run"
+    );
+    assert!(
+        contains(b";48;2;"),
+        "expected a truecolor background batched into an SGR run"
+    );
+    // The selected row batches its fg and bg into a single SGR write -- the
+    // exact behavior a color-batching regression would break.
+    assert!(
+        contains(b"\x1b[38;2;247;249;255;48;2;53;69;106m"),
+        "selected row should batch fg+bg into one SGR write"
+    );
+    // The underline-color reset the task flagged is present in the stream.
+    assert!(contains(b"\x1b[59m"), "expected the underline-color reset");
+
+    // The full golden: any other change to the wire bytes trips this line.
+    assert_eq!(
+        bytes.as_slice(),
+        GOLDEN_30X8,
+        "crossterm byte stream changed"
     );
 }
 
@@ -432,7 +590,7 @@ fn settings_mode_app(
     contents: Option<&str>,
     environment: UiEnvironment,
     locale_language: Language,
-) -> (PathBuf, App) {
+) -> (TempDir, App) {
     let root = mouse_test_root(name);
     let path = root.join("tui.toml");
     if let Some(contents) = contents {
@@ -538,10 +696,7 @@ fn render_frame(app: &mut App, width: u16, height: u16) -> Buffer {
             );
         })
         .unwrap();
-    if let Some(geometry) = list_geometry {
-        app.last_list_area = geometry.area;
-        app.last_list_start = geometry.start;
-    }
+    app.record_list_geometry(list_geometry);
     terminal.backend().buffer().clone()
 }
 
@@ -757,9 +912,6 @@ fn settings_panel_bilingual_labels_values_and_hints() {
                 "missing {expected:?} in {language:?}"
             );
         }
-        for root in roots {
-            let _ = fs::remove_dir_all(root);
-        }
     }
 }
 
@@ -769,19 +921,18 @@ fn settings_panel_locked_row_has_environment_read_only_marker() {
         preview: Some(true),
         ..UiEnvironment::default()
     };
-    let (root, mut app) = settings_mode_app("panel-lock", None, environment, Language::En);
+    let (_root, mut app) = settings_mode_app("panel-lock", None, environment, Language::En);
     settings_mode_select(&mut app, 2);
 
     let text = buffer_text(&render_buffer(&app, 80, 24, true));
 
     assert!(text.contains("Preview on startup"));
     assert!(text.contains("Environment controlled/read-only"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn main_screen_is_flat_with_surface_fill_and_no_outer_box_corners() {
-    let (root, app) = settings_mode_app("flat-main", None, UiEnvironment::default(), Language::En);
+    let (_root, app) = settings_mode_app("flat-main", None, UiEnvironment::default(), Language::En);
     // Leave settings mode so draw paints the main chrome.
     let mut app = app;
     app.mode = Mode::Normal;
@@ -809,12 +960,11 @@ fn main_screen_is_flat_with_surface_fill_and_no_outer_box_corners() {
     // Horizontal dividers still provide hierarchy without a frame.
     let divider = buffer.content.iter().any(|cell| cell.symbol() == "─");
     assert!(divider, "expected flat dividers");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_panel_selected_row_uses_one_continuous_background() {
-    let (root, mut app) = settings_mode_app(
+    let (_root, mut app) = settings_mode_app(
         "panel-selected",
         None,
         UiEnvironment::default(),
@@ -831,12 +981,11 @@ fn settings_panel_selected_row_uses_one_continuous_background() {
 
     assert!(selected_x.len() >= 40);
     assert!(selected_x.windows(2).all(|pair| pair[1] == pair[0] + 1));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_panel_colorless_selected_row_is_continuously_reversed() {
-    let (root, mut app) = settings_mode_app(
+    let (_root, mut app) = settings_mode_app(
         "panel-colorless",
         None,
         UiEnvironment::default(),
@@ -851,12 +1000,11 @@ fn settings_panel_colorless_selected_row_is_continuously_reversed() {
 
     assert!(reversed_x.len() >= 40);
     assert!(reversed_x.windows(2).all(|pair| pair[1] == pair[0] + 1));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_panel_narrow_and_tiny_terminals_render_safely() {
-    let (root, mut app) = settings_mode_app(
+    let (_root, mut app) = settings_mode_app(
         "panel-small",
         None,
         UiEnvironment::default(),
@@ -871,7 +1019,6 @@ fn settings_panel_narrow_and_tiny_terminals_render_safely() {
     }
     let narrow = buffer_text(&render_buffer(&app, 24, 12, true));
     assert!(narrow.contains("设置"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -896,7 +1043,7 @@ fn settings_panel_f2_copy_is_distinct_in_footer_and_help() {
 
 #[test]
 fn settings_mode_f2_opens_and_f2_or_escape_closes_without_editing_query() {
-    let (root, mut app) =
+    let (_root, mut app) =
         settings_mode_app("open-close", None, UiEnvironment::default(), Language::En);
     app.query = "keep".to_string();
     app.query_cursor = 4;
@@ -913,7 +1060,6 @@ fn settings_mode_f2_opens_and_f2_or_escape_closes_without_editing_query() {
     assert_eq!(app.mode, Mode::Settings { selected: 0 });
     handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, None);
     assert_eq!(app.mode, Mode::Normal);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -938,7 +1084,7 @@ fn settings_mode_ctrl_c_and_ctrl_g_exit_from_every_mode() {
 
 #[test]
 fn settings_mode_up_down_selects_exactly_five_rows_and_clamps() {
-    let (root, mut app) =
+    let (_root, mut app) =
         settings_mode_app("selection", None, UiEnvironment::default(), Language::En);
     settings_mode_select(&mut app, 0);
 
@@ -950,12 +1096,11 @@ fn settings_mode_up_down_selects_exactly_five_rows_and_clamps() {
     }
     handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE, None);
     assert_eq!(app.mode, Mode::Settings { selected: 4 });
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_mode_edit_keys_cycle_language_and_toggle_boolean_values() {
-    let (root, mut app) =
+    let (_root, mut app) =
         settings_mode_app("edit-keys", None, UiEnvironment::default(), Language::En);
     settings_mode_select(&mut app, 0);
 
@@ -990,7 +1135,6 @@ fn settings_mode_edit_keys_cycle_language_and_toggle_boolean_values() {
         };
         assert_ne!(before, after);
     }
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1007,7 +1151,6 @@ fn settings_mode_unlocked_edit_persists_before_updating_runtime() {
     assert!(fs::read_to_string(root.join("tui.toml"))
         .unwrap()
         .contains("color = false"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1050,7 +1193,6 @@ fn settings_mode_theme_cycles_and_persists_from_settings_and_shortcuts() {
     assert!(fs::read_to_string(root.join("tui.toml"))
         .unwrap()
         .contains("theme = \"graphite\""));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1074,12 +1216,11 @@ fn settings_mode_theme_env_lock_rejects_cycle_without_disk_change() {
     assert_eq!(app.theme_choice, ThemeChoice::Nord);
     assert!(!root.join("tui.toml").exists());
     assert_eq!(app.notice.as_deref(), Some("此设置由环境变量锁定"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_mode_persisted_theme_and_environment_override_seed_runtime() {
-    let (persisted_root, persisted_app) = settings_mode_app(
+    let (_persisted_root, persisted_app) = settings_mode_app(
         "theme-persisted",
         Some(
             "language = \"en\"\ntheme = \"daylight\"\npreview = false\ncolor = true\nmouse = true\n",
@@ -1089,13 +1230,12 @@ fn settings_mode_persisted_theme_and_environment_override_seed_runtime() {
     );
     assert_eq!(persisted_app.theme_choice, ThemeChoice::Daylight);
     assert_eq!(persisted_app.settings.saved().theme, ThemeChoice::Daylight);
-    let _ = fs::remove_dir_all(persisted_root);
 
     let environment = UiEnvironment {
         theme: Some(ThemeChoice::Mono),
         ..UiEnvironment::default()
     };
-    let (root, app) = settings_mode_app(
+    let (_root, app) = settings_mode_app(
         "theme-env-override",
         Some("language = \"en\"\ntheme = \"nord\"\npreview = false\ncolor = true\nmouse = true\n"),
         environment,
@@ -1105,7 +1245,6 @@ fn settings_mode_persisted_theme_and_environment_override_seed_runtime() {
     assert_eq!(app.settings.saved().theme, ThemeChoice::Nord);
     assert_eq!(app.settings.effective().theme, ThemeChoice::Mono);
     assert!(app.settings.is_locked(SettingKey::Theme));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1122,7 +1261,6 @@ fn settings_mode_locked_edit_is_rejected_without_disk_change() {
     assert!(app.settings.effective().preview);
     assert!(!root.join("tui.toml").exists());
     assert_eq!(app.notice.as_deref(), Some("此设置由环境变量锁定"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1150,12 +1288,11 @@ fn settings_mode_write_failure_preserves_runtime_and_saved_value() {
         .as_deref()
         .unwrap()
         .starts_with("Failed to save settings: "));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn settings_mode_persisted_defaults_and_environment_overrides_seed_runtime() {
-    let (persisted_root, persisted_app) = settings_mode_app(
+    let (_persisted_root, persisted_app) = settings_mode_app(
         "startup-persisted",
         Some("language = \"en\"\npreview = true\ncolor = false\nmouse = false\n"),
         UiEnvironment::default(),
@@ -1165,7 +1302,6 @@ fn settings_mode_persisted_defaults_and_environment_overrides_seed_runtime() {
     assert!(persisted_app.preview_visible);
     assert!(!persisted_app.color_enabled);
     assert!(!persisted_app.settings.effective().mouse);
-    let _ = fs::remove_dir_all(persisted_root);
 
     let environment = UiEnvironment {
         language: Some(LanguagePreference::En),
@@ -1174,7 +1310,7 @@ fn settings_mode_persisted_defaults_and_environment_overrides_seed_runtime() {
         mouse: Some(false),
         theme: None,
     };
-    let (root, app) = settings_mode_app(
+    let (_root, app) = settings_mode_app(
         "startup",
         Some("language = \"zh-CN\"\npreview = true\ncolor = false\nmouse = true\n"),
         environment,
@@ -1185,7 +1321,6 @@ fn settings_mode_persisted_defaults_and_environment_overrides_seed_runtime() {
     assert!(!app.preview_visible);
     assert!(app.color_enabled);
     assert!(!app.settings.effective().mouse);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1207,12 +1342,11 @@ fn settings_mode_preview_edit_persists_but_tab_remains_session_only() {
         persisted
     );
     assert!(app.settings.saved().preview);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_mode_load_warning_becomes_localized_notice() {
-    let (root, app) = settings_mode_app(
+    let (_root, app) = settings_mode_app(
         "load-warning",
         Some("language = ["),
         UiEnvironment::default(),
@@ -1223,7 +1357,6 @@ fn settings_mode_load_warning_becomes_localized_notice() {
         .as_deref()
         .unwrap()
         .starts_with("TUI 设置加载失败: "));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1249,12 +1382,11 @@ fn settings_mouse_staged_candidate_applies_and_reports_runtime_results() {
     assert!(fs::read_to_string(root.join("tui.toml"))
         .unwrap()
         .contains("mouse = false"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn settings_mouse_terminal_and_persistence_failures_are_localized_and_gate_actual_state() {
-    let (root, mut app) = settings_mode_app(
+    let (_root, mut app) = settings_mode_app(
         "mouse-terminal",
         None,
         UiEnvironment::default(),
@@ -1271,7 +1403,6 @@ fn settings_mouse_terminal_and_persistence_failures_are_localized_and_gate_actua
         .as_deref()
         .unwrap()
         .starts_with("Failed to change terminal mouse capture: "));
-    let _ = fs::remove_dir_all(root);
 
     let root = mouse_test_root("mouse-persist-rollback-runtime");
     fs::create_dir_all(&root).unwrap();
@@ -1294,7 +1425,6 @@ fn settings_mouse_terminal_and_persistence_failures_are_localized_and_gate_actua
         .as_deref()
         .unwrap()
         .starts_with("保存鼠标设置失败: "));
-    fs::remove_dir_all(root).unwrap();
 
     let root = mouse_test_root("mouse-persist-runtime");
     fs::create_dir_all(&root).unwrap();
@@ -1317,7 +1447,6 @@ fn settings_mouse_terminal_and_persistence_failures_are_localized_and_gate_actua
     assert!(!mouse_event_enabled(&rollback_failure, Mode::Normal));
     assert!(app.settings.saved().mouse);
     assert!(app.notice.as_deref().unwrap().contains("rollback failed"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1372,7 +1501,6 @@ fn settings_language_change_invalidates_old_preview() {
         outcome: preview_data(&["stale-language"]),
     }));
     assert!(app.preview_current.is_none());
-    let _ = fs::remove_dir_all(root);
 }
 
 fn line_text(line: &Line<'_>) -> String {
@@ -1392,12 +1520,8 @@ fn row_options(index: usize, total: usize, selected: bool, width: usize) -> List
     }
 }
 
-fn test_ctx(name: &str) -> (PathBuf, AppContext) {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("cdh_picker_test_{name}_{unique}"));
+fn test_ctx(name: &str) -> (TempDir, AppContext) {
+    let root = TempDir::new(&format!("picker_test_{name}"));
     let paths = Paths {
         config_dir: root.join("config"),
         data_dir: root.join("data"),
@@ -2680,7 +2804,6 @@ fn ctrl_d_confirmation_removes_history_and_candidate() {
     // directory walks straight back in as a discovered row on next launch --
     // and discovered rows carry no history entry to delete a second time.
     assert!(crate::excludes::Excludes::load(&ctx.paths.excludes).contains(stale.to_str().unwrap()));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2734,7 +2857,6 @@ fn ctrl_d_on_discovered_row_excludes_without_touching_history() {
         fs::read_to_string(&ctx.paths.history_uniq).unwrap(),
         history_line
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2860,7 +2982,7 @@ fn exclusion_window_follows_the_cursor_without_overscrolling() {
 
 #[test]
 fn unexclude_rewrites_the_file_and_shrinks_the_panel() {
-    let (root, ctx) = test_ctx("unexclude");
+    let (_root, ctx) = test_ctx("unexclude");
     crate::excludes::add(&ctx.paths.excludes, "/noise/one").unwrap();
     crate::excludes::add(&ctx.paths.excludes, "/noise/two").unwrap();
     let mut app = App::with_preview_worker(build_candidates(&recs(&[("/a", 0.9)])), None, false);
@@ -2898,7 +3020,6 @@ fn unexclude_rewrites_the_file_and_shrinks_the_panel() {
         KeyModifiers::CONTROL,
         Some(&ctx),
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3667,6 +3788,402 @@ fn preview_layout_uses_side_then_bottom_then_notice() {
     );
 }
 
+/// What preview panel a given terminal size should resolve to. Kept
+/// test-local because the renderer's `PreviewPlacement` is deliberately opaque
+/// (no `PartialEq`/`Debug`), so the matrix rows spell out the expected panel
+/// here instead of comparing it directly.
+#[derive(Clone, Copy)]
+enum ExpectPreview {
+    None,
+    Side,
+    Bottom,
+}
+
+/// Assert the solved `ScreenLayout` partitions the terminal the way the
+/// renderer depends on, deriving every expectation from `full` and the layout
+/// contract rather than pinning solver output. Fixed chrome lands on exact
+/// rows, the content band between the dividers is tiled by the list, the
+/// preview, and the cube gutter with no overlaps or gaps, and the gutter sits
+/// one blank column right of the content. These invariants outlive a
+/// constraint-solver swap (cassowary -> kasuari) yet still fail on the
+/// off-by-one reflow such a swap could introduce.
+fn assert_screen_layout_tiles(
+    full: Rect,
+    preview_visible: bool,
+    corner_enabled: bool,
+    expect_preview: ExpectPreview,
+    expect_corner: bool,
+) {
+    let layout = screen_layout(full, preview_visible, corner_enabled)
+        .unwrap_or_else(|| panic!("{full:?} should produce a layout"));
+
+    // Fixed chrome: three one-row bands on top, two on the bottom, each inset
+    // by the single side-padding column. Pinning these rows is the boundary
+    // check the task asks for -- a divider that drifts a line fails here.
+    let band_x = full.x + 1;
+    let band_w = full.width - 2;
+    assert_eq!(
+        layout.header,
+        Rect::new(band_x, full.y, band_w, 1),
+        "{full:?} header row"
+    );
+    assert_eq!(
+        layout.input,
+        Rect::new(band_x, full.y + 1, band_w, 1),
+        "{full:?} input row"
+    );
+    assert_eq!(
+        layout.top_divider,
+        Rect::new(band_x, full.y + 2, band_w, 1),
+        "{full:?} top divider row"
+    );
+    assert_eq!(
+        layout.bottom_divider,
+        Rect::new(band_x, full.y + full.height - 2, band_w, 1),
+        "{full:?} bottom divider row"
+    );
+    assert_eq!(
+        layout.footer,
+        Rect::new(band_x, full.y + full.height - 1, band_w, 1),
+        "{full:?} footer row"
+    );
+
+    // The content band is exactly what the dividers leave between them.
+    let content_full = Rect::new(band_x, full.y + 3, band_w, full.height - 5);
+
+    // The cube gutter, when reserved, is carved off the right of the band with
+    // one blank separator column; the list/preview content shrinks by exactly
+    // the gutter width and never reaches into it.
+    let content = match layout.corner {
+        Some(corner) => {
+            assert!(
+                expect_corner,
+                "{full:?} reserved a cube gutter unexpectedly"
+            );
+            assert_eq!(corner.width, cube::WIDTH, "{full:?} cube gutter width");
+            assert_eq!(corner.height, cube::HEIGHT, "{full:?} cube gutter height");
+            let content = Rect::new(
+                content_full.x,
+                content_full.y,
+                content_full.width - CORNER_3D_GUTTER,
+                content_full.height,
+            );
+            assert_eq!(
+                corner.x,
+                content.right() + 1,
+                "{full:?} one blank column between content and cube"
+            );
+            assert_eq!(
+                corner.bottom(),
+                content.bottom(),
+                "{full:?} cube sits flush to the content bottom"
+            );
+            assert!(
+                corner.right() <= full.right(),
+                "{full:?} cube stays on screen"
+            );
+            content
+        }
+        None => {
+            assert!(
+                !expect_corner,
+                "{full:?} should have reserved a cube gutter"
+            );
+            content_full
+        }
+    };
+
+    let preview = layout.preview.map(|(rect, _)| rect);
+    match expect_preview {
+        ExpectPreview::None => {
+            assert!(preview.is_none(), "{full:?} expected no preview panel");
+            // The notice appears exactly when a preview was requested but the
+            // terminal was too small to place it.
+            assert_eq!(
+                layout.preview_unavailable, preview_visible,
+                "{full:?} notice iff a requested preview was dropped"
+            );
+            assert_eq!(
+                layout.list, content,
+                "{full:?} the list fills the whole content band"
+            );
+        }
+        ExpectPreview::Side => {
+            let preview = preview.expect("side preview rect");
+            assert!(
+                matches!(layout.preview, Some((_, PreviewPlacement::Side))),
+                "{full:?} expected a side preview"
+            );
+            assert!(
+                !layout.preview_unavailable,
+                "{full:?} a placed preview leaves no notice"
+            );
+            // List and preview split the band left-to-right, edge to edge.
+            assert_eq!(
+                layout.list.x, content.x,
+                "{full:?} side list starts the band"
+            );
+            assert_eq!(layout.list.y, content.y, "{full:?} side list top");
+            assert_eq!(
+                layout.list.height, content.height,
+                "{full:?} side list spans the band height"
+            );
+            assert_eq!(preview.y, content.y, "{full:?} side preview top");
+            assert_eq!(
+                preview.height, content.height,
+                "{full:?} side preview spans the band height"
+            );
+            assert_eq!(
+                layout.list.right(),
+                preview.x,
+                "{full:?} side columns abut with no gap"
+            );
+            assert_eq!(
+                preview.right(),
+                content.right(),
+                "{full:?} side preview ends the band"
+            );
+            assert!(
+                layout.list.width >= 1 && preview.width >= 1,
+                "{full:?} neither side column collapses"
+            );
+        }
+        ExpectPreview::Bottom => {
+            let preview = preview.expect("bottom preview rect");
+            assert!(
+                matches!(layout.preview, Some((_, PreviewPlacement::Bottom))),
+                "{full:?} expected a bottom preview"
+            );
+            assert!(
+                !layout.preview_unavailable,
+                "{full:?} a placed preview leaves no notice"
+            );
+            // List on top, preview below, with the one-row divider gap between.
+            assert_eq!(layout.list.x, content.x, "{full:?} bottom list left edge");
+            assert_eq!(
+                layout.list.width, content.width,
+                "{full:?} bottom list spans the band width"
+            );
+            assert_eq!(preview.x, content.x, "{full:?} bottom preview left edge");
+            assert_eq!(
+                preview.width, content.width,
+                "{full:?} bottom preview spans the band width"
+            );
+            assert_eq!(
+                layout.list.y, content.y,
+                "{full:?} bottom list starts the band"
+            );
+            assert_eq!(
+                preview.y,
+                layout.list.y + layout.list.height + 1,
+                "{full:?} one divider row between list and preview"
+            );
+            assert_eq!(
+                preview.bottom(),
+                content.bottom(),
+                "{full:?} bottom preview ends the band"
+            );
+            assert!(
+                layout.list.height >= 1 && preview.height >= 1,
+                "{full:?} neither row band collapses"
+            );
+        }
+    }
+
+    // Whatever panels exist must be pairwise disjoint and must never intrude on
+    // the chrome rows -- the list/preview/footer non-overlap the task calls
+    // out, checked with ratatui's own intersection test.
+    let panels: Vec<Rect> = [Some(layout.list), preview, layout.corner]
+        .into_iter()
+        .flatten()
+        .collect();
+    let chrome = [
+        layout.header,
+        layout.input,
+        layout.top_divider,
+        layout.bottom_divider,
+        layout.footer,
+    ];
+    for (i, panel) in panels.iter().enumerate() {
+        for other in &panels[i + 1..] {
+            assert!(
+                !panel.intersects(*other),
+                "{full:?} panels {panel:?} and {other:?} overlap"
+            );
+        }
+        for band in chrome {
+            assert!(
+                !panel.intersects(band),
+                "{full:?} panel {panel:?} overlaps chrome {band:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn screen_layout_tiles_list_preview_and_gutter_across_odd_sizes() {
+    // Odd widths and heights push the percentage constraints onto fractional
+    // boundaries, which is exactly where a constraint-solver swap could drift a
+    // column or row. Each case pins the structural invariants (see
+    // `assert_screen_layout_tiles`) rather than raw bytes, so it survives the
+    // swap while still catching an overlap or off-by-one.
+    let cases = [
+        // (full, preview_visible, corner_enabled, expected preview, expects gutter)
+        (
+            Rect::new(0, 0, 81, 23),
+            true,
+            true,
+            ExpectPreview::Bottom,
+            true,
+        ), // width == cube minimum
+        (
+            Rect::new(0, 0, 83, 41),
+            true,
+            true,
+            ExpectPreview::Bottom,
+            true,
+        ), // tall, odd both ways
+        (
+            Rect::new(0, 0, 71, 19),
+            true,
+            true,
+            ExpectPreview::Bottom,
+            false,
+        ), // too narrow for the cube
+        (
+            Rect::new(0, 0, 107, 21),
+            true,
+            false,
+            ExpectPreview::Bottom,
+            false,
+        ), // just below side threshold
+        (
+            Rect::new(0, 0, 109, 19),
+            true,
+            true,
+            ExpectPreview::Side,
+            true,
+        ),
+        (
+            Rect::new(0, 0, 137, 25),
+            true,
+            true,
+            ExpectPreview::Side,
+            true,
+        ),
+        (
+            Rect::new(0, 0, 111, 45),
+            true,
+            true,
+            ExpectPreview::Side,
+            true,
+        ),
+        (
+            Rect::new(0, 0, 95, 15),
+            false,
+            true,
+            ExpectPreview::None,
+            true,
+        ),
+        (
+            Rect::new(0, 0, 95, 11),
+            false,
+            true,
+            ExpectPreview::None,
+            false,
+        ), // too short for the cube
+        (
+            Rect::new(0, 0, 45, 13),
+            false,
+            true,
+            ExpectPreview::None,
+            false,
+        ), // too narrow for the cube
+        (
+            Rect::new(0, 0, 63, 9),
+            false,
+            false,
+            ExpectPreview::None,
+            false,
+        ), // near MIN_HEIGHT
+    ];
+    for (full, preview_visible, corner_enabled, expect_preview, expect_corner) in cases {
+        assert_screen_layout_tiles(
+            full,
+            preview_visible,
+            corner_enabled,
+            expect_preview,
+            expect_corner,
+        );
+    }
+}
+
+#[test]
+fn screen_layout_promotes_preview_to_the_side_at_width_108() {
+    // At 107 columns the side preview cannot meet PREVIEW_SIDE_MIN_WIDTH, so the
+    // panel stays docked at the bottom; one column wider crosses the threshold
+    // and it swings to the side. (Mutation check: lower the constant to 107 and
+    // the 107 case would already report Side.)
+    let below = screen_layout(Rect::new(0, 0, 107, 30), true, false).unwrap();
+    assert!(
+        matches!(below.preview, Some((_, PreviewPlacement::Bottom))),
+        "107 columns keeps the preview docked at the bottom"
+    );
+    let at = screen_layout(Rect::new(0, 0, 108, 30), true, false).unwrap();
+    assert!(
+        matches!(at.preview, Some((_, PreviewPlacement::Side))),
+        "108 columns promotes the preview to the side"
+    );
+}
+
+#[test]
+fn screen_layout_admits_bottom_preview_at_width_70() {
+    // Below PREVIEW_BOTTOM_MIN_WIDTH no panel fits, so a requested preview
+    // degrades to the notice; at exactly 70 the bottom preview appears.
+    let below = screen_layout(Rect::new(0, 0, 69, 18), true, false).unwrap();
+    assert!(
+        below.preview.is_none(),
+        "69 columns is too narrow for any preview panel"
+    );
+    assert!(
+        below.preview_unavailable,
+        "the requested-but-unplaced preview shows a notice"
+    );
+    let at = screen_layout(Rect::new(0, 0, 70, 18), true, false).unwrap();
+    assert!(
+        matches!(at.preview, Some((_, PreviewPlacement::Bottom))),
+        "70 columns admits the bottom preview"
+    );
+    assert!(
+        !at.preview_unavailable,
+        "a placed preview clears the notice"
+    );
+}
+
+#[test]
+fn screen_layout_admits_bottom_preview_at_height_18() {
+    // In the bottom-preview width band the panel still needs the minimum
+    // height: 17 rows shows only the notice, 18 rows admits the panel.
+    let below = screen_layout(Rect::new(0, 0, 80, 17), true, false).unwrap();
+    assert!(
+        below.preview.is_none(),
+        "17 rows is too short for a bottom preview"
+    );
+    assert!(
+        below.preview_unavailable,
+        "the requested-but-unplaced preview shows a notice"
+    );
+    let at = screen_layout(Rect::new(0, 0, 80, 18), true, false).unwrap();
+    assert!(
+        matches!(at.preview, Some((_, PreviewPlacement::Bottom))),
+        "18 rows admits the bottom preview"
+    );
+    assert!(
+        !at.preview_unavailable,
+        "a placed preview clears the notice"
+    );
+}
+
 #[test]
 fn read_git_info_reports_clean_and_modified_status() {
     if Command::new("git").arg("--version").output().is_err() {
@@ -3688,7 +4205,6 @@ fn read_git_info_reports_clean_and_modified_status() {
     assert_eq!(git::read_git_info(&repo).unwrap().dirty, Some(false));
     fs::write(repo.join("note.txt"), "dirty").unwrap();
     assert_eq!(git::read_git_info(&repo).unwrap().dirty, Some(true));
-    let _ = fs::remove_dir_all(root);
 }
 
 // ---- Directory-tree discovery layer ----
@@ -3837,13 +4353,7 @@ fn ctrl_d_on_history_row_still_arms_confirmation() {
 
 #[test]
 fn bootstrap_seeds_pwd_ancestors_and_children() {
-    let tree = {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("cdh-bootstrap-{}-{stamp}", std::process::id()))
-    };
+    let tree = TempDir::new("bootstrap");
     fs::create_dir_all(tree.join("child_a")).unwrap();
     fs::create_dir_all(tree.join("child_b")).unwrap();
     let mut app = App::with_preview_worker(Vec::new(), None, false);
@@ -3857,7 +4367,6 @@ fn bootstrap_seeds_pwd_ancestors_and_children() {
         .candidates
         .iter()
         .all(|c| c.source == CandidateSource::Discovered));
-    let _ = fs::remove_dir_all(&tree);
 }
 
 #[test]

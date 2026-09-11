@@ -1077,18 +1077,18 @@ impl App {
     }
 
     fn page(&self) -> PageWindow {
-        let total = self.filtered_results.len();
-        if total == 0 {
-            return PageWindow::new(0, 0, self.page_size);
-        }
-        let start = self.current_page.saturating_sub(1) * self.page_size;
-        PageWindow {
-            start,
-            end: (start + self.page_size).min(total),
-            page: self.current_page,
-            page_count: self.total_pages,
-            page_size: self.page_size,
-        }
+        // `PageWindow::new` is the single source for the window math, including
+        // the short last-page clamp (`end = (start + page_size).min(total)`).
+        // `page()` used to hand-roll the same `start`/`end` computation, so the
+        // last-page clamp lived in two places and could drift apart (issue #32).
+        // Delegating keeps it in one spot. `current_page`/`total_pages` stay in
+        // sync with `selected_index` via `sync_pagination`, so deriving the
+        // window straight from `selected_index` returns the same window.
+        PageWindow::new(
+            self.filtered_results.len(),
+            self.selected_index,
+            self.page_size,
+        )
     }
 
     fn sync_pagination(&mut self) {
@@ -1107,6 +1107,26 @@ impl App {
         );
         self.current_page = page.page;
         self.total_pages = page.page_count;
+    }
+
+    /// Remember where the last frame drew its result list, so the next mouse
+    /// click can map a screen row back to a result index. `run_ui` calls this
+    /// after every `draw`; the `render_frame` test harness calls the same seam,
+    /// so the click tests drive this exact write-back rather than a private
+    /// copy of it (issue #33: the in-loop store used to survive mutation).
+    ///
+    /// `None` means nothing drew a list this frame (e.g. the terminal was too
+    /// small for the layout). Keep the previous geometry rather than zeroing
+    /// it: a zeroed `last_list_area` has `height == 0`, and the click handler
+    /// treats a zero-height list area as a click that missed the list and
+    /// drops the click (returns `None`) -- it never maps onto row 0 of an
+    /// empty area. Reusing the last real geometry instead lets a click during
+    /// a transient listless frame keep mapping to the right row.
+    fn record_list_geometry(&mut self, geometry: Option<ListGeometry>) {
+        if let Some(geometry) = geometry {
+            self.last_list_area = geometry.area;
+            self.last_list_start = geometry.start;
+        }
     }
 
     /// Snapshot everything rendering reads, once per frame. Drawing then
@@ -1415,7 +1435,7 @@ impl App {
         let page = self.page();
         let current = self.current_page.saturating_sub(1) as isize;
         let target_page =
-            (current + delta).clamp(0, page.page_count.saturating_sub(1) as isize) as usize;
+            (current + delta).clamp(0, self.total_pages.saturating_sub(1) as isize) as usize;
         let row_in_page = self.selected_index.saturating_sub(page.start);
         self.set_selected(target_page * page.page_size + row_in_page)
     }
@@ -1929,10 +1949,7 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
                 let view = app.view(now_unix);
                 list_geometry = draw(frame, &view, &theme, corner_angle);
             })?;
-            if let Some(geometry) = list_geometry {
-                app.last_list_area = geometry.area;
-                app.last_list_start = geometry.start;
-            }
+            app.record_list_geometry(list_geometry);
             dirty = false;
         }
 

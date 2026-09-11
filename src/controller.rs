@@ -229,17 +229,12 @@ fn run_log_subcommand(ctx: &AppContext, mut args: impl Iterator<Item = String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
     use crate::{EffectiveConfig, Paths};
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn test_ctx(name: &str) -> (PathBuf, AppContext) {
-        let uniq = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("cdh_controller_test_{name}_{uniq}"));
+    fn test_ctx(name: &str) -> (TempDir, AppContext) {
+        let root = TempDir::new(&format!("controller_test_{name}"));
         let paths = Paths {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
@@ -276,7 +271,7 @@ mod tests {
 
     #[test]
     fn half_life_zero_returns_error_instead_of_panicking() {
-        let (root, ctx) = test_ctx("half_life_zero");
+        let (_root, ctx) = test_ctx("half_life_zero");
         let status = run_with_args(
             &ctx,
             ["--half-life", "0", "--no-check-dir"]
@@ -284,12 +279,11 @@ mod tests {
                 .map(String::from),
         );
         assert_eq!(status, 1);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn half_life_negative_returns_error_instead_of_panicking() {
-        let (root, ctx) = test_ctx("half_life_negative");
+        let (_root, ctx) = test_ctx("half_life_negative");
         let status = run_with_args(
             &ctx,
             ["--half-life", "-1", "--no-check-dir"]
@@ -297,20 +291,18 @@ mod tests {
                 .map(String::from),
         );
         assert_eq!(status, 1);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn empty_keyword_is_ignored() {
-        let (root, ctx) = test_ctx("empty_keyword");
+        let (_root, ctx) = test_ctx("empty_keyword");
         let status = run_with_args(&ctx, ["", "--no-check-dir"].into_iter().map(String::from));
         assert_eq!(status, 0);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn limit_zero_returns_error() {
-        let (root, ctx) = test_ctx("limit_zero");
+        let (_root, ctx) = test_ctx("limit_zero");
         let status = run_with_args(
             &ctx,
             ["--limit", "0", "--no-check-dir"]
@@ -318,12 +310,11 @@ mod tests {
                 .map(String::from),
         );
         assert_eq!(status, 1);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn limit_invalid_returns_error() {
-        let (root, ctx) = test_ctx("limit_invalid");
+        let (_root, ctx) = test_ctx("limit_invalid");
         let status = run_with_args(
             &ctx,
             ["--limit", "abc", "--no-check-dir"]
@@ -331,6 +322,5 @@ mod tests {
                 .map(String::from),
         );
         assert_eq!(status, 1);
-        let _ = fs::remove_dir_all(root);
     }
 }
