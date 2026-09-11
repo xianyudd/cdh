@@ -611,11 +611,16 @@ DAG 收官时在案的 11 项挂起事项，在 GATE-13 逐项裁定。**A 类�
 2026-09-11 更新：A2、A3、A5 已随 PR #38 销账（issue #30/#32/#33 随合并自动关闭），
 A13、A14 已随 PR #39 销账（issue #35/#36 同）。A 类在案仅剩 1（issue #31，待定 notice
 过期行为）与 12（issue #34，PTY 输入路径覆盖）。
+2026-09-12 更新：A1 已随 PR #40 销账（issue #31 随合并自动关闭）。A 类在案仅剩
+12（issue #34，PTY 输入路径覆盖）。
 
 ### A 类：转 issue 候选（技术债有明确动作）
 
-1. **`app.notice` 无过期机制** —— 转新 issue：notice 没有过期/清除路径，可能长期挂在页脚；
-   PR-8 期间发现，按「零夹带」护栏未顺手修。（issue #31）
+1. **`app.notice` 无过期机制** —— 已解决（PR #40，2026-09-12）：`ddbdd26` 抽出
+   `dispatch_event` 缝：交互输入先经 notice 过期判定清除、再分发事件，run_ui 与
+   测试同路径；配 dispatch 级测试，M4/M5 各变异均被杀。原委：notice 没有过期/
+   清除路径，可能长期挂在页脚，PR-8 期间发现，按「零夹带」护栏未顺手修；现账
+   已收。（issue #31，已关闭）
 2. **34 处临时目录泄漏缺 `Drop` guard** —— 已解决（PR #38，2026-09-11）：`1ef2159` 新增
    `src/test_support.rs` 统一 Drop 守卫 `TempDir`（栈展开即清理，`Deref`/`AsRef<Path>` 顶替裸
    `PathBuf`），迁移全部裸 `remove_dir_all` 站点，配 panic 中途也会清目录的回归测试。
