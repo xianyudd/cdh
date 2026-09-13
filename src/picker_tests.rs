@@ -2127,6 +2127,117 @@ fn language_resolution_honors_override_locale_and_fallbacks() {
 }
 
 #[test]
+fn cli_help_renders_chinese_and_english_usage_options_and_subcommands() {
+    // 两语言的 required 逐项对等：旗标名/环境变量名两语言相同，所以每边
+    // 都必须再钉住自己的描述文字——把某一边的描述换成另一边的语言时，
+    // 这张表要变红（见 `help_stderr_localizes_through_the_full_preference_chain`
+    // 的端到端版本）。
+    for (language, required) in [
+        (
+            Language::ZhCn,
+            [
+                "用法:",
+                "交互选择历史目录（默认模式）",
+                "记录一次目录访问",
+                "供 shell hook 使用",
+                "cdh log --dir <path>",
+                "-v, --version",
+                "显示版本并退出",
+                "-l, --limit <N>",
+                "限制最大候选数",
+                "--half-life <sec>",
+                "Frecency 半衰期（默认 7 天",
+                "--threshold <f64>",
+                "融合分阈值",
+                "--ignore-re <re>",
+                "忽略路径正则",
+                "--no-check-dir",
+                "不检查目录是否存在",
+                "CDH_LIMIT",
+                "CDH_CHECK_DIR=false",
+                "过滤关键字",
+                "命中任一即可",
+            ],
+        ),
+        (
+            Language::En,
+            [
+                "Usage:",
+                "Interactively pick a history directory (default)",
+                "Record a directory visit",
+                "shell hooks",
+                "cdh log --dir <path>",
+                "-v, --version",
+                "Print the version and exit",
+                "-l, --limit <N>",
+                "Cap the number of candidates",
+                "--half-life <sec>",
+                "Frecency half-life (default 7 days",
+                "--threshold <f64>",
+                "Fused-score threshold",
+                "--ignore-re <re>",
+                "Regex of paths to ignore",
+                "--no-check-dir",
+                "Skip the directory-exists check",
+                "CDH_LIMIT",
+                "CDH_CHECK_DIR=false",
+                "case-insensitive",
+                "any match counts",
+            ],
+        ),
+    ] {
+        let help = language.cli_help();
+        for expected in required {
+            assert!(
+                help.contains(expected),
+                "missing {expected:?} in {language:?} help"
+            );
+        }
+    }
+    assert_ne!(
+        Language::ZhCn.cli_help(),
+        Language::En.cli_help(),
+        "the two catalogs must not collapse into one text"
+    );
+}
+
+#[test]
+fn cli_help_language_prefers_environment_then_saved_then_locale() {
+    let root = TempDir::new("cli_help_language_chain");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("tui.toml");
+
+    // No settings file yet: preference stays auto, so the locale decides.
+    let missing = UiSettings::load(path.clone(), UiEnvironment::default());
+    assert_eq!(cli_help_language(&missing, Language::En), Language::En);
+    assert_eq!(cli_help_language(&missing, Language::ZhCn), Language::ZhCn);
+
+    // A saved preference in tui.toml overrides the detected locale.
+    fs::write(&path, "language = \"en\"\n").unwrap();
+    let saved_en = UiSettings::load(path.clone(), UiEnvironment::default());
+    assert_eq!(
+        cli_help_language(&saved_en, Language::ZhCn),
+        Language::En,
+        "saved 'en' must win over a Chinese locale"
+    );
+
+    // CDH_LANG pins the language even above the saved preference.
+    let pinned = UiEnvironment::from_values(Some("zh-CN"), None, None, None, None);
+    let environment_wins = UiSettings::load(path.clone(), pinned);
+    assert_eq!(
+        cli_help_language(&environment_wins, Language::En),
+        Language::ZhCn,
+        "CDH_LANG must win over tui.toml and locale"
+    );
+
+    // Explicit 'auto' hands the decision back to the locale.
+    fs::write(&path, "language = \"auto\"\n").unwrap();
+    let auto = UiSettings::load(path.clone(), UiEnvironment::default());
+    assert_eq!(cli_help_language(&auto, Language::En), Language::En);
+    assert_eq!(cli_help_language(&auto, Language::ZhCn), Language::ZhCn);
+}
+
+#[test]
 fn ui_catalog_exposes_complete_chinese_and_english_core_copy() {
     assert_eq!(
         Language::ZhCn.text(TextKey::SearchPlaceholder),

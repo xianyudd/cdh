@@ -1879,6 +1879,25 @@ fn resolve_language_preference(
     }
 }
 
+/// `cdh -h/--help` 的帮助文本。语言解析与 TUI 同一条链：
+/// `CDH_LANG` / `tui.toml` 的显式偏好优先，`auto` 时按 locale 检测。
+///
+/// help 在 `controller::run` 很早期就要打印，那时 TUI 尚未启动，所以这里
+/// 自行从同一个 config_dir 加载 UiSettings。代价仅仅是 `UiSettings::load`
+/// 自己的一次小文件读取（help 分支不额外建目录、不写任何文件；建 XDG
+/// 目录与 touch 历史文件的是 main 里的 `AppContext` 初始化，与 `-h` 路径
+/// 无关的既有行为），不值得为它重排 controller 的初始化顺序；设置缺失或
+/// 损坏时 `UiSettings::load` 自己退回默认偏好，帮助照常打印。
+pub(crate) fn cli_help_text(config_dir: &Path) -> &'static str {
+    let loaded = UiSettings::load(config_dir.join("tui.toml"), UiEnvironment::from_process());
+    cli_help_language(&loaded, detect_locale_language()).cli_help()
+}
+
+/// 与 `App::new` 相同的偏好→locale 解析，单列出来供 CLI 侧与测试复用。
+fn cli_help_language(loaded: &SettingsLoad, locale_language: Language) -> Language {
+    resolve_language_preference(loaded.settings.effective().language, locale_language)
+}
+
 fn mouse_state_label(language: Language, enabled: bool) -> &'static str {
     match (language, enabled) {
         (Language::ZhCn, true) => "启用",
