@@ -69,6 +69,12 @@ From a clone of this repository:
 bash --noprofile --norc scripts/install.sh
 ```
 
+> **cdh is not published to crates.io.** `cargo install` can get you the binary,
+> but not the shell integration (the logging hooks and wrapper functions), and
+> that integration is the core of how cdh is meant to be used; shipping users a
+> crippled install is worse than not publishing at all. Install via install.sh
+> above or a release tarball.
+
 ### Uninstall
 
 Remote — removes the shell integration, the binary and the history files:
