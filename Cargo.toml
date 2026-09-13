@@ -22,6 +22,11 @@ toml = "1.1"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 
+# PTY 集成测试（tests/pty_input.rs）：经真实 tty 字节流驱动 crossterm 的
+# 事件解析层（issue #34）。仅测试目标使用，不进发布二进制。
+[dev-dependencies]
+portable-pty = "0.9"
+
 [lib]
 path = "src/lib.rs"
 
