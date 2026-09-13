@@ -14,6 +14,9 @@ categories = ["command-line-utilities"]
 [dependencies]
 crossterm = "0.29"
 nucleo-matcher = "0.3"
+# Cargo.lock 里 termwiz/wezterm-* 等约 85 个条目来自 ratatui 0.30 的可选后端
+# （ratatui-termwiz / ratatui-termina）；cdh 只用 crossterm 后端，从不编译它们。
+# lockfile 与 feature 选择无关，这些条目结构性必含、删掉即被 cargo 加回，见 #42。
 ratatui = "0.30"
 regex = "1"
 # toml 1.1（rust-version 1.85）：随 2026-09 依赖解冻战役落地——MSRV 已由 1.74 抬到
