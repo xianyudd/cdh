@@ -63,6 +63,10 @@ bash --noprofile --norc install.sh
 bash --noprofile --norc scripts/install.sh
 ```
 
+> **cdh 不发布到 crates.io。** `cargo install` 装得上二进制，但装不了 shell 集成
+> （日志 hook 与包装函数），而那正是 cdh 的核心用法；与其让用户装一个功能残缺的
+> 版本，不如不发布。安装请走上面的 install.sh 或 release tarball。
+
 ### 一键卸载
 
 远程卸载（自动清理 shell 集成 + 二进制 + 历史文件）：
