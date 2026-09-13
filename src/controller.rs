@@ -119,21 +119,9 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
                 opt.check_dir = false;
             }
             "--help" | "-h" => {
-                eprintln!(
-                    "用法:
-  cdh [选项] [关键字...]      # 交互选择历史目录（默认模式）
-  cdh log --dir <path>       # 记录一次目录访问（供 shell hook 使用）
-
-选项:
-  -v, --version          显示版本并退出
-  -l, --limit <N>        限制最大候选数（默认不截断，可用环境变量 CDH_LIMIT 覆盖）
-      --half-life <sec>  Frecency 半衰期（默认 7 天，可用 CDH_HALF_LIFE 覆盖）
-      --threshold <f64>  融合分阈值（默认 0，可用 CDH_THRESHOLD 覆盖）
-      --ignore-re <re>   忽略路径正则（默认取 ENV:CDH_IGNORE_RE）
-      --no-check-dir     不检查目录是否存在（默认检查，可用 CDH_CHECK_DIR=false 关闭）
-
-  其余位置参数作为过滤关键字（大小写不敏感，命中任一即可）"
-                );
+                // 帮助文本走 picker 的 i18n 层：语言与 TUI 同链解析
+                // （CDH_LANG / tui.toml 偏好优先，auto 时按 locale 检测）。
+                eprintln!("{}", picker::cli_help_text(&ctx.paths.config_dir));
                 return 0;
             }
             _ => {
@@ -298,6 +286,15 @@ mod tests {
         let (_root, ctx) = test_ctx("empty_keyword");
         let status = run_with_args(&ctx, ["", "--no-check-dir"].into_iter().map(String::from));
         assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn help_flags_print_bilingual_help_and_exit_zero() {
+        for flag in ["-h", "--help"] {
+            let (_root, ctx) = test_ctx("help_flags");
+            let status = run_with_args(&ctx, [flag].into_iter().map(String::from));
+            assert_eq!(status, 0, "cdh {flag} must exit 0");
+        }
     }
 
     #[test]

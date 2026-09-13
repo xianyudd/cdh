@@ -275,6 +275,39 @@ impl Language {
         }
     }
 
+    /// `cdh -h/--help` 的整块帮助文本。CLI 不是 TUI 界面，但走同一双语
+    /// 目录与 `pick` 模式：新增文案时保持中英两版的选项顺序与信息量一致。
+    pub(super) fn cli_help(self) -> &'static str {
+        self.pick(
+            "用法:
+  cdh [选项] [关键字...]      # 交互选择历史目录（默认模式）
+  cdh log --dir <path>       # 记录一次目录访问（供 shell hook 使用）
+
+选项:
+  -v, --version          显示版本并退出
+  -l, --limit <N>        限制最大候选数（默认不截断，可用环境变量 CDH_LIMIT 覆盖）
+      --half-life <sec>  Frecency 半衰期（默认 7 天，可用 CDH_HALF_LIFE 覆盖）
+      --threshold <f64>  融合分阈值（默认 0，可用 CDH_THRESHOLD 覆盖）
+      --ignore-re <re>   忽略路径正则（默认取 ENV:CDH_IGNORE_RE）
+      --no-check-dir     不检查目录是否存在（默认检查，可用 CDH_CHECK_DIR=false 关闭）
+
+  其余位置参数作为过滤关键字（大小写不敏感，命中任一即可）",
+            "Usage:
+  cdh [options] [keywords...]  # Interactively pick a history directory (default)
+  cdh log --dir <path>         # Record a directory visit (for shell hooks)
+
+Options:
+  -v, --version          Print the version and exit
+  -l, --limit <N>        Cap the number of candidates (no cap by default; CDH_LIMIT overrides)
+      --half-life <sec>  Frecency half-life (default 7 days; CDH_HALF_LIFE overrides)
+      --threshold <f64>  Fused-score threshold (default 0; CDH_THRESHOLD overrides)
+      --ignore-re <re>   Regex of paths to ignore (defaults to $CDH_IGNORE_RE)
+      --no-check-dir     Skip the directory-exists check (on by default; CDH_CHECK_DIR=false disables it)
+
+  Remaining positional arguments are filter keywords (case-insensitive; any match counts)",
+        )
+    }
+
     pub(super) fn page_summary(
         self,
         start: usize,
