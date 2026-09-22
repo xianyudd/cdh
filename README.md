@@ -54,17 +54,19 @@ curl -fsSL https://xianyudd.github.io/cdh/install.sh | bash -s -- --interactive
 
 ```bash
 curl -fsSL https://xianyudd.github.io/cdh/install.sh \
-  | CDH_VERSION=v0.2.8 bash
+  | CDH_VERSION=v0.3.2 bash
 ```
 
 也可以直接使用 GitHub release 打包产物安装，适合 `raw.githubusercontent.com` 不稳定但 release asset 可下载的环境：
 
 ```bash
-curl -fsSL https://github.com/xianyudd/cdh/releases/download/v0.2.8/cdh-v0.2.8-x86_64-unknown-linux-gnu.tar.gz \
+curl -fsSL https://github.com/xianyudd/cdh/releases/download/v0.3.2/cdh-v0.3.2-x86_64-unknown-linux-gnu.tar.gz \
   | tar -xz
-cd cdh-v0.2.8-x86_64-unknown-linux-gnu
+cd cdh-v0.3.2-x86_64-unknown-linux-gnu
 bash --noprofile --norc install.sh
 ```
+
+> 把 `v0.3.2` 换成 [releases](https://github.com/xianyudd/cdh/releases) 里你要的版本，架构后缀（`x86_64-unknown-linux-gnu`）也按你的平台替换。
 
 也可以本地调试安装脚本（在仓库根目录）：
 
