@@ -7,9 +7,9 @@
 > Stop typing `cd ../../../where-was-that-project`. cdh remembers the directories you actually use and ranks them by how often and how recently you visit — plus how they relate to where you are now. Type `cdh`, fuzzy-search, hit Enter, and you're there.
 
 <p align="center">
-  <a href="./docs/demo.mp4"><img src="./docs/demo-poster.png" width="720" alt="The cdh picker in a 110-column terminal: below the search box are 21 directories ranked by score, ~/projects/awesome-app selected, the preview pane shows git branch / last visit / directory contents, and a key-hint bar along the bottom"></a>
+  <img src="./docs/demo.gif" width="720" alt="The cdh picker in a 110-column terminal: below the search box are 21 directories ranked by score, ~/projects/awesome-app selected, the preview pane shows git branch / last visit / directory contents, and a key-hint bar along the bottom">
 </p>
-<p align="center"><sub>▶ Click to play the recording · a real cdh session in tmux, isolated demo home, no mock-up</sub></p>
+<p align="center"><sub>a real cdh session in tmux, isolated demo home, no mock-up · <a href="./docs/demo.mp4">watch the original mp4 (sharper, full frame rate)</a></sub></p>
 
 `cdh` fuses several signals over your directory history — visit frequency with
 time decay, recency, and the context of the directory you are in right now — and
