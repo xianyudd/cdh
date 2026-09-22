@@ -59,18 +59,20 @@ If the GitHub `latest` redirect is unreliable on your network, pin a version:
 
 ```bash
 curl -fsSL https://xianyudd.github.io/cdh/install.sh \
-  | CDH_VERSION=v0.2.8 bash
+  | CDH_VERSION=v0.3.2 bash
 ```
 
 Or install from a release tarball, which helps when `raw.githubusercontent.com` is
 flaky but release assets download fine:
 
 ```bash
-curl -fsSL https://github.com/xianyudd/cdh/releases/download/v0.2.8/cdh-v0.2.8-x86_64-unknown-linux-gnu.tar.gz \
+curl -fsSL https://github.com/xianyudd/cdh/releases/download/v0.3.2/cdh-v0.3.2-x86_64-unknown-linux-gnu.tar.gz \
   | tar -xz
-cd cdh-v0.2.8-x86_64-unknown-linux-gnu
+cd cdh-v0.3.2-x86_64-unknown-linux-gnu
 bash --noprofile --norc install.sh
 ```
+
+> Replace `v0.3.2` with whatever version you want from [releases](https://github.com/xianyudd/cdh/releases), and swap the target triple (`x86_64-unknown-linux-gnu`) for your platform.
 
 From a clone of this repository:
 
