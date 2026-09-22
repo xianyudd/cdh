@@ -442,9 +442,17 @@ fn decay_weight(dt_secs: i64, half_life: f64) -> f64 {
 
 /// `dir` 是否是 `parent` 的直接子目录（如 /a/b 之于 /a；/a/b/c 不算）。
 fn is_direct_child(dir: &str, parent: &str) -> bool {
+    // 规整 parent 的末尾斜杠：调用处的 pwd 来自 env::current_dir()，非根目录不带
+    // 末尾 `/`，但根目录会返回 "/"。trim 后根变成空串，"/foo".strip_prefix("")
+    // 仍得到 "/foo"，随后剥掉前导 `/` 得 "foo"，根下直接子目录的语义得以保留。
+    let parent = parent.trim_end_matches('/');
     match dir.strip_prefix(parent) {
+        // 必须真的在 parent 之后遇到路径分隔符 `/` 才算目录边界，否则
+        // "/home/username" 会被误当成 "/home/user" 的子目录（兄弟目录错判）。
         Some(rest) => {
-            let rest = rest.strip_prefix('/').unwrap_or(rest);
+            let Some(rest) = rest.strip_prefix('/') else {
+                return false;
+            };
             let rest = rest.strip_suffix('/').unwrap_or(rest); // 容忍末尾斜杠
             !rest.is_empty() && !rest.contains('/')
         }
@@ -1236,6 +1244,15 @@ mod tests {
         assert!(!is_direct_child("/a/b/c", "/a")); // 孙目录不算
         assert!(!is_direct_child("/a", "/a")); // 自身不算
         assert!(!is_direct_child("/x/y", "/a")); // 无关
+                                                 // 真实路径场景与本 bug 的回归
+        assert!(is_direct_child("/home/user/foo", "/home/user")); // 真子目录
+        assert!(!is_direct_child("/home/username", "/home/user")); // 兄弟目录误判回归
+        assert!(!is_direct_child("/home/user/foo/bar", "/home/user")); // 孙目录不算
+        assert!(!is_direct_child("/home/user", "/home/user")); // 自身不算
+        assert!(is_direct_child("/home/user/foo", "/home/user/")); // parent 末尾斜杠规整
+                                                                   // 根目录：trim 后为空串，仍能识别根下直接子目录
+        assert!(is_direct_child("/a", "/")); // 根的直接子目录
+        assert!(!is_direct_child("/a/b", "/")); // 根的孙目录不算
     }
 
     #[test]
