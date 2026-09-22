@@ -46,10 +46,10 @@ impl EffectiveConfig {
         let half_life = parse_positive_f64_env("CDH_HALF_LIFE", 7.0 * 24.0 * 3600.0)?;
 
         // threshold 以前只有默认 0，这里顺便支持一下 CDH_THRESHOLD（可选）
-        let threshold = std::env::var("CDH_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0);
+        // 允许负/零（负 threshold 语义上等于关闭），但拒绝 nan/inf——
+        // recommend 里 `threshold <= 0 || score >= threshold` 遇到 nan 时两边
+        // 都为 false，会把所有历史候选静默清空。
+        let threshold = parse_finite_f64_env("CDH_THRESHOLD", 0.0)?;
 
         // 原 RecommendOpt::default 中的 ignore_re
         let ignore_re = env::var("CDH_IGNORE_RE")
@@ -63,30 +63,18 @@ impl EffectiveConfig {
             .unwrap_or(true);
 
         // 原 RecommendOpt::default 中的三个权重相关 env
-        let w_frecency = env::var("CDH_W_FRECENCY")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.40);
+        // 权重要求有限且 >= 0：nan 会让排序失稳，inf/负值会把融合分推出 [0,1]。
+        let w_frecency = parse_weight_env("CDH_W_FRECENCY", 0.40)?;
 
-        let w_uniq = env::var("CDH_W_UNIQ")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.10);
+        let w_uniq = parse_weight_env("CDH_W_UNIQ", 0.10)?;
 
-        let w_recency = env::var("CDH_W_RECENCY")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.30);
+        let w_recency = parse_weight_env("CDH_W_RECENCY", 0.30)?;
 
-        let w_context = env::var("CDH_W_CONTEXT")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.20);
+        let w_context = parse_weight_env("CDH_W_CONTEXT", 0.20)?;
 
-        let uniq_decay = env::var("CDH_UNIQ_DECAY")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.85);
+        // uniq_decay 是几何衰减系数，只有落在 [0,1] 才有意义：
+        // nan/负/>1 会让 `decay.powi(k)` 产生 NaN 或越界值。
+        let uniq_decay = parse_unit_f64_env("CDH_UNIQ_DECAY", 0.85)?;
 
         let recency_half_life = parse_positive_f64_env("CDH_RECENCY_HALF_LIFE", 24.0 * 3600.0)?;
 
@@ -141,5 +129,132 @@ fn parse_positive_f64_env(name: &str, default: f64) -> Result<f64, String> {
     match value.parse::<f64>() {
         Ok(n) if n.is_finite() && n > 0.0 => Ok(n),
         _ => Err(format!("{name} 必须是大于 0 的有限数字")),
+    }
+}
+
+/// 解析要求“有限”的 f64 环境变量（允许负/零，供 threshold 用——
+/// 负 threshold 语义上等于关闭过滤）。缺失回退默认，nan/inf 报错。
+fn parse_finite_f64_env(name: &str, default: f64) -> Result<f64, String> {
+    let value = match env::var(name) {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return Ok(default),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(format!("{name} 必须是有限数字"));
+        }
+    };
+
+    match value.parse::<f64>() {
+        Ok(n) if n.is_finite() => Ok(n),
+        _ => Err(format!("{name} 必须是有限数字")),
+    }
+}
+
+/// 解析融合权重环境变量：要求有限且 >= 0。缺失回退默认，nan/inf/负值报错。
+fn parse_weight_env(name: &str, default: f64) -> Result<f64, String> {
+    let value = match env::var(name) {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return Ok(default),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(format!("{name} 必须是 >= 0 的有限数字"));
+        }
+    };
+
+    match value.parse::<f64>() {
+        Ok(n) if n.is_finite() && n >= 0.0 => Ok(n),
+        _ => Err(format!("{name} 必须是 >= 0 的有限数字")),
+    }
+}
+
+/// 解析落在 [0, 1] 的 f64 环境变量（供 uniq_decay 用）。缺失回退默认，
+/// nan/inf/越界报错。
+fn parse_unit_f64_env(name: &str, default: f64) -> Result<f64, String> {
+    let value = match env::var(name) {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return Ok(default),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(format!("{name} 必须是 0 到 1 之间的有限数字"));
+        }
+    };
+
+    match value.parse::<f64>() {
+        Ok(n) if n.is_finite() && (0.0..=1.0).contains(&n) => Ok(n),
+        _ => Err(format!("{name} 必须是 0 到 1 之间的有限数字")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// `from_env` 读进程级的 CDH_* 变量，测试并发跑会互相污染。这里串行化，
+    /// 并在每个用例结束时清掉自己设过的变量，避免泄漏到别的用例。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 在锁保护下清空本簇校验涉及的所有 CDH_* 变量，跑一次 `from_env`。
+    /// `set` 里给出的键会先设值，函数返回前统一清理，无论断言是否失败。
+    fn from_env_with(set: &[(&str, &str)]) -> Result<EffectiveConfig, String> {
+        const KEYS: &[&str] = &[
+            "CDH_THRESHOLD",
+            "CDH_W_FRECENCY",
+            "CDH_W_UNIQ",
+            "CDH_W_RECENCY",
+            "CDH_W_CONTEXT",
+            "CDH_UNIQ_DECAY",
+        ];
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for key in KEYS {
+            env::remove_var(key);
+        }
+        for (key, value) in set {
+            env::set_var(key, value);
+        }
+        let result = EffectiveConfig::from_env();
+        for key in KEYS {
+            env::remove_var(key);
+        }
+        result
+    }
+
+    #[test]
+    fn threshold_nan_is_rejected() {
+        assert!(from_env_with(&[("CDH_THRESHOLD", "nan")]).is_err());
+    }
+
+    #[test]
+    fn threshold_negative_is_accepted() {
+        let cfg = from_env_with(&[("CDH_THRESHOLD", "-1")]).expect("负 threshold 应视为关闭过滤");
+        assert_eq!(cfg.threshold, -1.0);
+    }
+
+    #[test]
+    fn weight_inf_is_rejected() {
+        assert!(from_env_with(&[("CDH_W_FRECENCY", "inf")]).is_err());
+    }
+
+    #[test]
+    fn weight_non_numeric_is_rejected() {
+        assert!(from_env_with(&[("CDH_W_UNIQ", "abc")]).is_err());
+    }
+
+    #[test]
+    fn weight_negative_is_rejected() {
+        assert!(from_env_with(&[("CDH_W_RECENCY", "-0.1")]).is_err());
+    }
+
+    #[test]
+    fn uniq_decay_above_one_is_rejected() {
+        assert!(from_env_with(&[("CDH_UNIQ_DECAY", "2.0")]).is_err());
+    }
+
+    #[test]
+    fn uniq_decay_negative_is_rejected() {
+        assert!(from_env_with(&[("CDH_UNIQ_DECAY", "-0.5")]).is_err());
+    }
+
+    #[test]
+    fn uniq_decay_in_unit_range_is_accepted() {
+        let cfg = from_env_with(&[("CDH_UNIQ_DECAY", "0.5")]).expect("0.5 落在 [0,1] 内");
+        assert_eq!(cfg.uniq_decay, 0.5);
     }
 }

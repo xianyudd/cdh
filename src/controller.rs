@@ -91,27 +91,41 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
                 }
             }
             "--half-life" => {
-                if let Some(v) = args.next() {
-                    if let Ok(secs) = v.parse::<f64>() {
-                        if !secs.is_finite() || secs <= 0.0 {
-                            eprintln!("cdh: --half-life 必须是大于 0 的有限数字");
-                            return 1;
-                        }
-                        opt.half_life = secs;
+                let Some(v) = args.next() else {
+                    eprintln!("cdh: --half-life 必须是大于 0 的有限数字");
+                    return 1;
+                };
+                match v.parse::<f64>() {
+                    Ok(secs) if secs.is_finite() && secs > 0.0 => opt.half_life = secs,
+                    _ => {
+                        eprintln!("cdh: --half-life 必须是大于 0 的有限数字");
+                        return 1;
                     }
                 }
             }
             "--threshold" => {
-                if let Some(v) = args.next() {
-                    if let Ok(th) = v.parse::<f64>() {
-                        opt.threshold = th;
+                let Some(v) = args.next() else {
+                    eprintln!("cdh: --threshold 必须是有限数字");
+                    return 1;
+                };
+                match v.parse::<f64>() {
+                    Ok(th) if th.is_finite() => opt.threshold = th,
+                    _ => {
+                        eprintln!("cdh: --threshold 必须是有限数字");
+                        return 1;
                     }
                 }
             }
             "--ignore-re" => {
-                if let Some(pat) = args.next() {
-                    if let Ok(rx) = Regex::new(&pat) {
-                        opt.ignore_re = Some(rx);
+                let Some(pat) = args.next() else {
+                    eprintln!("cdh: --ignore-re 必须是合法的正则表达式");
+                    return 1;
+                };
+                match Regex::new(&pat) {
+                    Ok(rx) => opt.ignore_re = Some(rx),
+                    Err(_) => {
+                        eprintln!("cdh: --ignore-re 必须是合法的正则表达式");
+                        return 1;
                     }
                 }
             }
@@ -315,6 +329,54 @@ mod tests {
         let status = run_with_args(
             &ctx,
             ["--limit", "abc", "--no-check-dir"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn threshold_nan_returns_error() {
+        let (_root, ctx) = test_ctx("threshold_nan");
+        let status = run_with_args(
+            &ctx,
+            ["--threshold", "nan", "--no-check-dir"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn threshold_invalid_returns_error() {
+        let (_root, ctx) = test_ctx("threshold_invalid");
+        let status = run_with_args(
+            &ctx,
+            ["--threshold", "abc", "--no-check-dir"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn half_life_invalid_returns_error() {
+        let (_root, ctx) = test_ctx("half_life_invalid");
+        let status = run_with_args(
+            &ctx,
+            ["--half-life", "abc", "--no-check-dir"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn ignore_re_invalid_returns_error() {
+        let (_root, ctx) = test_ctx("ignore_re_invalid");
+        let status = run_with_args(
+            &ctx,
+            ["--ignore-re", "[", "--no-check-dir"]
                 .into_iter()
                 .map(String::from),
         );
