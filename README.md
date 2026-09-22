@@ -1,6 +1,15 @@
 # cdh — Frecency 驱动的目录跳转（含 TUI）
 
+[![CI](https://github.com/xianyudd/cdh/actions/workflows/ci.yml/badge.svg)](https://github.com/xianyudd/cdh/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/xianyudd/cdh?sort=semver)](https://github.com/xianyudd/cdh/releases) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
 **中文** | [English](./README.en.md)
+
+> 少敲 `cd ../../../那个项目到底在哪`。cdh 记住你真正常去的目录，按「去得勤 + 最近去过 + 跟当前目录相关」排好序——敲一下 `cdh`、模糊搜索、回车，就跳过去。
+
+<p align="center">
+  <a href="./docs/demo.mp4"><img src="./docs/demo-poster.png" width="720" alt="110 列终端里的 cdh 选择器：搜索框下是 21 条按分数排序的目录，~/projects/awesome-app 选中，预览面板显示 git 分支/上次访问/目录内容，底部键位提示条"></a>
+</p>
+<p align="center"><sub>▶ 点击播放录屏 · tmux 里的真实 cdh 会话，独立演示 home，非拼接</sub></p>
 
 `cdh` 融合“访问频次 × 时间衰减 + 最近性 + 当前目录上下文”对历史目录多信号打分，提供一个终端 TUI，让你按分数排序快速选择并跳转。
 
@@ -167,13 +176,19 @@ fzf 风格的模糊搜索，只渲染当前页。每行显示完整路径，Home
 | `Ctrl+C` / `Ctrl+G` | 退出 |
 | 鼠标 | 单击选中、双击跳转、滚轮滚动 |
 
+#### 候选池：历史 ∪ 目录树
+
 候选池是「历史 ∪ 目录树」：除了 cd 过的历史目录，后台会流式扫描目录树（历史目录的兄弟、`$HOME` 全树等），让没去过的目录也能被模糊搜索命中。发现层候选排在同模糊分的历史候选之后。历史为空时仍会打开界面并从 `$PWD` 自举。
+
+#### 排除子树（Ctrl+D 排除 / F4 管理）
 
 `Ctrl+D` 是**排除**，不是单纯删除：确认后该目录**及其全部子目录**被写入排除清单，此后既不出现在历史候选里，也不会被目录树扫描产出——扫描线程拿它当剪枝集合，整棵子树连 `read_dir` 都不会发生。候选池有五万条量级，噪音的单位是子树而不是单个目录（`~/miniforge3` 一条抵六千多条），所以按子树排除。历史行会额外把记录从历史文件里删掉；发现行没有历史记录，只写清单。
 
 按 `F4` 打开排除清单，上下选择、`Ctrl+D` 取消排除。取消后该子树会**当场**被补扫回来，不用重启——这是取消排除唯一的入口，因为被排除的目录根本不在候选列表里，没有行可以按。
 
 排除清单是 `$XDG_DATA_HOME/cdh/excludes`（默认 `~/.local/share/cdh/excludes`），每行一个绝对路径，`#` 开头为注释，也可以手工编辑；文件不存在等于空清单。它和 `CDH_IGNORE_RE` 的分工是：正则面向「在脚本或配置里预先声明」，清单面向「用的时候顺手清掉眼前的噪音」，两者都同时作用于历史候选和发现候选。
+
+#### 临时隐藏点目录（Ctrl+H / F5）
 
 `Ctrl+H`（或 `F5`）是**临时视图过滤**，和排除清单是两回事：它只在本次会话内隐藏路径中含隐藏目录段的候选（`~/.cache/pip` 这类），不写任何文件，再按一次就全部回来。适合「我知道这些点目录迟早还要用，但现在挡视线」的场合；真要长期清掉才用 `Ctrl+D`。判定是按路径分段做的，只看 `/` 分隔出的每一段是否以 `.` 开头，所以 `~/workspace/dot.config` 不会被误判成隐藏目录。
 

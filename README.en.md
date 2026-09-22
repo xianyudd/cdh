@@ -1,6 +1,15 @@
 # cdh — frecency-driven directory jumping, with a TUI
 
+[![CI](https://github.com/xianyudd/cdh/actions/workflows/ci.yml/badge.svg)](https://github.com/xianyudd/cdh/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/xianyudd/cdh?sort=semver)](https://github.com/xianyudd/cdh/releases) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
 [中文](./README.md) | **English**
+
+> Stop typing `cd ../../../where-was-that-project`. cdh remembers the directories you actually use and ranks them by how often and how recently you visit — plus how they relate to where you are now. Type `cdh`, fuzzy-search, hit Enter, and you're there.
+
+<p align="center">
+  <a href="./docs/demo.mp4"><img src="./docs/demo-poster.png" width="720" alt="The cdh picker in a 110-column terminal: below the search box are 21 directories ranked by score, ~/projects/awesome-app selected, the preview pane shows git branch / last visit / directory contents, and a key-hint bar along the bottom"></a>
+</p>
+<p align="center"><sub>▶ Click to play the recording · a real cdh session in tmux, isolated demo home, no mock-up</sub></p>
 
 `cdh` fuses several signals over your directory history — visit frequency with
 time decay, recency, and the context of the directory you are in right now — and
@@ -146,6 +155,8 @@ The keys you will use most:
 double-click to jump, wheel to scroll) are bound as well — the complete table is in
 [TUI 操作 — the TUI](./README.md#tui-操作).
 
+#### The candidate pool: history ∪ directory tree
+
 The candidate pool is "history ∪ directory tree": besides the directories you have
 `cd`'d into, a background thread streams a scan of the tree (siblings of history
 entries, all of `$HOME`, and so on) so that directories you have never visited can
@@ -153,17 +164,22 @@ still be found by fuzzy search. Discovered entries rank after history entries wi
 the same fuzzy score. With an empty history the picker still opens and bootstraps
 from `$PWD`.
 
+#### Excluding a subtree (Ctrl+D to exclude, F4 to manage)
+
 `Ctrl+D` **excludes** rather than simply deletes: once confirmed, the directory *and
 its entire subtree* go into the exclusion list, so it stops appearing among the
 candidates and the scanner prunes it — the subtree is never `read_dir`'d again (a
 history row also has its record removed from the history file). The list is
 `$XDG_DATA_HOME/cdh/excludes` (default `~/.local/share/cdh/excludes`), one absolute
 path per line, `#` for comments, safe to hand-edit. `F4` is the only way back,
-because an excluded directory has no row left to press a key on. `Ctrl+H` / `F5` is
-a different thing: a temporary view filter that hides candidates containing a hidden
-path segment (`~/.cache/pip` and friends) for this session only and writes nothing.
-Why both exist, and how a hidden segment is decided, is explained in
-[TUI 操作 — the TUI](./README.md#tui-操作).
+because an excluded directory has no row left to press a key on.
+
+#### Temporarily hiding dot-directories (Ctrl+H / F5)
+
+`Ctrl+H` / `F5` is a different thing: a temporary view filter that hides candidates
+containing a hidden path segment (`~/.cache/pip` and friends) for this session only
+and writes nothing. Why both exist, and how a hidden segment is decided, is
+explained in [TUI 操作 — the TUI](./README.md#tui-操作).
 
 ### Environment variables
 
