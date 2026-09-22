@@ -371,7 +371,13 @@ impl FileLock {
 
         for attempt in 0..=HISTORY_LOCK_RETRIES {
             match OpenOptions::new().create_new(true).write(true).open(&path) {
-                Ok(file) => return Ok(FileLock { path, file }),
+                Ok(mut file) => {
+                    // 写入当前进程 PID，供后续 `maybe_clear_stale_lock` 的存活探测使用（H2）。
+                    // 写失败不致命：读侧读不到合法 PID 时会退回 mtime 兜底。
+                    let _ = write!(file, "{}", std::process::id());
+                    let _ = file.flush();
+                    return Ok(FileLock { path, file });
+                }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     last_err = Some(e);
 
@@ -400,13 +406,85 @@ impl FileLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        // 释放锁：删除锁文件，忽略错误
-        let _ = fs::remove_file(&self.path);
+        // 释放锁：只删「仍然是我们创建的那把」锁文件（H1）。
+        //
+        // 用创建时保留的句柄 fstat 拿到我们那个 inode（即使 path 已被 unlink/替换，
+        // 句柄仍指向原文件），与 path 当前指向的 inode 比对：
+        //   - 一致  → 确是我们的锁，删；
+        //   - path 不存在 / inode 不同 → 已被别的进程 unlink 并重建，删了就是删别人的锁，
+        //     会引发级联失效，故不删。
+        // 全程忽略错误，但宁可不删也不误删。
+        if lock_file_still_ours(&self.file, &self.path) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
+}
+
+/// 判断 `path` 当前指向的锁文件是否就是 `file` 句柄创建的那一个（inode 相同）。
+///
+/// 用 fstat（句柄）对 stat（路径）比对 inode，避免删掉别的进程重建的同名锁。
+#[cfg(unix)]
+fn lock_file_still_ours(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let ours = match file.metadata() {
+        Ok(meta) => meta.ino(),
+        Err(_) => return false,
+    };
+    let current = match fs::metadata(path) {
+        Ok(meta) => meta.ino(),
+        Err(_) => return false,
+    };
+    ours == current
+}
+
+/// 非 unix 平台无 inode 语义，退化为「path 仍存在即视为我们的锁」，保持旧行为。
+#[cfg(not(unix))]
+fn lock_file_still_ours(_file: &File, path: &Path) -> bool {
+    path.exists()
+}
+
+/// 若能确凿判定持锁进程已死（仅 Linux，读锁文件里的 PID + 探 `/proc/<pid>`），
+/// 立即清理以消除 H2 卡顿；任何不确定都返回 false，交给调用方的 mtime 兜底。
+///
+/// 安全性：本函数只用于「加速」清理，绝不延长持锁——
+/// 即便 PID 看似存活（可能是 PID 复用），也返回 false，让 mtime>阈值 的旧逻辑兜底。
+#[cfg(target_os = "linux")]
+fn lock_owner_is_dead(path: &Path) -> bool {
+    // /proc 不存在（异常环境）则无法判定 → 交给 mtime 兜底。
+    if !Path::new("/proc").exists() {
+        return false;
+    }
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(_) => return false,
+    };
+    // 读不到合法正整数 PID（空文件 / 旧格式 / 损坏）→ 不确定，交给 mtime 兜底。
+    let pid = match contents.trim().parse::<u32>() {
+        Ok(pid) if pid > 0 => pid,
+        _ => return false,
+    };
+    // /proc/<pid> 不存在 ⇒ 该进程确已退出。
+    !Path::new("/proc").join(pid.to_string()).exists()
+}
+
+/// 非 Linux（如 macOS CI）没有 `/proc`，无法做存活探测，一律退化到 mtime 判定。
+#[cfg(not(target_os = "linux"))]
+fn lock_owner_is_dead(_path: &Path) -> bool {
+    false
 }
 
 /// 如果锁文件明显过期，尝试清理它。
 fn maybe_clear_stale_lock(path: &Path) -> bool {
+    // 优先：若能确定持锁进程已死，立即清理（H2 加速），无需等满 mtime 阈值。
+    if lock_owner_is_dead(path) {
+        return match fs::remove_file(path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+    }
+
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
         Err(_) => return false,
@@ -746,5 +824,87 @@ mod tests {
 
         assert_eq!(raw_path, expected);
         assert_eq!(read_lines(&ctx.paths.history_uniq), vec![expected]);
+    }
+
+    #[test]
+    fn acquire_writes_current_pid_into_lock_file() {
+        let (root, _ctx) = make_test_ctx("lock_pid_written");
+        let lock_path = root.join("lock");
+
+        let lock = FileLock::acquire(lock_path.clone()).unwrap();
+        let contents = fs::read_to_string(&lock_path).unwrap();
+        assert_eq!(contents.trim(), process::id().to_string());
+        drop(lock);
+    }
+
+    #[test]
+    fn drop_removes_our_own_lock() {
+        let (root, _ctx) = make_test_ctx("lock_drop_own");
+        let lock_path = root.join("lock");
+
+        let lock = FileLock::acquire(lock_path.clone()).unwrap();
+        assert!(lock_path.exists());
+        drop(lock);
+        assert!(!lock_path.exists(), "自己的锁在 Drop 时应被清理");
+    }
+
+    /// H1 级联回归：锁被别的进程 unlink 后重建成同名不同 inode 的文件，
+    /// 我们的 Drop 不得删掉那个替换文件。
+    #[test]
+    fn drop_does_not_remove_lock_recreated_by_another_process() {
+        let (root, _ctx) = make_test_ctx("lock_inode_guard");
+        let lock_path = root.join("lock");
+
+        let lock = FileLock::acquire(lock_path.clone()).unwrap();
+        // 模拟：我们的锁被 unlink，另一个进程重建了同名锁（新 inode、新内容）。
+        fs::remove_file(&lock_path).unwrap();
+        fs::write(&lock_path, b"other-process-lock").unwrap();
+
+        drop(lock);
+
+        // 替换文件必须仍在，且内容原封不动（否则就是删了别人的锁 → H1 级联）。
+        assert!(lock_path.exists(), "别的进程重建的锁被误删了 (H1 级联)");
+        assert_eq!(
+            fs::read_to_string(&lock_path).unwrap(),
+            "other-process-lock"
+        );
+    }
+
+    /// H2：锁文件里的 PID 已死时，即便 mtime 很新也应被立即清理。
+    #[test]
+    fn maybe_clear_stale_lock_removes_dead_pid_immediately() {
+        let (root, _ctx) = make_test_ctx("lock_dead_pid");
+        let lock_path = root.join("lock");
+
+        // 写一个确定不存在的 PID（超出任何合法 pid），文件 mtime 很新。
+        fs::write(&lock_path, format!("{}", u32::MAX)).unwrap();
+
+        let cleared = maybe_clear_stale_lock(&lock_path);
+
+        // Linux：能探测到 PID 已死 → 立即清；非 Linux：退化到 mtime，因很新故不清。
+        #[cfg(target_os = "linux")]
+        {
+            assert!(cleared, "死 PID 的锁应被立即清理，不必等满 30s");
+            assert!(!lock_path.exists());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(!cleared, "非 Linux 无 /proc，mtime 很新时不应清理");
+            assert!(lock_path.exists());
+        }
+    }
+
+    /// 安全性：锁文件里的 PID 是活着的进程（当前进程自己）、mtime 很新时，
+    /// 绝不能清理，避免误删活锁。两平台都应保持不清。
+    #[test]
+    fn maybe_clear_stale_lock_keeps_live_pid() {
+        let (root, _ctx) = make_test_ctx("lock_live_pid");
+        let lock_path = root.join("lock");
+
+        fs::write(&lock_path, format!("{}", process::id())).unwrap();
+
+        let cleared = maybe_clear_stale_lock(&lock_path);
+        assert!(!cleared, "活着的持锁进程不应被清 (避免误删活锁)");
+        assert!(lock_path.exists());
     }
 }
