@@ -7,9 +7,9 @@
 > 少敲 `cd ../../../那个项目到底在哪`。cdh 记住你真正常去的目录，按「去得勤 + 最近去过 + 跟当前目录相关」排好序——敲一下 `cdh`、模糊搜索、回车，就跳过去。
 
 <p align="center">
-  <a href="./docs/demo.mp4"><img src="./docs/demo-poster.png" width="720" alt="110 列终端里的 cdh 选择器：搜索框下是 21 条按分数排序的目录，~/projects/awesome-app 选中，预览面板显示 git 分支/上次访问/目录内容，底部键位提示条"></a>
+  <img src="./docs/demo.gif" width="720" alt="110 列终端里的 cdh 选择器：搜索框下是 21 条按分数排序的目录，~/projects/awesome-app 选中，预览面板显示 git 分支/上次访问/目录内容，底部键位提示条">
 </p>
-<p align="center"><sub>▶ 点击播放录屏 · tmux 里的真实 cdh 会话，独立演示 home，非拼接</sub></p>
+<p align="center"><sub>tmux 里的真实 cdh 会话，独立演示 home，非拼接 · <a href="./docs/demo.mp4">看原始 mp4（更清晰、完整帧率）</a></sub></p>
 
 `cdh` 融合“访问频次 × 时间衰减 + 最近性 + 当前目录上下文”对历史目录多信号打分，提供一个终端 TUI，让你按分数排序快速选择并跳转。
 
