@@ -169,3 +169,32 @@ jobs:
 
       - name: Build for x86_64-unknown-linux-musl
         run: cargo build --locked --target x86_64-unknown-linux-musl
+
+  # README 中英 touch-parity 校验。守的是 roadmap.md:577 记下的那笔债：README.md
+  # 与 README.en.md 近乎全译，但中英不同步「没有任何检查会报出来」，漂移是沉默的。
+  #
+  # 独立成 job 而不是塞进 check：它跑的是 shell 脚本 + git diff，既不需要 Rust
+  # toolchain，也不随 os 矩阵变化，混进 check 只会让它跟着两个平台白跑两遍。
+  #
+  # 只在 PR 上跑（if: pull_request）：判据是「本次改动是否同时动了两个 README」，
+  # 靠的是 base...head 三点 diff。push 到 main 没有 pull_request 上下文，
+  # base/head sha 与 PR 描述都取不到，跑了也没有意义。
+  readme-sync:
+    name: README zh/en sync
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      # fetch-depth: 0 取全历史 —— 三点 diff 要求 base 与 head 两个 commit 都在
+      # 本地，checkout 默认的浅克隆（depth 1）只有 head，base...head 会解析失败。
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check README zh/en touch-parity
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: bash scripts/tools/readme-sync-check.sh
