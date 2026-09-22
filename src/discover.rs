@@ -509,12 +509,14 @@ impl<F: FnMut(Vec<String>) -> bool> Scanner<F> {
 
 /// 执行分层 BFS，用三个堆把慢挂载深层与本地扫描解耦，避免 9p 深层饿死本地深层：
 ///
-/// * 阶段 1a：慢挂载浅层——只展开锚点（descent 0，一次 `read_dir`/根，实测 ~82ms），
-///   把兄弟层（descent 1）发射后推入 `deferred`；**绝不**在此对深层做 `read_dir`。
-///   浅层因此早到，本地几乎不被拖慢。
+/// * 阶段 1a：慢挂载锚点——只发射锚点自身（descent 0，无 IO 的 emit），随即推入
+///   `deferred`；**绝不**在本地阶段之前对任何慢挂载做 `read_dir`（含锚点展开）。
+///   即使锚点是挂死的网络盘（WSL 不可达的 `/mnt/d`），这里也只是一次无 IO 的 emit，
+///   本地阶段（1b）因此永不会被一次不可中断的 `read_dir` 阻塞。锚点展开留到阶段 2。
 /// * 阶段 1b：本地 frontier，按 `eff_depth` 浅先深后，不被慢挂载打断；截到 `local_cap`
 ///   给慢挂载留配额，被截掉的是本地最深最不可能的层。
-/// * 阶段 2：慢挂载深层，独占本地扫完后的剩余时间预算，浅先深后发射到 cap。
+/// * 阶段 2：慢挂载深层——展开阶段 1a 只发未展开的锚点及其后代（慢挂载子孙均继承 slow，
+///   仍在此逐层展开），独占本地扫完后的剩余时间预算，浅先深后发射到 cap。
 /// * 阶段 3：收尾补齐——预算耗尽后慢挂载往往认领不满自己的配额（9p 一次展开 ~1.8ms，
 ///   预算内只够 ~1700–2050 个），把没认领的槽用本地堆补满，`TOPUP_GRACE` 封顶。
 ///
@@ -565,7 +567,9 @@ pub(crate) fn run<F: FnMut(Vec<String>) -> bool>(job: ScanJob, on_batch: F) {
         seq += 1;
     }
 
-    // 阶段 1a：慢挂载浅层。
+    // 阶段 1a：慢挂载锚点。只做无 IO 的 emit，把展开（read_dir）整体推给阶段 2——
+    // 挂死的网络盘在此不触发任何 read_dir，本地阶段（1b）因此绝不被阻塞（D1）。
+    // slow 堆初始只含 descent==0 的根，且这里不再往 slow 回推，所以循环只会看到锚点。
     while let Some(Reverse(item)) = slow.pop() {
         if scanner.hit_limit() {
             break;
@@ -575,21 +579,9 @@ pub(crate) fn run<F: FnMut(Vec<String>) -> bool>(job: ScanJob, on_batch: F) {
             scanner.flush();
             return;
         }
-        if node.descent == 0 {
-            // 展开锚点：一次 read_dir，浮出兄弟层。
-            for child in scanner.children(&node) {
-                if child.slow {
-                    push_node(&mut slow, (child.descent, seq), child);
-                } else {
-                    push_node(&mut local, (child.eff_depth, seq), child);
-                }
-                seq += 1;
-            }
-        } else {
-            // 兄弟层已发射；其展开（9p read_dir）推迟到本地扫完后的剩余预算。
-            push_node(&mut deferred, (node.descent, seq), node);
-            seq += 1;
-        }
+        // 不在此 children()：锚点入 deferred，展开留到本地扫完后的阶段 2。
+        push_node(&mut deferred, (node.descent, seq), node);
+        seq += 1;
     }
 
     // 阶段 1b：本地 frontier。
@@ -624,7 +616,8 @@ pub(crate) fn run<F: FnMut(Vec<String>) -> bool>(job: ScanJob, on_batch: F) {
             break;
         }
         let node = item.node;
-        // 兄弟层（descent 1）已在 1a 发射，emit 命中去重是无操作；descent ≥2 首次发射。
+        // 锚点（descent 0）已在 1a 发射，emit 命中去重是无操作；其子孙（descent ≥1）
+        // 在此首次经 read_dir 浮现并发射。慢挂载子孙均继承 slow，全部回推 deferred。
         if !scanner.emit(&node.path, false) {
             scanner.flush();
             return;
@@ -1066,7 +1059,7 @@ mod tests {
     fn local_any_depth_emitted_before_slow_deep_layers() {
         // 调度性质：本地目录（任意深度）先于慢挂载深层（descent ≥2）发射，避免 9p 深层
         // 饿死本地深层。慢挂载用注入前缀模拟，不依赖真实 /mnt。
-        // （变异验证：把 1a 里 descent≥1 的 `push deferred` 改成就地展开，此断言即失败。）
+        // （变异验证：把阶段 2 的 deferred 展开挪到阶段 1b 之前，慢挂载深层就抢在本地前发射，此断言即失败。）
         let tree = TempTree::new("sched");
         tree.dir("home/a/b/c"); // 本地深链（depth 3）
         tree.dir("slow/x/y/z"); // 慢挂载深链
@@ -1166,6 +1159,50 @@ mod tests {
             found.iter().filter(|p| p.starts_with(&slow_prefix)).count(),
             2,
             "topup must not displace what the slow mount did claim: {found:?}"
+        );
+    }
+
+    #[test]
+    fn slow_anchor_read_dir_never_precedes_local_emission() {
+        // D1 回归：慢挂载锚点的展开（read_dir）绝不能发生在本地阶段之前，否则挂死的
+        // 网络盘一次不可中断的 read_dir 会把本地候选全部阻塞（用户拿到零个本地发现）。
+        // 锚点自身的 emit 是无 IO 的，允许早到；但锚点的子目录（descent 1，只有对锚点
+        // read_dir 过才可能浮现）必须排在所有本地候选之后——它的位置就是那次 read_dir
+        // 发生时机的可测代理。慢挂载用注入前缀模拟，不依赖真实 /mnt。
+        // （变异验证：把阶段 1a 对锚点改回就地 children 展开，slow/x 会挪到本地之前，
+        //  本断言即失败。）
+        let tree = TempTree::new("d1");
+        tree.dir("home/a/b/c"); // 本地深链
+        tree.dir("slow/x"); // 慢挂载锚点的子目录（须先 read_dir 锚点才能发现）
+        let slow_prefix = tree.s("slow");
+        let roots = vec![
+            root(tree.dir("home"), 1, UNLIMITED),
+            slow_root(tree.dir("slow"), 2, EXTERNAL_DESCENT),
+        ];
+        let found = collect_job(ScanJob {
+            roots,
+            cap: CANDIDATE_CAP,
+            deadline: None,
+            prune_abs: HashSet::new(),
+            slow_prefixes: vec![slow_prefix.clone()],
+            slow_reserve: CANDIDATE_CAP / SLOW_RESERVE_DIVISOR,
+        });
+        // 本地覆盖不因慢挂载锚点在场而缩水：最深的本地目录仍被发射。
+        assert!(
+            found.contains(&tree.s("home/a/b/c")),
+            "local coverage must not shrink when a slow anchor is present: {found:?}"
+        );
+        let last_local = found
+            .iter()
+            .rposition(|p| p.starts_with(&tree.s("home")))
+            .expect("local candidates must be emitted");
+        let slow_child = found
+            .iter()
+            .position(|p| p == &format!("{slow_prefix}/x"))
+            .expect("slow anchor child must eventually surface");
+        assert!(
+            last_local < slow_child,
+            "slow anchor read_dir (surfacing slow/x) must not precede local emission: {found:?}"
         );
     }
 }
