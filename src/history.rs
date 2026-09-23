@@ -11,10 +11,11 @@
 //!   - load_raw(ctx): 读 raw 为 HistoryEntry 列表
 //!
 //! 写入安全：
-//!   - 使用粗粒度文件锁 + 短暂重试/过期锁清理，降低并发写失败概率；
+//!   - 使用粗粒度 flock（OS 劝告锁）串行化并发写，降低并发写失败概率；
 //!   - 使用“临时文件 + rename”保证 history_uniq 的更新尽量原子。
 
 use crate::AppContext;
+use fs4::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
@@ -23,7 +24,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const HISTORY_LOCK_RETRY_MS: u64 = 50;
 const HISTORY_LOCK_RETRIES: usize = 20;
-const HISTORY_LOCK_STALE_SECS: u64 = 30;
 const MILLIS_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
 const MICROS_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000_000;
 const NANOS_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000_000_000;
@@ -349,15 +349,24 @@ fn parse_history_file(path: &Path) -> io::Result<Vec<HistoryEntry>> {
     Ok(res)
 }
 
-/// 简单文件锁：在 state_dir 下创建一个 lock 文件，
-/// 同一时刻只有一个进程能持有它。
+/// 基于 flock（OS 劝告锁）的粗粒度历史写锁。
+///
+/// 语义与旧「土锁」的根本差别：
+/// - 锁由**内核**持有，进程一旦退出（正常或崩溃）内核**自动释放**——不再有残留
+///   锁文件卡住后续写入（消除旧协议的 H2 卡顿）。
+/// - 加锁本身是原子的 test-and-set，没有「查存在→判死→删→重建」这套 check-then-act
+///   竞态窗口（消除旧协议的 H1 级联误删与 F2/F3 的 TOCTOU 误删活锁）。
+/// - 锁文件**常驻**：不再在 Drop 时删除它。flock 锁的是打开的文件描述，文件本身
+///   存不存在与锁状态无关，删文件反而会制造新的竞态。
+///
+/// 取舍：flock 是**劝告锁**，只对同样走 flock 的写者生效；在 NFS / 9p 等网络文件
+/// 系统上语义可能弱化（退化为 best-effort，甚至无效）。这是相对土锁可以接受的代价——
+/// 本地文件系统上它严格优于原来的竞态协议，而 cdh 的状态目录几乎总在本地盘。
 ///
 /// 注意：
 /// - 这是一个“粗粒度”锁：目前所有历史写操作共用一把锁；
 /// - 后续如果需要细分（比如 raw/uniq 分离），可以在这里扩展。
 struct FileLock {
-    path: PathBuf,
-    #[allow(dead_code)]
     file: File,
 }
 
@@ -367,147 +376,48 @@ impl FileLock {
             fs::create_dir_all(parent)?;
         }
 
-        let mut last_err: Option<io::Error> = None;
+        // 常驻锁文件：存在则用、不存在则建（不用 create_new）。锁的是这个已打开的
+        // 文件描述，不是「文件是否存在」，所以并发打开同一路径是正常且安全的。
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
 
+        // 有界重试拿排他锁：`cdh log` 每次 cd 都会调用，绝不能永久阻塞。用
+        // try_lock（非阻塞）+ 短睡眠轮询，耗尽重试就返回 Err，让上层静默失败。
         for attempt in 0..=HISTORY_LOCK_RETRIES {
-            match OpenOptions::new().create_new(true).write(true).open(&path) {
-                Ok(mut file) => {
-                    // 写入当前进程 PID，供后续 `maybe_clear_stale_lock` 的存活探测使用（H2）。
-                    // 写失败不致命：读侧读不到合法 PID 时会退回 mtime 兜底。
-                    let _ = write!(file, "{}", std::process::id());
-                    let _ = file.flush();
-                    return Ok(FileLock { path, file });
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    last_err = Some(e);
-
-                    if maybe_clear_stale_lock(&path) {
-                        continue;
-                    }
-
+            // 用 UFCS 强制走 fs4 的 trait 方法：std 1.89+ 给 `File` 加了同名的
+            // 固有 `try_lock`（返回 `std::fs::TryLockError`），固有方法会优先于
+            // trait，`file.try_lock()` 在 >=1.89 的工具链上会解析到 std 而非 fs4，
+            // 导致下面按 `fs4::TryLockError` 的匹配编译失败。
+            match FileExt::try_lock(&file) {
+                Ok(()) => return Ok(FileLock { file }),
+                // 锁被别的写者持有：短睡后重试。
+                Err(fs4::TryLockError::WouldBlock) => {
                     if attempt == HISTORY_LOCK_RETRIES {
                         break;
                     }
-
                     thread::sleep(Duration::from_millis(HISTORY_LOCK_RETRY_MS));
                 }
-                Err(e) => return Err(e),
+                // 真正的 I/O 错误：直接上报，不重试。
+                Err(fs4::TryLockError::Error(e)) => return Err(e),
             }
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            io::Error::other(format!(
-                "failed to acquire history lock: {}",
-                path.display()
-            ))
-        }))
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("failed to acquire history lock: {}", path.display()),
+        ))
     }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        // 释放锁：只删「仍然是我们创建的那把」锁文件（H1）。
-        //
-        // 用创建时保留的句柄 fstat 拿到我们那个 inode（即使 path 已被 unlink/替换，
-        // 句柄仍指向原文件），与 path 当前指向的 inode 比对：
-        //   - 一致  → 确是我们的锁，删；
-        //   - path 不存在 / inode 不同 → 已被别的进程 unlink 并重建，删了就是删别人的锁，
-        //     会引发级联失效，故不删。
-        // 全程忽略错误，但宁可不删也不误删。
-        if lock_file_still_ours(&self.file, &self.path) {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// 判断 `path` 当前指向的锁文件是否就是 `file` 句柄创建的那一个（inode 相同）。
-///
-/// 用 fstat（句柄）对 stat（路径）比对 inode，避免删掉别的进程重建的同名锁。
-#[cfg(unix)]
-fn lock_file_still_ours(file: &File, path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    let ours = match file.metadata() {
-        Ok(meta) => meta.ino(),
-        Err(_) => return false,
-    };
-    let current = match fs::metadata(path) {
-        Ok(meta) => meta.ino(),
-        Err(_) => return false,
-    };
-    ours == current
-}
-
-/// 非 unix 平台无 inode 语义，退化为「path 仍存在即视为我们的锁」，保持旧行为。
-#[cfg(not(unix))]
-fn lock_file_still_ours(_file: &File, path: &Path) -> bool {
-    path.exists()
-}
-
-/// 若能确凿判定持锁进程已死（仅 Linux，读锁文件里的 PID + 探 `/proc/<pid>`），
-/// 立即清理以消除 H2 卡顿；任何不确定都返回 false，交给调用方的 mtime 兜底。
-///
-/// 安全性：本函数只用于「加速」清理，绝不延长持锁——
-/// 即便 PID 看似存活（可能是 PID 复用），也返回 false，让 mtime>阈值 的旧逻辑兜底。
-#[cfg(target_os = "linux")]
-fn lock_owner_is_dead(path: &Path) -> bool {
-    // /proc 不存在（异常环境）则无法判定 → 交给 mtime 兜底。
-    if !Path::new("/proc").exists() {
-        return false;
-    }
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(_) => return false,
-    };
-    // 读不到合法正整数 PID（空文件 / 旧格式 / 损坏）→ 不确定，交给 mtime 兜底。
-    let pid = match contents.trim().parse::<u32>() {
-        Ok(pid) if pid > 0 => pid,
-        _ => return false,
-    };
-    // /proc/<pid> 不存在 ⇒ 该进程确已退出。
-    !Path::new("/proc").join(pid.to_string()).exists()
-}
-
-/// 非 Linux（如 macOS CI）没有 `/proc`，无法做存活探测，一律退化到 mtime 判定。
-#[cfg(not(target_os = "linux"))]
-fn lock_owner_is_dead(_path: &Path) -> bool {
-    false
-}
-
-/// 如果锁文件明显过期，尝试清理它。
-fn maybe_clear_stale_lock(path: &Path) -> bool {
-    // 优先：若能确定持锁进程已死，立即清理（H2 加速），无需等满 mtime 阈值。
-    if lock_owner_is_dead(path) {
-        return match fs::remove_file(path) {
-            Ok(()) => true,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => true,
-            Err(_) => false,
-        };
-    }
-
-    let meta = match fs::metadata(path) {
-        Ok(meta) => meta,
-        Err(_) => return false,
-    };
-
-    let modified = match meta.modified() {
-        Ok(modified) => modified,
-        Err(_) => return false,
-    };
-
-    let elapsed = match modified.elapsed() {
-        Ok(elapsed) => elapsed,
-        Err(_) => return false,
-    };
-
-    if elapsed < Duration::from_secs(HISTORY_LOCK_STALE_SECS) {
-        return false;
-    }
-
-    match fs::remove_file(path) {
-        Ok(()) => true,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
-        Err(_) => false,
+        // 显式释放 flock。即便这里不显式 unlock，内核也会在 File 关闭（Drop）时
+        // 自动释放；显式调用只是让释放时机更清晰。**不删锁文件**——它是常驻的。
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -826,85 +736,134 @@ mod tests {
         assert_eq!(read_lines(&ctx.paths.history_uniq), vec![expected]);
     }
 
+    /// 持锁期间，另一个独立 handle 对同一锁文件 `try_lock` 必须失败
+    /// （WouldBlock）——这正是 flock 提供的互斥语义，也是串行化并发写的根基。
     #[test]
-    fn acquire_writes_current_pid_into_lock_file() {
-        let (root, _ctx) = make_test_ctx("lock_pid_written");
+    fn flock_blocks_second_try_lock_while_held() {
+        let (root, _ctx) = make_test_ctx("flock_contended");
         let lock_path = root.join("lock");
 
-        let lock = FileLock::acquire(lock_path.clone()).unwrap();
-        let contents = fs::read_to_string(&lock_path).unwrap();
-        assert_eq!(contents.trim(), process::id().to_string());
-        drop(lock);
+        let held = FileLock::acquire(lock_path.clone()).unwrap();
+
+        // 第二个独立打开的 handle 指向同一文件，try_lock 应因锁被占而 WouldBlock。
+        let other = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        match FileExt::try_lock(&other) {
+            Err(fs4::TryLockError::WouldBlock) => {}
+            Ok(()) => panic!("持锁期间第二个 try_lock 不应成功（flock 互斥失效）"),
+            Err(fs4::TryLockError::Error(e)) => panic!("try_lock 意外 I/O 错误: {e}"),
+        }
+
+        drop(held);
     }
 
+    /// 持锁者 Drop（→ unlock + 关文件）后，锁必须可被再次获取。
+    /// 这条守的是「释放确实生效」——若 Drop 没释放，acquire 会耗尽重试而 Err。
     #[test]
-    fn drop_removes_our_own_lock() {
-        let (root, _ctx) = make_test_ctx("lock_drop_own");
+    fn flock_released_after_drop_allows_reacquire() {
+        let (root, _ctx) = make_test_ctx("flock_reacquire");
         let lock_path = root.join("lock");
 
-        let lock = FileLock::acquire(lock_path.clone()).unwrap();
-        assert!(lock_path.exists());
-        drop(lock);
-        assert!(!lock_path.exists(), "自己的锁在 Drop 时应被清理");
-    }
+        let held = FileLock::acquire(lock_path.clone()).unwrap();
+        // Drop 里显式 `FileExt::unlock` 是释放的兜底；即便省略它，`File` close
+        // 也会由内核释放 flock——两条路径构成双保险，这里验的是释放确实生效。
+        drop(held);
 
-    /// H1 级联回归：锁被别的进程 unlink 后重建成同名不同 inode 的文件，
-    /// 我们的 Drop 不得删掉那个替换文件。
-    #[test]
-    fn drop_does_not_remove_lock_recreated_by_another_process() {
-        let (root, _ctx) = make_test_ctx("lock_inode_guard");
-        let lock_path = root.join("lock");
+        // 释放后应能立刻拿到；acquire 内部有重试，但正常释放后首次 try 就该成功。
+        let again = FileLock::acquire(lock_path.clone());
+        assert!(again.is_ok(), "持锁者 Drop 后锁应可被重新获取");
 
-        let lock = FileLock::acquire(lock_path.clone()).unwrap();
-        // 模拟：我们的锁被 unlink，另一个进程重建了同名锁（新 inode、新内容）。
-        fs::remove_file(&lock_path).unwrap();
-        fs::write(&lock_path, b"other-process-lock").unwrap();
-
-        drop(lock);
-
-        // 替换文件必须仍在，且内容原封不动（否则就是删了别人的锁 → H1 级联）。
-        assert!(lock_path.exists(), "别的进程重建的锁被误删了 (H1 级联)");
-        assert_eq!(
-            fs::read_to_string(&lock_path).unwrap(),
-            "other-process-lock"
+        // 锁文件是常驻的：Drop 不删它。
+        assert!(
+            lock_path.exists(),
+            "flock 锁文件应常驻，不该在 Drop 时被删除"
         );
     }
 
-    /// H2：锁文件里的 PID 已死时，即便 mtime 很新也应被立即清理。
+    /// `with_history_lock` 串行执行闭包、透传返回值，且闭包内的历史写入落盘。
     #[test]
-    fn maybe_clear_stale_lock_removes_dead_pid_immediately() {
-        let (root, _ctx) = make_test_ctx("lock_dead_pid");
-        let lock_path = root.join("lock");
+    fn with_history_lock_runs_closure_and_returns_value() {
+        let (root, ctx) = make_test_ctx("with_lock_closure");
+        let dir = root.join("visited_dir");
+        fs::create_dir_all(&dir).unwrap();
+        let dir_str = fs::canonicalize(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
 
-        // 写一个确定不存在的 PID（超出任何合法 pid），文件 mtime 很新。
-        fs::write(&lock_path, format!("{}", u32::MAX)).unwrap();
+        let ret = with_history_lock(&ctx, || {
+            append_raw(&ctx, &dir_str)?;
+            Ok(42_u32)
+        })
+        .unwrap();
 
-        let cleared = maybe_clear_stale_lock(&lock_path);
+        assert_eq!(ret, 42, "返回值必须透传");
 
-        // Linux：能探测到 PID 已死 → 立即清；非 Linux：退化到 mtime，因很新故不清。
-        #[cfg(target_os = "linux")]
-        {
-            assert!(cleared, "死 PID 的锁应被立即清理，不必等满 30s");
-            assert!(!lock_path.exists());
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            assert!(!cleared, "非 Linux 无 /proc，mtime 很新时不应清理");
-            assert!(lock_path.exists());
-        }
+        let raw = fs::read_to_string(&ctx.paths.history_raw).unwrap();
+        assert!(raw.contains(&dir_str), "闭包内 append_raw 的写入必须落盘");
     }
 
-    /// 安全性：锁文件里的 PID 是活着的进程（当前进程自己）、mtime 很新时，
-    /// 绝不能清理，避免误删活锁。两平台都应保持不清。
+    /// 两个线程各自 `with_history_lock` 递增共享计数，锁必须串行化临界区，
+    /// 结果无交错（最终恰好为迭代总数）。用「持锁期间对方无法进入」来承重。
     #[test]
-    fn maybe_clear_stale_lock_keeps_live_pid() {
-        let (root, _ctx) = make_test_ctx("lock_live_pid");
-        let lock_path = root.join("lock");
+    fn with_history_lock_serializes_concurrent_writers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        fs::write(&lock_path, format!("{}", process::id())).unwrap();
+        // 保留 _root 绑定：其 Drop 负责清理临时目录，须活到测试结束。
+        let (_root, ctx) = make_test_ctx("with_lock_serialize");
 
-        let cleared = maybe_clear_stale_lock(&lock_path);
-        assert!(!cleared, "活着的持锁进程不应被清 (避免误删活锁)");
-        assert!(lock_path.exists());
+        let counter = Arc::new(AtomicUsize::new(0));
+        // 临界区内的「占用」标志：若两个闭包同时进入，in_critical 会 >1。
+        let in_critical = Arc::new(AtomicUsize::new(0));
+        let overlaps = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let iters = 50;
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let ctx = ctx.clone();
+            let counter = Arc::clone(&counter);
+            let in_critical = Arc::clone(&in_critical);
+            let overlaps = Arc::clone(&overlaps);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..iters {
+                    with_history_lock(&ctx, || {
+                        // 进入临界区：若此刻已有别人在内，记一次重叠。
+                        if in_critical.fetch_add(1, Ordering::SeqCst) != 0 {
+                            overlaps.fetch_add(1, Ordering::SeqCst);
+                        }
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        // 撑开一段可观测的耗时窗口：若锁失效、两个闭包能同时进入，
+                        // 对方必然落在这段 sleep 里被上面的 fetch_add 观测到（overlaps>0）。
+                        // 只靠三条原子操作窗口太窄，几乎不重叠——那样测试就不承重了。
+                        thread::sleep(Duration::from_micros(200));
+                        in_critical.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2 * iters,
+            "所有临界区都应执行且不丢失"
+        );
+        assert_eq!(
+            overlaps.load(Ordering::SeqCst),
+            0,
+            "临界区不得交错：flock 未能串行化并发写者"
+        );
     }
 }

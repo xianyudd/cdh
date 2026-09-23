@@ -13,6 +13,11 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 crossterm = "0.29"
+# fs4：纯安全封装的 flock(2)/LockFileEx 文件锁，历史写锁的实现基础（替换旧「土锁」
+# 协议，见 src/history.rs）。默认 feature 只启用 sync（同步 `FileExt`），不拉入任何
+# async 运行时。MSRV 1.75，低于本仓的 1.88；传递依赖仅 rustix(unix)/windows-sys，
+# 二者已在依赖树里，未新增重复版本或新许可证。
+fs4 = "1.1"
 nucleo-matcher = "0.3"
 # Cargo.lock 里 termwiz/wezterm-* 等约 85 个条目来自 ratatui 0.30 的可选后端
 # （ratatui-termwiz / ratatui-termina）；cdh 只用 crossterm 后端，从不编译它们。
