@@ -10,6 +10,7 @@ pub mod history;
 pub mod paths;
 pub mod picker;
 pub mod recommend;
+mod search;
 
 #[cfg(test)]
 mod test_support;

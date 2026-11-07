@@ -1790,6 +1790,11 @@ fn row_options(index: usize, total: usize, selected: bool, width: usize) -> List
 
 fn test_ctx(name: &str) -> (TempDir, AppContext) {
     let root = TempDir::new(&format!("picker_test_{name}"));
+    let ctx = test_context_at(&root);
+    (root, ctx)
+}
+
+fn test_context_at(root: &Path) -> AppContext {
     let paths = Paths {
         config_dir: root.join("config"),
         data_dir: root.join("data"),
@@ -1800,26 +1805,23 @@ fn test_ctx(name: &str) -> (TempDir, AppContext) {
         excludes: root.join("data").join("excludes"),
     };
     fs::create_dir_all(paths.history_raw.parent().unwrap()).unwrap();
-    (
-        root,
-        AppContext {
-            paths,
-            config: EffectiveConfig {
-                limit: None,
-                half_life: 7.0 * 24.0 * 3600.0,
-                threshold: 0.0,
-                ignore_re: None,
-                check_dir: true,
-                uniq_decay: 0.85,
-                recency_half_life: 24.0 * 3600.0,
-                debounce_secs: 600,
-                w_frecency: 0.40,
-                w_uniq: 0.10,
-                w_recency: 0.30,
-                w_context: 0.20,
-            },
+    AppContext {
+        paths,
+        config: EffectiveConfig {
+            limit: None,
+            half_life: 7.0 * 24.0 * 3600.0,
+            threshold: 0.0,
+            ignore_re: None,
+            check_dir: true,
+            uniq_decay: 0.85,
+            recency_half_life: 24.0 * 3600.0,
+            debounce_secs: 600,
+            w_frecency: 0.40,
+            w_uniq: 0.10,
+            w_recency: 0.30,
+            w_context: 0.20,
         },
-    )
+    }
 }
 
 #[test]
@@ -4587,6 +4589,497 @@ fn read_git_info_reports_clean_and_modified_status() {
 }
 
 // ---- Directory-tree discovery layer ----
+
+#[test]
+fn cli_query_construction_keeps_or_after_edits_until_clear() {
+    let setup = SearchSetup {
+        scan_paths: vec!["/outside/visited".into()],
+        history_items: Vec::new(),
+        tokens: vec!["alpha".into(), "beta".into()],
+        ignore_re: None,
+        context: crate::search::SearchContext::default(),
+    };
+    let loaded = SettingsLoad {
+        settings: UiSettings::for_test(UiPreferences {
+            preview: false,
+            ..UiPreferences::default()
+        }),
+        warning: None,
+    };
+    let (mut app, anchors) = build_search_app(
+        &recs(&[("/x/alpha", 0.9), ("/x/beta", 0.8), ("/x/alpha beta", 0.1)]),
+        &HashMap::new(),
+        loaded,
+        Language::En,
+        Excludes::default(),
+        setup,
+    );
+    assert_eq!(anchors, vec!["/outside/visited"]);
+    assert_eq!(app.query, "alpha beta");
+    assert!(app.filter.cli_or);
+    assert_eq!(app.filtered_results.len(), 3);
+    app.insert_query_char('z');
+    assert_eq!(app.filtered_results.len(), 2); // alpha OR betaz, not AND
+    app.clear_query();
+    assert!(!app.filter.cli_or);
+    for ch in "alpha beta".chars() {
+        app.insert_query_char(ch);
+    }
+    assert_eq!(app.filtered_results.len(), 1);
+    assert_eq!(app.selected_raw().as_deref(), Some("/x/alpha beta"));
+}
+
+#[test]
+fn cli_quoted_query_matches_and_highlights_one_literal_token() {
+    let mut app = App::with_preview_worker(
+        build_candidates(&recs(&[
+            ("/x/alpha", 0.9),
+            ("/x/beta", 0.8),
+            ("/x/alpha beta", 0.1),
+        ])),
+        None,
+        false,
+    );
+    app.set_cli_query(
+        &["alpha beta".into()],
+        crate::search::SearchContext::default(),
+    );
+    assert_eq!(app.query, "\"alpha beta\"");
+    assert_eq!(app.filtered_results.len(), 1);
+    let raw = app.selected_raw().unwrap();
+    let highlights = app
+        .filter
+        .query(&app.query)
+        .highlights(&raw, &mut Matcher::new(Config::DEFAULT));
+    assert_eq!(highlights, (3..13).collect::<Vec<_>>());
+}
+
+#[test]
+fn search_app_filters_excluded_anchors_and_actual_ignore_before_ingestion() {
+    let setup = SearchSetup {
+        history_items: recs(&[
+            ("/keep/visited", 0.7),
+            ("/excluded/visited", 1.0),
+            ("/ignored/visited", 1.0),
+        ]),
+        scan_paths: vec![
+            "/keep/visited".into(),
+            "/excluded/visited".into(),
+            "/ignored/visited".into(),
+        ],
+        tokens: vec!["target".into()],
+        ignore_re: Some(Regex::new("/ignored(/|$)").unwrap()),
+        context: crate::search::SearchContext::default(),
+    };
+    let loaded = SettingsLoad {
+        settings: UiSettings::for_test(UiPreferences {
+            preview: false,
+            ..UiPreferences::default()
+        }),
+        warning: None,
+    };
+    let (mut app, anchors) = build_search_app(
+        &recs(&[
+            ("/keep/target", 0.1),
+            ("/excluded/target", 1.0),
+            ("/ignored/target", 1.0),
+        ]),
+        &HashMap::new(),
+        loaded,
+        Language::En,
+        Excludes::from_paths(["/excluded"]),
+        setup,
+    );
+    assert_eq!(anchors, vec!["/keep/visited"]);
+    assert_eq!(app.candidates.len(), 1);
+    app.ingest_discovered(vec![vec![
+        "/excluded/target/child".into(),
+        "/ignored/target/child".into(),
+        "/keep/new-target".into(),
+    ]]);
+    assert_eq!(app.candidates.len(), 2);
+    assert!(!app
+        .known_paths
+        .contains(&path_fingerprint("/ignored/target/child")));
+    let before = app.selected_raw();
+    app.set_page_size(1);
+    app.ingest_discovered(vec![vec!["/target".into()]]);
+    assert_eq!(app.selected_raw(), before);
+    assert!(app.selected_index < app.filtered_results.len());
+    assert!(app.current_page < app.total_pages);
+    app.set_page_size(20);
+    assert_eq!(app.selected_raw(), before);
+    app.clear_query();
+    assert_eq!(app.candidates.len(), 4);
+    let restored = app
+        .candidates
+        .iter()
+        .find(|c| c.raw == "/keep/visited")
+        .unwrap();
+    assert_eq!(restored.source, CandidateSource::History);
+    assert_eq!(restored.score, 0.7);
+    for path in ["/excluded/visited", "/ignored/visited"] {
+        assert!(!app.known_paths.contains(&path_fingerprint(path)));
+        assert!(!app.history_visits.contains_key(path));
+        assert!(!app.history_scores.contains_key(path));
+    }
+}
+
+fn pruned_history_app(
+    ctx: &AppContext,
+    tokens: &[&str],
+    limit: Option<usize>,
+    threshold: f64,
+) -> App {
+    let opt = crate::RecommendOpt {
+        raw: ctx.paths.history_raw.to_string_lossy().into_owned(),
+        uniq: ctx.paths.history_uniq.to_string_lossy().into_owned(),
+        tokens: tokens.iter().map(|token| (*token).into()).collect(),
+        limit,
+        threshold,
+        ..crate::RecommendOpt::default()
+    };
+    let input = crate::recommend::prepare_recommendations(&opt, true);
+    let loaded = SettingsLoad {
+        settings: UiSettings::for_test(UiPreferences {
+            preview: false,
+            ..UiPreferences::default()
+        }),
+        warning: None,
+    };
+    build_search_app(
+        &input.items,
+        &load_last_visits(Some(ctx)),
+        loaded,
+        Language::En,
+        Excludes::default(),
+        SearchSetup {
+            scan_paths: input.scan_paths,
+            history_items: input.history_items,
+            tokens: opt.tokens,
+            ignore_re: None,
+            context: crate::search::SearchContext::default(),
+        },
+    )
+    .0
+}
+
+struct ScratchHistoryFixture(std::path::PathBuf);
+
+impl ScratchHistoryFixture {
+    fn new() -> Self {
+        // Reuse the existing unique-name generator, without creating a /tmp fixture.
+        let unique = TempDir::new("unscanned_history");
+        Self(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scratch")
+                .join(unique.file_name().unwrap()),
+        )
+    }
+}
+
+impl Drop for ScratchHistoryFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn cleared_query_restores_safe_history_without_discovery_and_keeps_scores() {
+    let fixture = ScratchHistoryFixture::new();
+    let root = &fixture.0;
+    let ctx = test_context_at(root);
+    let seed = root.join("seed").to_string_lossy().into_owned();
+    let visited = root
+        .join("node_modules/target")
+        .to_string_lossy()
+        .into_owned();
+    let uniq_only = root.join("uniq-target").to_string_lossy().into_owned();
+    for path in [&seed, &visited, &uniq_only] {
+        fs::create_dir_all(path).unwrap();
+    }
+    fs::write(
+        &ctx.paths.history_raw,
+        format!("100\t{visited}\n200\t{seed}\n150\t{visited}\n"),
+    )
+    .unwrap();
+    fs::write(
+        &ctx.paths.history_uniq,
+        format!("{uniq_only}\n{visited}\n{seed}\n"),
+    )
+    .unwrap();
+    let baseline = crate::recommend::recommend(&crate::RecommendOpt {
+        raw: ctx.paths.history_raw.to_string_lossy().into_owned(),
+        uniq: ctx.paths.history_uniq.to_string_lossy().into_owned(),
+        ..crate::RecommendOpt::default()
+    });
+    for (tokens, limit, threshold) in [
+        (vec!["seed"], None, 0.0),
+        (vec![], Some(1), 0.0),
+        (vec!["target"], None, 2.0),
+    ] {
+        let mut app = pruned_history_app(&ctx, &tokens, limit, threshold);
+        assert!(!app
+            .candidates
+            .iter()
+            .any(|candidate| candidate.raw == visited));
+        let initial: Vec<_> = app
+            .candidates
+            .iter()
+            .map(|c| (c.raw.clone(), c.score))
+            .collect();
+        // No ingest_discovered call: these rows must not wait for a scanner batch.
+        app.clear_query();
+        // Literal substring avoids unrelated fuzzy matches in the repo fixture prefix.
+        for ch in "'target".chars() {
+            app.insert_query_char(ch);
+        }
+        assert_eq!(app.filtered_results.len(), 2);
+        for (path, visit) in [(&visited, Some(150)), (&uniq_only, None)] {
+            let restored = app.candidates.iter().find(|c| &c.raw == path).unwrap();
+            assert_eq!(restored.source, CandidateSource::History);
+            assert_eq!(restored.last_visit, visit);
+            let score = baseline.iter().find(|r| &r.path == path).unwrap().score;
+            assert_eq!(restored.score, score.clamp(0.0, 1.0) as f32);
+            assert!(restored.exists);
+        }
+        for (path, score) in initial {
+            assert_eq!(
+                app.candidates.iter().find(|c| c.raw == path).unwrap().score,
+                score
+            );
+        }
+        assert_eq!(app.discovered_start, 3);
+        assert_eq!(app.known_paths.len(), 3);
+    }
+}
+
+#[test]
+fn rediscovered_pruned_history_keeps_identity_visit_and_preference() {
+    let (root, ctx) = test_ctx("pruned_identity");
+    let seed = root.join("seed").to_string_lossy().into_owned();
+    let visited = root.join("long/deep/target").to_string_lossy().into_owned();
+    let fresh = root.join("target").to_string_lossy().into_owned();
+    let uniq_only = root
+        .join("other/deep/target")
+        .to_string_lossy()
+        .into_owned();
+    for path in [&seed, &visited, &fresh, &uniq_only] {
+        fs::create_dir_all(path).unwrap();
+    }
+    fs::write(
+        &ctx.paths.history_raw,
+        format!("100\t{visited}\n200\t{seed}\n150\t{visited}\n"),
+    )
+    .unwrap();
+    fs::write(
+        &ctx.paths.history_uniq,
+        format!("{uniq_only}\n{visited}\n{seed}\n"),
+    )
+    .unwrap();
+    for (tokens, limit, threshold) in [
+        (vec!["seed"], None, 0.0),
+        (vec![], Some(1), 0.0),
+        (vec!["target"], None, 2.0),
+    ] {
+        let mut app = pruned_history_app(&ctx, &tokens, limit, threshold);
+        assert!(!app
+            .candidates
+            .iter()
+            .any(|candidate| candidate.raw == visited));
+        let selected_before = app.selected_raw();
+        assert!(app.ingest_discovered(vec![vec![
+            fresh.clone(),
+            visited.clone(),
+            uniq_only.clone()
+        ]]));
+        if selected_before.is_some() {
+            assert_eq!(app.selected_raw(), selected_before);
+        }
+        app.clear_query();
+        for ch in "target".chars() {
+            app.insert_query_char(ch);
+        }
+        app.set_page_size(1);
+        app.set_selected(0);
+        let candidate = app.selected_candidate().unwrap();
+        assert_ne!(
+            candidate.raw, fresh,
+            "equivalent visited matches must beat shallow unvisited paths"
+        );
+        let restored = app
+            .candidates
+            .iter()
+            .find(|candidate| candidate.raw == visited)
+            .unwrap();
+        assert_eq!(restored.source, CandidateSource::History);
+        assert_eq!(restored.last_visit, Some(150));
+        let restored_uniq = app
+            .candidates
+            .iter()
+            .find(|candidate| candidate.raw == uniq_only)
+            .unwrap();
+        assert_eq!(restored_uniq.source, CandidateSource::History);
+        assert_eq!(restored_uniq.last_visit, None);
+        assert!(app.candidates[..app.discovered_start]
+            .iter()
+            .all(|candidate| candidate.source == CandidateSource::History));
+        assert!(app.candidates[app.discovered_start..]
+            .iter()
+            .all(|candidate| candidate.source == CandidateSource::Discovered));
+        let selected_before_resize = app.selected_raw();
+        app.set_page_size(20);
+        assert_eq!(app.selected_raw(), selected_before_resize);
+        assert_eq!(app.current_page, 1); // Nonempty page numbers are one-based.
+        assert_eq!(app.total_pages, 1);
+    }
+}
+
+#[test]
+fn rediscovered_pruned_history_delete_removes_records_and_does_not_restore_identity() {
+    for via_scan in [false, true] {
+        pruned_history_delete_does_not_restore_identity(via_scan);
+    }
+}
+
+fn pruned_history_delete_does_not_restore_identity(via_scan: bool) {
+    let fixture = ScratchHistoryFixture::new();
+    let root = &fixture.0;
+    let ctx = test_context_at(root);
+    let seed = root.join("seed").to_string_lossy().into_owned();
+    let visited = root.join("long/deep/target").to_string_lossy().into_owned();
+    for path in [&seed, &visited] {
+        fs::create_dir_all(path).unwrap();
+    }
+    fs::write(
+        &ctx.paths.history_raw,
+        format!("100\t{visited}\n200\t{seed}\n"),
+    )
+    .unwrap();
+    fs::write(&ctx.paths.history_uniq, format!("{visited}\n{seed}\n")).unwrap();
+    let mut app = pruned_history_app(&ctx, &["seed"], None, 0.0);
+    if via_scan {
+        app.ingest_discovered(vec![vec![visited.clone()]]);
+    }
+    app.clear_query();
+    for ch in "target".chars() {
+        app.insert_query_char(ch);
+    }
+    for _ in 0..2 {
+        handle_key(
+            &mut app,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            Some(&ctx),
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&ctx.paths.history_raw).unwrap(),
+        format!("200\t{seed}\n")
+    );
+    assert_eq!(
+        fs::read_to_string(&ctx.paths.history_uniq).unwrap(),
+        format!("{seed}\n")
+    );
+    assert!(app.excludes.contains(&visited));
+    // Undo visibility only: after deletion the directory is genuinely unvisited.
+    app.excludes = crate::excludes::remove(&ctx.paths.excludes, &visited).unwrap();
+    app.ingest_discovered(vec![vec![visited.clone()]]);
+    let restored = app
+        .candidates
+        .iter()
+        .find(|candidate| candidate.raw == visited)
+        .unwrap();
+    assert_eq!(restored.source, CandidateSource::Discovered);
+    assert_eq!(restored.last_visit, None);
+}
+
+#[test]
+fn equivalent_basename_strength_keeps_history_preference_even_with_longer_path() {
+    let candidates = vec![
+        discovered_cand("/short/target", 1.0),
+        history_cand("/longer/parent/target", 0.0),
+    ];
+    let results = Filter::new().run(&candidates, "target");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].idx, 1);
+}
+
+#[test]
+fn structural_order_is_independent_of_names_and_batch_order() {
+    for (shallow, deep) in [
+        ("/very-long-parent-name/target", "/a/b/c/target"),
+        ("/a/target", "/z/y/x/target"),
+    ] {
+        for reversed in [false, true] {
+            let mut app = App::with_preview_worker(Vec::new(), None, false);
+            app.set_cli_query(&["target".into()], crate::search::SearchContext::default());
+            let mut batches = vec![vec![deep.into()], vec![shallow.into()]];
+            if reversed {
+                batches.reverse();
+            }
+            app.ingest_discovered(batches);
+            app.move_home();
+            assert_eq!(app.selected_raw().as_deref(), Some(shallow));
+        }
+    }
+}
+
+#[test]
+fn search_50k_candidates_compile_query_once_and_rank_all_matches() {
+    let candidates: Vec<_> = (0..50_000)
+        .rev()
+        .map(|n| discovered_cand(&format!("/generic/project-{n}"), 0.0))
+        .collect();
+    let mut filter = Filter::new();
+    for cli_or in [false, true] {
+        filter.cli_or = cli_or;
+        let before = filter.query_compilations.get();
+        let results = filter.run(&candidates, "project");
+        assert_eq!(
+            filter.query_compilations.get() - before,
+            1,
+            "each refilter must compile once, not once per candidate (cli_or={cli_or})"
+        );
+        assert_eq!(results.len(), 50_000);
+        assert_eq!(candidates[results[0].idx].raw, "/generic/project-0");
+    }
+    let before = filter.query_compilations.get();
+    assert_eq!(filter.run(&candidates, "").len(), 50_000);
+    assert_eq!(filter.query_compilations.get(), before);
+}
+
+#[test]
+fn search_regression_path_intent_rejects_unrelated_fuzzy_paths() {
+    let candidates = vec![
+        history_cand("/a/proj", 0.1),
+        history_cand("/archive/a/old/project", 0.9),
+    ];
+    let results = Filter::new().run(&candidates, "/a/proj");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].idx, 0);
+}
+
+#[test]
+fn search_regression_basename_beats_hot_ancestor_match() {
+    let candidates = vec![
+        history_cand("/project/child", 1.0),
+        discovered_cand("/cold/project", 0.0),
+    ];
+    let results = Filter::new().run(&candidates, "project");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].idx, 1);
+}
+
+#[test]
+fn search_regression_discovery_prefers_shallow_structure() {
+    let mut app = App::with_preview_worker(Vec::new(), None, false);
+    app.ingest_discovered(vec![vec!["/a/b/c/project".into(), "/z/project".into()]]);
+    assert_eq!(app.selected_raw().as_deref(), Some("/z/project"));
+    app.query = "project".into();
+    app.recompute_after_query_change();
+    assert_eq!(app.selected_raw().as_deref(), Some("/z/project"));
+}
 
 fn discovered_cand(raw: &str, score: f32) -> Candidate {
     Candidate {

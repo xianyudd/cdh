@@ -40,10 +40,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use nucleo_matcher::{
-    pattern::{CaseMatching, Normalization, Pattern},
-    Config, Matcher, Utf32Str,
-};
+use nucleo_matcher::{Config, Matcher};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -207,7 +204,7 @@ pub fn pick(items: &[Recommendation]) -> io::Result<Option<String>> {
     if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
         return Ok(items.first().map(|item| item.path.clone()));
     }
-    run_ui(items, None)
+    run_ui(items, None, None)
 }
 
 pub fn pick_with_history(ctx: &AppContext, items: &[Recommendation]) -> io::Result<Option<String>> {
@@ -218,7 +215,26 @@ pub fn pick_with_history(ctx: &AppContext, items: &[Recommendation]) -> io::Resu
     }
     // Interactive: open the picker even with an empty history. The directory-tree
     // discovery layer -- and the $PWD bootstrap -- give it candidates to show.
-    run_ui(items, Some(ctx))
+    run_ui(items, Some(ctx), None)
+}
+
+pub(crate) struct SearchSetup {
+    pub scan_paths: Vec<String>,
+    pub history_items: Vec<Recommendation>,
+    pub tokens: Vec<String>,
+    pub ignore_re: Option<Regex>,
+    pub context: crate::search::SearchContext,
+}
+
+pub(crate) fn pick_with_search(
+    ctx: &AppContext,
+    items: &[Recommendation],
+    setup: SearchSetup,
+) -> io::Result<Option<String>> {
+    if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
+        return Ok(items.first().map(|item| item.path.clone()));
+    }
+    run_ui(items, Some(ctx), Some(setup))
 }
 
 struct TermGuard {
@@ -597,7 +613,7 @@ fn build_candidates_with_visits(
 }
 
 /// Sort weight for the source tiebreak: smaller ranks first, so History (0)
-/// precedes Discovered (1) whenever the fuzzy score ties.
+/// precedes Discovered (1) whenever match strength ties.
 fn source_rank(source: CandidateSource) -> u8 {
     match source {
         CandidateSource::History => 0,
@@ -696,6 +712,10 @@ struct Filter {
     matcher: Matcher,
     buffer: Vec<char>,
     hide_hidden: bool,
+    cli_or: bool,
+    context: crate::search::SearchContext,
+    #[cfg(test)]
+    query_compilations: std::cell::Cell<usize>,
 }
 
 impl Filter {
@@ -704,6 +724,25 @@ impl Filter {
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             buffer: Vec::new(),
             hide_hidden: false,
+            cli_or: false,
+            #[cfg(test)]
+            query_compilations: std::cell::Cell::new(0),
+            context: crate::search::SearchContext::from_process(
+                env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            ),
+        }
+    }
+
+    fn query(&self, text: &str) -> crate::search::Query {
+        #[cfg(test)]
+        self.query_compilations
+            .set(self.query_compilations.get() + 1);
+        if self.cli_or {
+            crate::search::Query::cli(&crate::search::decode_tokens(text), &self.context)
+        } else {
+            crate::search::Query::interactive(text, &self.context)
         }
     }
 
@@ -717,11 +756,10 @@ impl Filter {
     }
 
     /// An empty query preserves recommendation order (history first, then the
-    /// discovered tree). Fuzzy matches rank by matcher quality, then by source
-    /// (History before Discovered -- a place the user actually visited outranks
-    /// a merely-existing sibling at the same fuzzy score), then by the existing
-    /// recommendation score; stale paths remain after valid paths so they can be
-    /// cleaned up without competing with jump targets.
+    /// discovered tree). Nonempty queries rank literal path intent, basename,
+    /// then ancestor-only matches. Equivalent strength retains History preference;
+    /// discovered ties use shallow structure before neighborhood heat and path length.
+    /// Stale paths remain after valid paths for cleanup without competing with jumps.
     ///
     /// Only the *ranking* score is computed here -- one `pattern.score` pass per
     /// candidate. Match highlight indices are deliberately NOT computed: a query
@@ -730,8 +768,7 @@ impl Filter {
     /// rows only (see `compute_row_highlights`). Dropping the second per-match
     /// pass roughly halves filter cost on wide result sets.
     fn run(&mut self, candidates: &[Candidate], query: &str) -> Vec<Match> {
-        let query = query.trim();
-        if query.is_empty() {
+        if query.trim().is_empty() {
             return candidates
                 .iter()
                 .enumerate()
@@ -740,46 +777,56 @@ impl Filter {
                 .collect();
         }
 
-        let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
-        let mut valid = Vec::new();
-        let mut missing = Vec::new();
-
+        let query = self.query(query);
+        let mut matched = Vec::new();
         for (idx, candidate) in candidates.iter().enumerate() {
             if !self.accepts(candidate) {
                 continue;
             }
-            let haystack = Utf32Str::new(&candidate.raw, &mut self.buffer);
-            let Some(score) = pattern.score(haystack, &mut self.matcher) else {
+            let Some(strength) =
+                query.strength(&candidate.raw, &mut self.matcher, &mut self.buffer)
+            else {
                 continue;
             };
-
-            if candidate.exists {
-                valid.push((score, idx));
-            } else {
-                missing.push(idx);
-            }
+            // Cache numeric structure keys before sorting the potentially 50k pool.
+            matched.push((
+                strength,
+                crate::search::path_depth(&candidate.raw),
+                candidate.raw.len(),
+                idx,
+            ));
         }
-
-        valid.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
+        matched.sort_by(|left, right| {
+            let a = &candidates[left.3];
+            let b = &candidates[right.3];
+            b.exists
+                .cmp(&a.exists)
+                .then_with(|| right.0.cmp(&left.0))
+                .then_with(|| source_rank(a.source).cmp(&source_rank(b.source)))
                 .then_with(|| {
-                    source_rank(candidates[left.1].source)
-                        .cmp(&source_rank(candidates[right.1].source))
+                    if a.source == CandidateSource::Discovered {
+                        left.1.cmp(&right.1)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
                 })
                 .then_with(|| {
-                    candidates[right.1]
-                        .score
-                        .partial_cmp(&candidates[left.1].score)
+                    b.score
+                        .partial_cmp(&a.score)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
+                .then_with(|| {
+                    if a.source == CandidateSource::Discovered {
+                        left.2.cmp(&right.2)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .then_with(|| a.raw.cmp(&b.raw))
         });
-
-        valid
+        matched
             .into_iter()
-            .map(|(_, idx)| Match { idx })
-            .chain(missing.into_iter().map(|idx| Match { idx }))
+            .map(|(_, _, _, idx)| Match { idx })
             .collect()
     }
 }
@@ -787,22 +834,10 @@ impl Filter {
 /// Compute raw match-highlight indices for a single path, on demand. Run only
 /// for on-screen rows (see `Filter::run`'s note), so the O(pool) filter never
 /// pays for highlighting candidates the user will not see.
+#[cfg(test)]
 fn compute_row_highlights(matcher: &mut Matcher, raw: &str, query: &str) -> Vec<u32> {
-    let query = query.trim();
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let mut haystack_buffer = Vec::new();
-    let mut highlights = Vec::new();
-    let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
-    let _ = pattern.indices(
-        Utf32Str::new(raw, &mut haystack_buffer),
-        matcher,
-        &mut highlights,
-    );
-    highlights.sort_unstable();
-    highlights.dedup();
-    highlights
+    crate::search::Query::interactive(query, &crate::search::SearchContext::default())
+        .highlights(raw, matcher)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -935,6 +970,16 @@ struct App {
     /// map to 0. This is the internal ordering key for the discovery layer --
     /// no fabricated frecency, just "how hot is this corner of the tree".
     discover_score_map: HashMap<String, f32>,
+    /// Eligible history identity before query/limit/threshold pruning. Values are
+    /// the latest raw visit, or None for uniq-only entries. Unlike `known_paths`,
+    /// this does not claim the row is already in the pool, so scanning can restore
+    /// pruned history without relabeling it as a never-visited discovery.
+    history_visits: HashMap<String, Option<i64>>,
+    /// Full-history scores/existence, captured by the recommendation read pass.
+    history_scores: HashMap<String, (f32, bool)>,
+    /// Safe history outside the startup recommendation. Promoted on the first
+    /// query edit/clear, independent of discovery; initial limit/threshold remain.
+    pending_history: Vec<Candidate>,
     /// `$HOME` for abbreviating paths at render time, captured once.
     home: Option<String>,
     /// Fingerprints (see `path_fingerprint`) of the normalized raw paths already
@@ -943,9 +988,9 @@ struct App {
     /// per-candidate memory bill — see `path_fingerprint` for the trade-off.
     known_paths: HashSet<u64>,
     /// Index where the discovered slice begins in `candidates` (== the history
-    /// count). The prefix `[0, discovered_start)` is history in frecency order
-    /// and never reordered; the suffix is the discovery layer, kept sorted by
-    /// (score desc, path asc) so the empty-query view is deterministic.
+    /// count). The prefix keeps initial recommendation order, with any pruned
+    /// history recovered by scanning appended per drain. The suffix is the
+    /// discovery layer, kept sorted by (depth, heat desc, length, path).
     discovered_start: usize,
     /// User exclusion list, subtree semantics. Nothing under an excluded root
     /// reaches the pool: history candidates are filtered at startup, discovered
@@ -1024,6 +1069,11 @@ impl App {
             .map(|candidate| path_fingerprint(&candidate.raw))
             .collect::<HashSet<_>>();
         let discovered_start = candidates.len();
+        let history_visits = candidates
+            .iter()
+            .filter(|candidate| candidate.source == CandidateSource::History)
+            .map(|candidate| (normalize_path(&candidate.raw), candidate.last_visit))
+            .collect();
         let mut app = Self {
             settings: loaded.settings,
             language,
@@ -1060,6 +1110,9 @@ impl App {
             corner_3d_env: env_flag_enabled("CDH_CORNER_3D", true),
             discover_rx: Vec::new(),
             discover_score_map: HashMap::new(),
+            history_visits,
+            history_scores: HashMap::new(),
+            pending_history: Vec::new(),
             home: env::var("HOME").ok().filter(|home| !home.is_empty()),
             known_paths,
             discovered_start,
@@ -1171,6 +1224,8 @@ impl App {
             exclude_roots: self.excludes.roots(),
             home: self.home.as_deref(),
             query: &self.query,
+            cli_or: self.filter.cli_or,
+            search_context: &self.filter.context,
             query_cursor: self.query_cursor,
             results: &self.filtered_results,
             candidates: &self.candidates,
@@ -1237,6 +1292,7 @@ impl App {
     fn ingest_discovered(&mut self, batches: Vec<Vec<String>>) -> bool {
         let selected_path = self.selected_raw();
         let mut added = false;
+        let mut restored_history = Vec::new();
         for batch in batches {
             for raw in batch {
                 // Checked before the fingerprint insert so a filtered path stays
@@ -1255,31 +1311,57 @@ impl App {
                     // History or an earlier discovery already owns this path.
                     continue;
                 }
-                let score = parent_dir(&raw)
-                    .and_then(|parent| self.discover_score_map.get(&parent).copied())
-                    .unwrap_or(0.0);
-                self.candidates.push(Candidate {
-                    raw,
-                    score,
-                    exists: true,
-                    last_visit: None,
-                    source: CandidateSource::Discovered,
-                });
+                if let Some(&last_visit) = self.history_visits.get(normalized_path_str(&raw)) {
+                    let (score, exists) = self
+                        .history_scores
+                        .get(normalized_path_str(&raw))
+                        .copied()
+                        .unwrap_or((0.0, true));
+                    restored_history.push(Candidate {
+                        raw,
+                        score,
+                        exists,
+                        last_visit,
+                        source: CandidateSource::History,
+                    });
+                } else {
+                    let score = parent_dir(&raw)
+                        .and_then(|parent| self.discover_score_map.get(&parent).copied())
+                        .unwrap_or(0.0);
+                    self.candidates.push(Candidate {
+                        raw,
+                        score,
+                        exists: true,
+                        last_visit: None,
+                        source: CandidateSource::Discovered,
+                    });
+                }
                 added = true;
             }
         }
         if !added {
             return false;
         }
-        // Keep the discovered suffix ordered by (score desc, path asc): the empty
-        // query renders candidates in vec order and the history prefix must stay
-        // untouched, so only the suffix is (re)sorted.
-        self.candidates[self.discovered_start..].sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.raw.cmp(&right.raw))
+        // One splice per drain, not one O(pool) insertion per restored row.
+        // Keep the original recommendation prefix untouched; recovered history
+        // joins its end, outside the structure-sorted discovery suffix.
+        restored_history.sort_by(|a, b| a.raw.cmp(&b.raw));
+        let restored_count = restored_history.len();
+        self.candidates.splice(
+            self.discovered_start..self.discovered_start,
+            restored_history,
+        );
+        self.discovered_start += restored_count;
+        // Empty queries render vec order: preserve the history prefix and sort
+        // only discovery by depth, neighborhood heat, length, then lexical path.
+        // Nonnegative finite f32 scores have monotonically ordered bit patterns.
+        self.candidates[self.discovered_start..].sort_by_cached_key(|candidate| {
+            (
+                crate::search::path_depth(&candidate.raw),
+                std::cmp::Reverse(candidate.score.clamp(0.0, 1.0).to_bits()),
+                candidate.raw.len(),
+                candidate.raw.clone(),
+            )
         });
         self.filtered_results = self.filter.run(&self.candidates, &self.query);
         self.restore_selected_path(selected_path.as_deref());
@@ -1314,7 +1396,43 @@ impl App {
         self.ingest_discovered(vec![seeds]);
     }
 
+    fn set_cli_query(&mut self, tokens: &[String], context: crate::search::SearchContext) {
+        self.filter.context = context;
+        self.filter.cli_or = !tokens.is_empty();
+        self.query = crate::search::encode_tokens(tokens);
+        self.query_cursor = self.query_grapheme_count();
+        self.recompute_after_query_change();
+    }
+
+    fn restore_pending_history(&mut self) {
+        if self.pending_history.is_empty() {
+            return;
+        }
+        let restored = std::mem::take(&mut self.pending_history)
+            .into_iter()
+            .filter(|candidate| {
+                !self.excludes.contains(&candidate.raw)
+                    && !self
+                        .ignore_re
+                        .as_ref()
+                        .is_some_and(|rx| rx.is_match(&candidate.raw))
+                    && self
+                        .history_visits
+                        .contains_key(normalized_path_str(&candidate.raw))
+                    && self.known_paths.insert(path_fingerprint(&candidate.raw))
+            })
+            .collect::<Vec<_>>();
+        let count = restored.len();
+        self.candidates
+            .splice(self.discovered_start..self.discovered_start, restored);
+        self.discovered_start += count;
+    }
+
     fn recompute_after_query_change(&mut self) {
+        self.restore_pending_history();
+        if self.query.is_empty() {
+            self.filter.cli_or = false;
+        }
         self.clamp_query_cursor();
         self.filtered_results = self.filter.run(&self.candidates, &self.query);
         self.selected_index = 0;
@@ -1385,7 +1503,7 @@ impl App {
     }
 
     fn clear_query(&mut self) -> bool {
-        if self.query.is_empty() {
+        if self.query.is_empty() && self.pending_history.is_empty() {
             self.query_cursor = 0;
             return false;
         }
@@ -1907,7 +2025,79 @@ fn mouse_state_label(language: Language, enabled: bool) -> &'static str {
     }
 }
 
-fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Option<String>> {
+fn build_search_app(
+    items: &[Recommendation],
+    last_visits: &HashMap<String, i64>,
+    loaded: SettingsLoad,
+    locale_language: Language,
+    excludes: Excludes,
+    setup: SearchSetup,
+) -> (App, Vec<String>) {
+    let accepted = |path: &str| {
+        !excludes.contains(path) && !setup.ignore_re.as_ref().is_some_and(|rx| rx.is_match(path))
+    };
+    let items: Vec<_> = items
+        .iter()
+        .filter(|item| accepted(&item.path))
+        .cloned()
+        .collect();
+    let scan_paths: Vec<String> = setup
+        .scan_paths
+        .into_iter()
+        .filter(|path| accepted(path))
+        .collect();
+    let history_scores = setup
+        .history_items
+        .into_iter()
+        .filter(|item| accepted(&item.path))
+        .map(|item| {
+            (
+                normalize_path(&item.path),
+                (item.score.clamp(0.0, 1.0) as f32, item.exists),
+            )
+        })
+        .collect();
+    let mut app = App::new(
+        build_candidates_with_visits(&items, last_visits),
+        loaded,
+        locale_language,
+    );
+    app.excludes = excludes;
+    app.ignore_re = setup.ignore_re;
+    app.discover_score_map = build_score_map(&items);
+    app.history_visits.extend(
+        scan_paths
+            .iter()
+            .map(|path| (normalize_path(path), last_visits.get(path).copied())),
+    );
+    app.set_cli_query(&setup.tokens, setup.context);
+    // Install the reserve after startup filtering: limit/threshold still control
+    // the initial recommendation prefix, not the lifetime searchable history.
+    app.history_scores = history_scores;
+    app.pending_history = scan_paths
+        .iter()
+        .filter_map(|path| {
+            if app.known_paths.contains(&path_fingerprint(path)) {
+                return None;
+            }
+            let &(score, exists) = app.history_scores.get(normalized_path_str(path))?;
+            Some(Candidate {
+                raw: path.clone(),
+                score,
+                exists,
+                last_visit: last_visits.get(path).copied(),
+                source: CandidateSource::History,
+            })
+        })
+        .collect();
+    (app, scan_paths)
+}
+
+fn run_ui(
+    items: &[Recommendation],
+    ctx: Option<&AppContext>,
+    setup: Option<SearchSetup>,
+) -> io::Result<Option<String>> {
     let last_visits = load_last_visits(ctx);
     let config_dir = ctx
         .map(|context| context.paths.config_dir.clone())
@@ -1922,29 +2112,27 @@ fn run_ui(items: &[Recommendation], ctx: Option<&AppContext>) -> io::Result<Opti
     let excludes = ctx
         .map(|context| Excludes::load(&context.paths.excludes))
         .unwrap_or_default();
-    let items: Vec<Recommendation> = items
-        .iter()
-        .filter(|item| !excludes.contains(&item.path))
-        .cloned()
-        .collect();
-
-    let mut app = App::new(
-        build_candidates_with_visits(&items, &last_visits),
+    let setup = setup.unwrap_or_else(|| SearchSetup {
+        scan_paths: items.iter().map(|item| item.path.clone()).collect(),
+        history_items: Vec::new(),
+        tokens: Vec::new(),
+        ignore_re: ctx.and_then(|context| context.config.ignore_re.clone()),
+        context: crate::search::SearchContext::from_process(
+            env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned()),
+        ),
+    });
+    let (mut app, scan_paths) = build_search_app(
+        items,
+        &last_visits,
         loaded,
         locale_language,
+        excludes,
+        setup,
     );
-    app.excludes = excludes;
-    app.ignore_re = ctx.and_then(|context| context.config.ignore_re.clone());
-
-    // Wire up the directory-tree discovery layer. The score map orders the
-    // discovered candidates; the scan worker streams new paths in on a channel
-    // and takes the exclusion list as a prune set, so excluded subtrees cost no
-    // I/O at all rather than being filtered out after the fact.
-    app.discover_score_map = build_score_map(&items);
-    app.discover_rx.extend(discover::spawn(
-        items.iter().map(|item| item.path.clone()).collect(),
-        app.excludes.prune_set(),
-    ));
+    app.discover_rx
+        .extend(discover::spawn(scan_paths, app.excludes.prune_set()));
     // Empty-history bootstrap: seed from $PWD before the loop so the first frame
     // isn't blank while the full scan spins up.
     if app.candidates.is_empty() {
@@ -2213,6 +2401,11 @@ fn handle_key_confirm_delete(
             ));
             return None;
         }
+        // Un-excluding later only restores visibility, not deleted history.
+        app.history_visits.remove(normalized_path_str(&path));
+        app.history_scores.remove(normalized_path_str(&path));
+        app.pending_history
+            .retain(|candidate| normalized_path_str(&candidate.raw) != normalized_path_str(&path));
     }
     match excludes::add(&ctx.paths.excludes, &path) {
         Ok(excludes) => {
@@ -2521,6 +2714,8 @@ struct FrameView<'a> {
     exclude_roots: &'a [String],
     home: Option<&'a str>,
     query: &'a str,
+    cli_or: bool,
+    search_context: &'a crate::search::SearchContext,
     query_cursor: usize,
     results: &'a [Match],
     candidates: &'a [Candidate],
@@ -2624,6 +2819,11 @@ fn screen_overlay_area(full: Rect, corner: Option<Rect>) -> Rect {
 fn render_header(frame: &mut Frame, view: &FrameView, theme: &Theme, area: Rect) {
     let title = "cdh";
     let summary = view.page.summary(view.results.len(), view.language);
+    let summary = if view.cli_or {
+        format!("OR · {summary}")
+    } else {
+        summary
+    };
     let title_width = UnicodeWidthStr::width(title);
     let summary_width = UnicodeWidthStr::width(summary.as_str());
     let width = area.width as usize;
@@ -2826,12 +3026,20 @@ fn render_list(frame: &mut Frame, view: &FrameView, theme: &Theme, area: Rect) -
     // candidate. See `Filter::run` and `Candidate::display`.
     let home = view.home;
     let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+    let query = if view.cli_or {
+        crate::search::Query::cli(
+            &crate::search::decode_tokens(view.query),
+            view.search_context,
+        )
+    } else {
+        crate::search::Query::interactive(view.query, view.search_context)
+    };
     let mut lines = Vec::with_capacity(page.end - page.start);
     for (offset, matched) in view.results[page.start..page.end].iter().enumerate() {
         let index = page.start + offset;
         let candidate = &view.candidates[matched.idx];
         let highlights = if candidate.exists {
-            compute_row_highlights(&mut matcher, &candidate.raw, view.query)
+            query.highlights(&candidate.raw, &mut matcher)
         } else {
             Vec::new()
         };

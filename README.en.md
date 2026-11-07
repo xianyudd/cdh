@@ -235,7 +235,13 @@ cdh -h
 * `--ignore-re <re>` — regex of paths to ignore (defaults to `CDH_IGNORE_RE`, e.g. to skip `.git`);
 * `--no-check-dir` — do not check that a directory still exists (handy when history is shared across machines).
 
-Note that `cdh -h` prints its help text in Chinese; the list above is all of it.
+Positional arguments use case-insensitive literal **OR**: `cdh alpha beta` accepts either word, while `cdh "alpha beta"` preserves one space-containing argument. The TUI starts with that query and an OR marker. Double quotes/backslashes preserve token boundaries; edits stay OR until the query is cleared (e.g. `Ctrl+U`), then the original nucleo fuzzy syntax resumes (space-separated AND and explicit operators). CLI tokens do not interpret fuzzy operators.
+
+Bare absolute paths, `~`/`~/`, `./`/`../` resolve lexically against startup HOME/cwd and match only literal exact/prefix paths, never unrelated fuzzy paths. `~user` is not expanded; ordinary `a/b` remains full-path fuzzy in interactive mode. The final component may complete; a trailing slash enforces directory boundaries (`/a/pro/` excludes `/a/project`). Queries do not canonicalize, follow symlinks, or expand scan roots.
+
+Nonempty searches rank path intent, then directory-name matches, then ancestor-only matches. Equivalent matches retain history preference; discovered ties use depth, neighborhood heat, length and lexical order, never directory-purpose weights. Discovery roots use all eligible history independently of the query, `--limit` and `--threshold`; those options only trim history recommendations. Non-TTY output remains history-only: its best recommendation without a newline, or exit 2 with no history match, without scanning.
+
+Help follows the same language preference as the TUI.
 
 Exit codes: `0` — a directory was selected and printed; `1` — cancelled (`Esc` /
 `Ctrl+C`) or a TUI render error; `2` — no candidates available (empty history, or
