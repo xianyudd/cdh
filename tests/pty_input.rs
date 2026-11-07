@@ -73,10 +73,12 @@ impl TestDir {
             .unwrap()
             .as_nanos();
         let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "cdh-pty-{name}-{}-{timestamp}-{sequence}",
-            process::id()
-        ));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scratch")
+            .join(format!(
+                "cdh-pty-{name}-{}-{timestamp}-{sequence}",
+                process::id()
+            ));
         fs::create_dir_all(&root).unwrap();
         Self { root }
     }
@@ -145,6 +147,87 @@ fn stream_contains(state: &Mutex<StreamState>, needle: &[u8]) -> bool {
         .bytes
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+// Ratatui emits cursor-addressed diffs, not complete frames: stripping ANSI would
+// miss retained cells and whitespace. Replay its absolute-address/style subset.
+fn stream_plain_contains(state: &Mutex<StreamState>, needle: &[u8]) -> bool {
+    use unicode_width::UnicodeWidthChar;
+    let state = state.lock().unwrap();
+    let text = String::from_utf8_lossy(&state.bytes);
+    let mut chars = text.chars().peekable();
+    let mut cells = vec![vec![" ".to_string(); COLS as usize]; ROWS as usize];
+    let (mut row, mut col) = (0usize, 0usize);
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            let mut args = String::new();
+            let mut final_char = None;
+            for ch in chars.by_ref() {
+                if ('@'..='~').contains(&ch) {
+                    final_char = Some(ch);
+                    break;
+                }
+                args.push(ch);
+            }
+            let numbers: Vec<usize> = args.split(';').map(|n| n.parse().unwrap_or(0)).collect();
+            match final_char {
+                Some('H' | 'f') => {
+                    row = numbers.first().copied().unwrap_or(1).max(1) - 1;
+                    col = numbers.get(1).copied().unwrap_or(1).max(1) - 1;
+                }
+                Some('J') if numbers.first() == Some(&2) => {
+                    for line in &mut cells {
+                        line.fill(" ".into());
+                    }
+                }
+                _ => {} // styles and mode changes do not occupy cells
+            }
+        } else if ch == '\r' {
+            col = 0;
+        } else if ch == '\n' {
+            row += 1;
+        } else if !ch.is_control() {
+            let width = ch.width().unwrap_or(0);
+            if row < cells.len() && col < COLS as usize {
+                if width == 0 && col > 0 {
+                    cells[row][col - 1].push(ch);
+                } else {
+                    cells[row][col] = ch.to_string();
+                    if width == 2 && col + 1 < COLS as usize {
+                        cells[row][col + 1].clear();
+                    }
+                }
+            }
+            col += width;
+        }
+    }
+    let screen = cells
+        .into_iter()
+        .map(|line| line.concat())
+        .collect::<Vec<_>>()
+        .join("\n");
+    screen
+        .as_bytes()
+        .windows(needle.len())
+        .any(|part| part == needle)
+}
+
+#[test]
+fn terminal_snapshot_preserves_spaces_unicode_and_incremental_overwrites() {
+    let state = Mutex::new(StreamState {
+        bytes: b"\x1b[1;1HPage 0/0\x1b[1;6H1\x1b[1;8H1\x1b[2;1Halpha\x1b[2;7Hbeta".to_vec(),
+        closed: false,
+    });
+    assert!(stream_plain_contains(&state, b"Page 1/1"));
+    assert!(stream_plain_contains(&state, b"alpha beta"));
+    assert!(!stream_plain_contains(&state, b"Page 0/0"));
+    state
+        .lock()
+        .unwrap()
+        .bytes
+        .extend_from_slice("\x1b[3;1H目录 space".as_bytes());
+    assert!(stream_plain_contains(&state, "目录 space".as_bytes()));
 }
 
 fn stream_position(state: &Mutex<StreamState>, needle: &[u8]) -> Option<usize> {
@@ -238,6 +321,33 @@ impl Drop for PtySession {
 }
 
 fn spawn_cdh_on_pty(label: &str) -> (TestDir, Fixture, PtySession) {
+    spawn_search_on_pty(label, &[], false)
+}
+
+fn spawn_search_on_pty(
+    label: &str,
+    args: &[&str],
+    discovery: bool,
+) -> (TestDir, Fixture, PtySession) {
+    spawn_search_options(label, args, discovery, false)
+}
+
+fn spawn_search_options(
+    label: &str,
+    args: &[&str],
+    discovery: bool,
+    protect: bool,
+) -> (TestDir, Fixture, PtySession) {
+    spawn_search_fixture(label, args, discovery, protect, |_| {})
+}
+
+fn spawn_search_fixture(
+    label: &str,
+    args: &[&str],
+    discovery: bool,
+    protect: bool,
+    prepare: impl FnOnce(&Path),
+) -> (TestDir, Fixture, PtySession) {
     let test_dir = TestDir::new(label);
     let home = test_dir.root.join("home");
     let config_home = test_dir.root.join("config");
@@ -277,6 +387,45 @@ fn spawn_cdh_on_pty(label: &str) -> (TestDir, Fixture, PtySession) {
     )
     .unwrap();
 
+    if discovery {
+        fs::create_dir_all(dirs.join("needle")).unwrap();
+        fs::create_dir_all(home.join("needle-ancestor/child")).unwrap();
+        // HOME hit alone cannot reveal the never-visited external sibling.
+        fs::write(
+            history_dir.join("history_uniq"),
+            format!(
+                "{}\n{}\n",
+                alpha.display(),
+                home.join("needle-ancestor/child").display()
+            ),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(dirs.join("alpha beta")).unwrap();
+    if args.contains(&"alpha beta") {
+        fs::write(
+            history_dir.join("history_uniq"),
+            format!(
+                "{}\n{}\n{}\n",
+                alpha.display(),
+                beta.display(),
+                dirs.join("alpha beta").display()
+            ),
+        )
+        .unwrap();
+    }
+    if protect || args.contains(&"/needle$") {
+        fs::create_dir_all(dirs.join("needle-allowed")).unwrap();
+    }
+    if protect {
+        fs::write(
+            data_home.join("cdh/excludes"),
+            format!("{}\n", dirs.join("needle").display()),
+        )
+        .unwrap();
+    }
+
+    prepare(&test_dir.root);
     let stdout_path = test_dir.root.join("stdout");
 
     let pty_system = native_pty_system();
@@ -291,9 +440,20 @@ fn spawn_cdh_on_pty(label: &str) -> (TestDir, Fixture, PtySession) {
 
     let mut cmd = CommandBuilder::new("/bin/sh");
     cmd.arg("-c");
-    cmd.arg("exec \"$0\" >\"$1\"");
+    cmd.arg("out=$1; shift; exec \"$0\" \"$@\" >\"$out\"");
     cmd.arg(env!("CARGO_BIN_EXE_cdh"));
     cmd.arg(&stdout_path);
+    for arg in args {
+        if *arg == "{absolute-target}" {
+            fs::create_dir_all(home.join("目录 space")).unwrap();
+            cmd.arg(home.join("目录 space"));
+        } else {
+            cmd.arg(arg);
+        }
+    }
+    if args.contains(&"~/目录 space") || args.contains(&"../home/目录 space") {
+        fs::create_dir_all(home.join("目录 space")).unwrap();
+    }
     cmd.cwd(&current_dir);
     // 全新环境：路径全指临时目录，可能泄进来的 CDH_* 一并清掉。
     cmd.env_clear();
@@ -307,7 +467,9 @@ fn spawn_cdh_on_pty(label: &str) -> (TestDir, Fixture, PtySession) {
     cmd.env("TERM", "xterm-256color");
     // 候选池钉死为夹具两行：发现层会异步并入扫描结果、搅动列表排序，
     // 而这里要钉的是输入路径。发现层有自己的契约测试。
-    cmd.env("CDH_DISCOVER", "0");
+    cmd.env("CDH_DISCOVER", if discovery { "1" } else { "0" });
+    cmd.env("CDH_CORNER_3D", "0");
+    cmd.env("CDH_COLOR", "0");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     // 父进程侧的 slave 句柄关掉：子进程持有自己的副本，父侧不关的话
@@ -331,6 +493,325 @@ fn spawn_cdh_on_pty(label: &str) -> (TestDir, Fixture, PtySession) {
             stdout_path,
         },
     )
+}
+
+#[test]
+fn absolute_tilde_relative_unicode_space_paths_select_literal_target_on_pty() {
+    for query in ["{absolute-target}", "~/目录 space", "../home/目录 space"] {
+        let (dir, _fixture, mut session) = spawn_search_on_pty("path-intent", &[query], true);
+        session.wait_ready();
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        while !stream_plain_contains(&session.state, b"1/1") {
+            assert!(
+                Instant::now() < deadline,
+                "literal target never reached first page: {:?}",
+                String::from_utf8_lossy(&session.state.lock().unwrap().bytes)
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+        session.send(b"\x1b[H\r");
+        assert_eq!(session.wait_exit().exit_code(), 0);
+        assert_eq!(
+            session.selection(),
+            path_bytes(&dir.root.join("home/目录 space"))
+        );
+    }
+}
+
+#[test]
+fn cli_multi_tokens_stay_or_and_quoted_spaces_stay_one_token_on_pty() {
+    let (_dir, fixture, mut session) = spawn_search_on_pty("tokens", &["alpha", "beta"], false);
+    session.wait_ready();
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    while !stream_plain_contains(&session.state, b"/beta") {
+        assert!(
+            Instant::now() < deadline,
+            "OR did not retain beta-only history"
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
+    session.send(b"\x1b[B\r");
+    assert_eq!(session.wait_exit().exit_code(), 0);
+    assert_eq!(session.selection(), fixture.beta_bytes());
+    let (_dir, fixture, mut session) = spawn_search_on_pty("quoted", &["alpha beta"], false);
+    session.wait_ready();
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    while !stream_plain_contains(&session.state, b"1/1")
+        || !stream_plain_contains(&session.state, b"\"alpha beta\"")
+    {
+        assert!(Instant::now() < deadline, "quoted argv boundary missing");
+        thread::sleep(POLL_INTERVAL);
+    }
+    session.send(b"\r");
+    assert_eq!(session.wait_exit().exit_code(), 0);
+    assert_eq!(
+        session.selection(),
+        path_bytes(&fixture.alpha.parent().unwrap().join("alpha beta"))
+    );
+}
+
+#[test]
+fn cli_ignore_override_and_excludes_protect_discovery_on_pty() {
+    for protect in [false, true] {
+        let args = if protect {
+            vec!["needle"]
+        } else {
+            vec!["--ignore-re", "/needle$", "needle"]
+        };
+        let (dir, fixture, mut session) = spawn_search_options("protected", &args, true, protect);
+        let history = dir.root.join("data/cdh/history/history_uniq");
+        let before = fs::read(&history).unwrap();
+        session.wait_ready();
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        while !stream_plain_contains(&session.state, b"dirs/needle-allowed") {
+            assert!(
+                Instant::now() < deadline,
+                "allowed discovery never reached picker"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+        session.send(b"\x1b[H\r");
+        assert_eq!(session.wait_exit().exit_code(), 0);
+        assert_eq!(
+            session.selection(),
+            path_bytes(&fixture.alpha.parent().unwrap().join("needle-allowed"))
+        );
+        assert_eq!(fs::read(history).unwrap(), before);
+        if protect {
+            assert_eq!(
+                fs::read_to_string(dir.root.join("data/cdh/excludes")).unwrap(),
+                format!(
+                    "{}\n",
+                    fixture.alpha.parent().unwrap().join("needle").display()
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn non_tty_query_remains_history_only_with_no_newline_or_state_changes() {
+    let dir = TestDir::new("non-tty-search");
+    let home = dir.root.join("home");
+    let history = dir.root.join("data/cdh/history");
+    let alpha = home.join("alpha");
+    for path in [
+        &alpha,
+        &home.join("needle"),
+        &history,
+        &dir.root.join("cwd"),
+    ] {
+        fs::create_dir_all(path).unwrap();
+    }
+    fs::write(
+        history.join("history_raw"),
+        format!("1000\t{}\n", alpha.display()),
+    )
+    .unwrap();
+    fs::write(
+        history.join("history_uniq"),
+        format!("{}\n", alpha.display()),
+    )
+    .unwrap();
+    let before_raw = fs::read(history.join("history_raw")).unwrap();
+    let before_uniq = fs::read(history.join("history_uniq")).unwrap();
+    for (query, code, expected) in [("needle", 2, Vec::new()), ("alpha", 0, path_bytes(&alpha))] {
+        let output = process::Command::new(env!("CARGO_BIN_EXE_cdh"))
+            .arg(query)
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", dir.root.join("config"))
+            .env("XDG_DATA_HOME", dir.root.join("data"))
+            .env("XDG_STATE_HOME", dir.root.join("state"))
+            .env("XDG_CACHE_HOME", dir.root.join("cache"))
+            .env("CDH_DISCOVER", "1")
+            .current_dir(dir.root.join("cwd"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code));
+        assert_eq!(output.stdout, expected);
+    }
+    assert_eq!(fs::read(history.join("history_raw")).unwrap(), before_raw);
+    assert_eq!(fs::read(history.join("history_uniq")).unwrap(), before_uniq);
+    assert!(!dir.root.join("config/cdh/tui.toml").exists());
+    assert!(!dir.root.join("data/cdh/excludes").exists());
+}
+
+#[test]
+fn search_regression_cli_query_is_visible_before_typing() {
+    let (_dir, fixture, mut session) = spawn_search_on_pty("handoff", &["beta"], false);
+    session.wait_ready();
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    while !stream_contains(&session.state, b"OR") {
+        assert!(Instant::now() < deadline, "CLI OR query marker missing");
+        thread::sleep(POLL_INTERVAL);
+    }
+    session.send(b"\r");
+    assert_eq!(session.wait_exit().exit_code(), 0);
+    assert_eq!(session.selection(), fixture.beta_bytes());
+}
+
+#[test]
+fn search_regression_discovery_survives_query_limit_and_threshold() {
+    for args in [
+        vec!["needle"],
+        vec!["--limit", "1", "needle"],
+        vec!["--threshold", "2", "needle"],
+    ] {
+        let (_dir, fixture, mut session) = spawn_search_on_pty("roots", &args, true);
+        session.wait_ready();
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        // Rendered basename is contiguous even with ANSI styles; full raw paths need not be.
+        while !stream_contains(&session.state, b"needle") || !stream_contains(&session.state, b"OR")
+        {
+            assert!(Instant::now() < deadline, "initial CLI query missing");
+            thread::sleep(POLL_INTERVAL);
+        }
+        // Wait for the visible discovered basename+parent to prove a batch reached the UI.
+        while !stream_plain_contains(&session.state, b"dirs/needle") {
+            assert!(
+                Instant::now() < deadline,
+                "external sibling was not discovered"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+        // Discovery intentionally preserves the selected path, so explicitly move to the new top.
+        session.send(b"\x1b[H\r");
+        assert_eq!(session.wait_exit().exit_code(), 0);
+        assert_eq!(
+            session.selection(),
+            path_bytes(&fixture.alpha.parent().unwrap().join("needle"))
+        );
+    }
+}
+
+#[test]
+fn rediscovered_pruned_history_keeps_preference_on_pty() {
+    for args in [
+        vec!["target"], // positive control: identity was not pruned
+        vec!["seed"],
+        vec!["--limit", "1"],
+        vec!["--threshold", "2", "target"],
+    ] {
+        let (dir, _fixture, mut session) =
+            spawn_search_fixture("pruned-history", &args, true, false, |root| {
+                let home = root.join("home");
+                let seed = home.join("seed");
+                let visited = home.join("long/deep/target");
+                for path in [&seed, &visited, &home.join("target")] {
+                    fs::create_dir_all(path).unwrap();
+                }
+                let history = root.join("data/cdh/history");
+                fs::write(
+                    history.join("history_raw"),
+                    format!("100\t{}\n200\t{}\n", visited.display(), seed.display()),
+                )
+                .unwrap();
+                fs::write(
+                    history.join("history_uniq"),
+                    format!("{}\n{}\n", visited.display(), seed.display()),
+                )
+                .unwrap();
+            });
+        let history = dir.root.join("data/cdh/history");
+        let before_raw = fs::read(history.join("history_raw")).unwrap();
+        let before_uniq = fs::read(history.join("history_uniq")).unwrap();
+        session.wait_ready();
+        session.send(b"\x15target"); // Ctrl+U clears CLI OR and searches interactively.
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        while !stream_plain_contains(&session.state, b"long/deep/target")
+            || !stream_plain_contains(&session.state, b"~/target")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "both target paths must be visible before selection: {}",
+                debug_tail(&session.state)
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+        session.send(b"\x1b[H\r");
+        assert_eq!(session.wait_exit().exit_code(), 0);
+        assert_eq!(session.selection(), path_bytes(&dir.root.join("home/long/deep/target")), "visited target must outrank equally strong shallow discovery after launch with {args:?}");
+        assert_eq!(fs::read(history.join("history_raw")).unwrap(), before_raw);
+        assert_eq!(fs::read(history.join("history_uniq")).unwrap(), before_uniq);
+    }
+}
+
+fn unscanned_history_returns_on_pty(label: &str, discovery: bool, target: &str, symlink: bool) {
+    for args in [
+        vec![target],
+        vec!["seed"],
+        vec!["--limit", "1"],
+        vec!["--threshold", "2", "seed"],
+    ] {
+        let (dir, _fixture, mut session) =
+            spawn_search_fixture(label, &args, discovery, false, |root| {
+                let home = root.join("home");
+                let seed = home.join("seed");
+                let visited = home.join(target);
+                fs::create_dir_all(&seed).unwrap();
+                if symlink {
+                    fs::create_dir_all(root.join("link-destination")).unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(root.join("link-destination"), &visited).unwrap();
+                } else {
+                    fs::create_dir_all(&visited).unwrap();
+                }
+                let history = root.join("data/cdh/history");
+                fs::write(
+                    history.join("history_raw"),
+                    format!("100\t{}\n200\t{}\n", visited.display(), seed.display()),
+                )
+                .unwrap();
+                fs::write(
+                    history.join("history_uniq"),
+                    format!("{}\n{}\n", visited.display(), seed.display()),
+                )
+                .unwrap();
+            });
+        let history = dir.root.join("data/cdh/history");
+        let before_raw = fs::read(history.join("history_raw")).unwrap();
+        let before_uniq = fs::read(history.join("history_uniq")).unwrap();
+        session.wait_ready();
+        // The direct-query launch is a positive control for history eligibility.
+        if args != vec![target] {
+            session.send(format!("\x15{target}").as_bytes());
+        }
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        let visible = format!("~/{target}");
+        while !stream_plain_contains(&session.state, visible.as_bytes()) {
+            assert!(
+                Instant::now() < deadline,
+                "safe history must return with {args:?}: {}",
+                debug_tail(&session.state)
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+        session.send(b"\x1b[H\r");
+        assert_eq!(session.wait_exit().exit_code(), 0);
+        assert_eq!(
+            session.selection(),
+            path_bytes(&dir.root.join("home").join(target))
+        );
+        assert_eq!(fs::read(history.join("history_raw")).unwrap(), before_raw);
+        assert_eq!(fs::read(history.join("history_uniq")).unwrap(), before_uniq);
+    }
+}
+
+#[test]
+fn cleared_query_returns_history_with_discovery_disabled_on_pty() {
+    unscanned_history_returns_on_pty("unscanned-disabled", false, "offline-target", false);
+}
+
+#[test]
+fn cleared_query_returns_scanner_pruned_history_on_pty() {
+    unscanned_history_returns_on_pty("unscanned-pruned", true, "node_modules", false);
+}
+
+#[test]
+#[cfg(unix)]
+fn cleared_query_returns_directory_symlink_history_on_pty() {
+    unscanned_history_returns_on_pty("unscanned-symlink", true, "linked-target", true);
 }
 
 #[test]

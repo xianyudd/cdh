@@ -1,7 +1,8 @@
 use crate::history; // 历史子系统
 use crate::picker;
+use crate::recommend::prepare_recommendations;
 use crate::AppContext;
-use crate::{recommend, RecommendOpt};
+use crate::RecommendOpt;
 
 use regex::Regex;
 use std::env;
@@ -139,10 +140,10 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
                 return 0;
             }
             _ => {
-                // 关键字过滤 token
-                let token = a.trim();
-                if !token.is_empty() {
-                    opt.tokens.push(token.to_string());
+                // 关键字过滤 token：只丢弃纯空白参数，push 原始 argv 保留参数边界
+                // （如 "alpha beta" 词内空格原样保留），空白参数等同空查询
+                if !a.trim().is_empty() {
+                    opt.tokens.push(a);
                 }
             }
         }
@@ -150,7 +151,8 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
 
     // 3) 计算推荐路径（推荐算法完全由 recommend 控制）
     //    注意：这里保留 Recommendation（含融合分 score），交给 TUI 渲染分数条。
-    let items = recommend(&opt);
+    let input = prepare_recommendations(&opt, interactive);
+    let items = input.items;
     // 空历史：非交互仍退 2（契约不变）；交互则照常打开 picker——目录树发现层
     // 与 $PWD 自举会给它候选，历史为空也能模糊搜索没 cd 过的目录。
     if items.is_empty() && !interactive {
@@ -158,7 +160,17 @@ fn run_with_args(ctx: &AppContext, args: impl Iterator<Item = String>) -> i32 {
     }
 
     // 4) 打开 TUI 选择（非交互环境时 picker 会直接返回第一项）
-    match picker::pick_with_history(ctx, &items) {
+    match picker::pick_with_search(
+        ctx,
+        &items,
+        picker::SearchSetup {
+            scan_paths: input.scan_paths,
+            history_items: input.history_items,
+            tokens: opt.tokens,
+            ignore_re: opt.ignore_re,
+            context: crate::search::SearchContext::from_process(opt.pwd),
+        },
+    ) {
         Ok(Some(sel)) => {
             // 与 Fish 集成友好：不换行，避免命令替换多出 \n
             print!("{sel}");

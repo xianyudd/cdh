@@ -291,7 +291,9 @@ impl Language {
       --ignore-re <re>   忽略路径正则（默认取 ENV:CDH_IGNORE_RE）
       --no-check-dir     不检查目录是否存在（默认检查，可用 CDH_CHECK_DIR=false 关闭）
 
-  其余位置参数作为过滤关键字（大小写不敏感，命中任一即可）",
+  其余位置参数作为过滤关键字（大小写不敏感，命中任一即可）
+  TUI 保留参数边界与 OR；引号保护含空格参数，编辑仍为 OR，清空后恢复模糊搜索
+  裸 /、~/、./、../ 路径按字面前缀匹配；推荐限制不裁剪发现根",
             "Usage:
   cdh [options] [keywords...]  # Interactively pick a history directory (default)
   cdh log --dir <path>         # Record a directory visit (for shell hooks)
@@ -304,7 +306,9 @@ Options:
       --ignore-re <re>   Regex of paths to ignore (defaults to $CDH_IGNORE_RE)
       --no-check-dir     Skip the directory-exists check (on by default; CDH_CHECK_DIR=false disables it)
 
-  Remaining positional arguments are filter keywords (case-insensitive; any match counts)",
+  Remaining positional arguments are filter keywords (case-insensitive; any match counts)
+  TUI keeps argv boundaries and OR; quotes protect spaces, edits stay OR until cleared
+  Bare /, ~/, ./, ../ paths match literal prefixes; recommendation caps do not trim scan roots",
         )
     }
 

@@ -175,3 +175,129 @@ fn empty_history_non_tty_still_exits_two() {
     );
     assert!(output.stdout.is_empty());
 }
+
+/// A whitespace-only argument (`cdh " "`) must not become a literal token:
+/// it behaves exactly like an empty query. Non-TTY `cdh " "` and `cdh ""` both
+/// print the best history path (exit 0, no trailing newline); the blank
+/// argument is dropped by `controller` and never reaches the picker as an
+/// initial query. The raw, untrimmed argument is pushed otherwise, so argv
+/// boundaries such as the inner space of `"alpha beta"` stay intact.
+#[test]
+fn blank_argv_matches_best_history_like_empty_query() {
+    let test_dir = TestDir::new("blank-argv");
+    let home = test_dir.root.join("home");
+    let config_home = test_dir.root.join("config");
+    let data_home = test_dir.root.join("data");
+    let state_home = test_dir.root.join("state");
+    let cache_home = test_dir.root.join("cache");
+    let current_dir = test_dir.root.join("current");
+    let candidate = test_dir.root.join("candidate");
+    let history_dir = data_home.join("cdh/history");
+
+    for directory in [
+        &home,
+        &config_home,
+        &data_home,
+        &state_home,
+        &cache_home,
+        &current_dir,
+        &candidate,
+        &history_dir,
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+
+    fs::write(
+        history_dir.join("history_raw"),
+        format!("1\t{}\n", candidate.display()),
+    )
+    .unwrap();
+    fs::write(
+        history_dir.join("history_uniq"),
+        format!("{}\n", candidate.display()),
+    )
+    .unwrap();
+
+    for arg in [" ", ""] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cdh"))
+            .arg(arg)
+            .current_dir(&current_dir)
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_DATA_HOME", &data_home)
+            .env("XDG_STATE_HOME", &state_home)
+            .env("XDG_CACHE_HOME", &cache_home)
+            .env("LANG", "C.UTF-8")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "cdh {arg:?} failed with status {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout,
+            candidate.as_os_str().as_encoded_bytes(),
+            "cdh {arg:?} must print the best history path exactly"
+        );
+    }
+}
+
+/// The non-TTY contract for whitespace-only arguments still holds with an
+/// empty history: `cdh " "` exits 2 (no candidates) and prints nothing.
+#[test]
+fn blank_argv_with_empty_history_still_exits_two() {
+    let test_dir = TestDir::new("blank-argv-empty");
+    let home = test_dir.root.join("home");
+    let config_home = test_dir.root.join("config");
+    let data_home = test_dir.root.join("data");
+    let state_home = test_dir.root.join("state");
+    let cache_home = test_dir.root.join("cache");
+    let current_dir = test_dir.root.join("current");
+    let history_dir = data_home.join("cdh/history");
+
+    for directory in [
+        &home,
+        &config_home,
+        &data_home,
+        &state_home,
+        &cache_home,
+        &current_dir,
+        &history_dir,
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+
+    fs::write(history_dir.join("history_raw"), b"").unwrap();
+    fs::write(history_dir.join("history_uniq"), b"").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cdh"))
+        .arg(" ")
+        .current_dir(&current_dir)
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_DATA_HOME", &data_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CACHE_HOME", &cache_home)
+        .env("LANG", "C.UTF-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "cdh \" \" with empty history without a TTY must exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+}

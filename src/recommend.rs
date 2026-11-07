@@ -26,6 +26,8 @@
 //! 依赖：本 crate 需已提供 `Frecency` / `FrecencyIndex`（见 src/frecency.rs）。
 use crate::frecency::{Frecency, FrecencyIndex};
 use crate::history;
+use crate::search::{Query, SearchContext, Strength};
+use nucleo_matcher::{Config, Matcher};
 use regex::Regex;
 use std::{
     collections::{HashMap, HashSet},
@@ -135,7 +137,7 @@ struct RankedItem {
     breakdown: ScoreBreakdown,
     exists: bool,
     frecency_score: f64,
-    match_quality: f64,
+    match_quality: Strength,
 }
 
 /// 外部主接口：融合 RAW+UNIQ，返回路径+融合分。
@@ -146,107 +148,100 @@ pub fn recommend(opt: &RecommendOpt) -> Vec<Recommendation> {
 
 /// 变体：可注入“当前时间”，便于测试
 pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
-    // 预处理 tokens（一次性 lower）
-    let tokens_lc: Vec<String> = opt
-        .tokens
-        .iter()
-        .map(|t| t.trim().to_lowercase())
-        .filter(|t| !t.is_empty())
+    prepare_with_now(opt, now, false).items
+}
+
+pub(crate) struct RecommendationInput {
+    pub items: Vec<Recommendation>,
+    pub scan_paths: Vec<String>,
+    /// Unsorted safe history, before query/limit/threshold. Only interactive
+    /// callers request it; startup recommendations retain their original scores.
+    pub history_items: Vec<Recommendation>,
+}
+
+pub(crate) fn prepare_recommendations(
+    opt: &RecommendOpt,
+    collect_scan_paths: bool,
+) -> RecommendationInput {
+    prepare_with_now(opt, now_secs(), collect_scan_paths)
+}
+
+struct PathInput {
+    query: Query,
+    matcher: Matcher,
+    buffer: Vec<char>,
+    existence: HashMap<String, bool>,
+    scan_paths: Option<HashSet<String>>,
+    full_uniq_scores: HashMap<String, f64>,
+    full_raw: Option<RawSignals>,
+}
+
+impl PathInput {
+    fn accepts_safe(&mut self, opt: &RecommendOpt, path: &str) -> bool {
+        if path.is_empty() || opt.ignore_re.as_ref().is_some_and(|rx| rx.is_match(path)) {
+            return false;
+        }
+        let exists = *self
+            .existence
+            .entry(path.to_string())
+            .or_insert_with(|| !opt.check_dir || Path::new(path).is_dir());
+        if !exists && !opt.include_missing {
+            return false;
+        }
+        if opt.pwd.as_deref() != Some(path) {
+            if let Some(paths) = &mut self.scan_paths {
+                paths.insert(path.to_string());
+            }
+        }
+        true
+    }
+
+    fn matches_query(&mut self, path: &str) -> bool {
+        self.query
+            .strength(path, &mut self.matcher, &mut self.buffer)
+            .is_some()
+    }
+}
+
+fn prepare_with_now(opt: &RecommendOpt, now: i64, collect_scan_paths: bool) -> RecommendationInput {
+    let mut input = PathInput {
+        query: Query::cli(&opt.tokens, &SearchContext::from_process(opt.pwd.clone())),
+        matcher: Matcher::new(Config::DEFAULT.match_paths()),
+        buffer: Vec::new(),
+        existence: HashMap::new(),
+        scan_paths: collect_scan_paths.then(HashSet::new),
+        full_uniq_scores: HashMap::new(),
+        full_raw: (collect_scan_paths && !opt.tokens.is_empty())
+            .then(|| RawSignals::new(opt.half_life)),
+    };
+    let uniq_scores = load_uniq_scores(opt, &mut input);
+    let signals = build_raw_signals(opt, &mut input, now);
+
+    let scored = score_history(opt, now, &signals, &uniq_scores, &input.existence);
+    let history_items = if !collect_scan_paths {
+        Vec::new()
+    } else if let Some(full) = &input.full_raw {
+        score_history(opt, now, full, &input.full_uniq_scores, &input.existence)
+    } else {
+        scored.clone()
+    };
+    let mut items: Vec<RankedItem> = scored
+        .into_iter()
+        .filter(|item| opt.threshold <= 0.0 || item.score >= opt.threshold)
+        .map(|item| RankedItem {
+            match_quality: input
+                .query
+                .strength(&item.path, &mut input.matcher, &mut input.buffer)
+                .unwrap_or_default(),
+            frecency_score: item.breakdown.frecency_norm,
+            path: item.path,
+            final_score: item.score,
+            breakdown: item.breakdown,
+            exists: item.exists,
+        })
         .collect();
 
-    // 1) uniq -> 生成 “最近唯一”几何衰减分（本身已在 (0,1]，无需再归一化）
-    let uniq_scores = load_uniq_scores(
-        &opt.uniq,
-        &opt.ignore_re,
-        &tokens_lc,
-        opt.check_dir,
-        opt.include_missing,
-        opt.uniq_decay,
-    );
-
-    // 2) raw -> 流式提取信号：频次索引 + 每目录最近访问时刻 + 从 pwd 出发的转移权重
-    let signals = build_raw_signals(opt, &tokens_lc, now);
-
-    // 3) 候选集 = raw ∪ uniq，排除当前目录（跳到自己所在目录没有意义）
-    let mut candidates: HashSet<String> = signals.seen;
-    candidates.extend(uniq_scores.keys().cloned());
-    if let Some(pwd) = &opt.pwd {
-        candidates.remove(pwd);
-    }
-
-    // 4) 频次分（对数压缩）：ln(1+s)/ln(1+s_max)。
-    //    线性 min-max 会被“巨鲸”目录（分数是他人几十倍）压扁中部排序，对数压缩保留区分度。
-    let mut fre_max = 0.0f64;
-    for dir in &candidates {
-        fre_max = fre_max.max(signals.idx.score_at(dir, now));
-    }
-    let fre_log_max = (1.0 + fre_max).ln();
-
-    // 5) 上下文分归一化基准
-    let ctx_max = signals
-        .transitions
-        .values()
-        .fold(0.0f64, |acc, &v| acc.max(v));
-
-    // 6) 四分量融合 + 阈值过滤 + 排序
-    let mut items: Vec<RankedItem> = Vec::with_capacity(candidates.len());
-    for dir in candidates {
-        let exists = !opt.check_dir || Path::new(&dir).is_dir();
-        // 频次（对数压缩后 0~1）
-        let fz = {
-            let s = signals.idx.score_at(&dir, now);
-            if s > 0.0 && fre_log_max > 0.0 {
-                (1.0 + s).ln() / fre_log_max
-            } else {
-                0.0
-            }
-        };
-        // 最近性：短半衰期的“刚访问过”信号（0~1）
-        let rz = signals
-            .last_visit
-            .get(&dir)
-            .map(|&t| decay_weight(now - t, opt.recency_half_life))
-            .unwrap_or(0.0);
-        // 上下文：从 pwd 出发的历史转移 + 子目录小加成（0~1）
-        let cz = {
-            let trans = match signals.transitions.get(&dir) {
-                Some(&v) if ctx_max > 0.0 => v / ctx_max,
-                _ => 0.0,
-            };
-            let subdir_bonus = match &opt.pwd {
-                Some(pwd) if is_direct_child(&dir, pwd) => 0.25,
-                _ => 0.0,
-            };
-            (trans + subdir_bonus).min(1.0)
-        };
-        // 最近唯一名次（0~1）
-        let uz = *uniq_scores.get(&dir).unwrap_or(&0.0);
-
-        let final_score =
-            opt.w_frecency * fz + opt.w_recency * rz + opt.w_context * cz + opt.w_uniq * uz;
-        if opt.threshold <= 0.0 || final_score >= opt.threshold {
-            let match_quality = if tokens_lc.is_empty() {
-                0.0
-            } else {
-                keyword_match_quality_lc(&dir.to_lowercase(), &tokens_lc)
-            };
-            items.push(RankedItem {
-                path: dir,
-                final_score,
-                breakdown: ScoreBreakdown {
-                    frecency_norm: fz,
-                    recency_norm: rz,
-                    context_norm: cz,
-                    uniq_norm: uz,
-                },
-                exists,
-                frecency_score: fz,
-                match_quality,
-            });
-        }
-    }
-
-    if tokens_lc.is_empty() {
+    if input.query.empty() {
         // 主排序：final desc；次排序：frecency desc；再次：路径字典序
         items.sort_by(|a, b| {
             b.exists
@@ -260,7 +255,7 @@ pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
         items.sort_by(|a, b| {
             b.exists
                 .cmp(&a.exists)
-                .then_with(|| cmp_f64_desc(b.match_quality, a.match_quality))
+                .then_with(|| b.match_quality.cmp(&a.match_quality))
                 .then_with(|| cmp_f64_desc(b.final_score, a.final_score))
                 .then_with(|| cmp_f64_desc(b.frecency_score, a.frecency_score))
                 .then(a.path.cmp(&b.path))
@@ -273,10 +268,87 @@ pub fn recommend_with_now(opt: &RecommendOpt, now: i64) -> Vec<Recommendation> {
         breakdown: item.breakdown,
         exists: item.exists,
     });
-    match opt.limit {
+    let items = match opt.limit {
         Some(limit) => iter.take(limit).collect(),
         None => iter.collect(),
+    };
+    let mut scan_paths: Vec<_> = input.scan_paths.unwrap_or_default().into_iter().collect();
+    scan_paths.sort();
+    RecommendationInput {
+        items,
+        scan_paths,
+        history_items,
     }
+}
+
+/// Compute scores without sorting or checking the filesystem again. Full safe
+/// history and the original query-filtered recommendations use the same formula
+/// but retain their own normalization/transition baselines.
+fn score_history(
+    opt: &RecommendOpt,
+    now: i64,
+    signals: &RawSignals,
+    uniq_scores: &HashMap<String, f64>,
+    existence: &HashMap<String, bool>,
+) -> Vec<Recommendation> {
+    let mut candidates = signals.seen.clone();
+    candidates.extend(uniq_scores.keys().cloned());
+    if let Some(pwd) = &opt.pwd {
+        candidates.remove(pwd);
+    }
+    let fre_max = candidates
+        .iter()
+        .fold(0.0f64, |max, dir| max.max(signals.idx.score_at(dir, now)));
+    let fre_log_max = (1.0 + fre_max).ln();
+    let ctx_max = signals
+        .transitions
+        .values()
+        .fold(0.0f64, |max, &v| max.max(v));
+    candidates
+        .into_iter()
+        .map(|dir| {
+            let s = signals.idx.score_at(&dir, now);
+            let fz = if s > 0.0 && fre_log_max > 0.0 {
+                (1.0 + s).ln() / fre_log_max
+            } else {
+                0.0
+            };
+            let rz = signals
+                .last_visit
+                .get(&dir)
+                .map(|&t| decay_weight(now - t, opt.recency_half_life))
+                .unwrap_or(0.0);
+            let trans = match signals.transitions.get(&dir) {
+                Some(&v) if ctx_max > 0.0 => v / ctx_max,
+                _ => 0.0,
+            };
+            let subdir_bonus = if opt
+                .pwd
+                .as_ref()
+                .is_some_and(|pwd| is_direct_child(&dir, pwd))
+            {
+                0.25
+            } else {
+                0.0
+            };
+            let cz = (trans + subdir_bonus).min(1.0);
+            let uz = *uniq_scores.get(&dir).unwrap_or(&0.0);
+            Recommendation {
+                exists: existence.get(&dir).copied().unwrap_or(true),
+                path: dir,
+                score: opt.w_frecency * fz
+                    + opt.w_recency * rz
+                    + opt.w_context * cz
+                    + opt.w_uniq * uz,
+                breakdown: ScoreBreakdown {
+                    frecency_norm: fz,
+                    recency_norm: rz,
+                    context_norm: cz,
+                    uniq_norm: uz,
+                },
+            }
+        })
+        .collect()
 }
 
 /// 仅返回路径（同排序/同截断）
@@ -289,15 +361,8 @@ pub fn recommend_paths(opt: &RecommendOpt) -> Vec<String> {
 /// 从 uniq 生成几何衰减分：
 /// - 假设 uniq 文件通常“旧->新”，因此从尾到头赋分（最新=1.0，次新=decay，…）
 /// - 支持 ignore_re / tokens / check_dir 过滤
-fn load_uniq_scores(
-    uniq_file: &str,
-    ignore_re: &Option<Regex>,
-    tokens_lc: &[String],
-    check_dir: bool,
-    include_missing: bool,
-    decay: f64,
-) -> HashMap<String, f64> {
-    let f = match File::open(uniq_file) {
+fn load_uniq_scores(opt: &RecommendOpt, input: &mut PathInput) -> HashMap<String, f64> {
+    let f = match File::open(&opt.uniq) {
         Ok(f) => f,
         Err(_) => return HashMap::new(),
     };
@@ -309,22 +374,28 @@ fn load_uniq_scores(
 
     let mut scores = HashMap::with_capacity(lines.len());
     let mut k: usize = 0;
+    let mut full_k: usize = 0;
     for p in lines.drain(..).rev() {
-        if let Some(rx) = ignore_re {
-            if rx.is_match(&p) {
-                continue;
-            }
-        }
-        if !tokens_lc.is_empty() {
-            let lp = p.to_lowercase();
-            if !path_matches_tokens_lc(&lp, tokens_lc) {
-                continue;
-            }
-        }
-        if check_dir && !include_missing && !Path::new(&p).is_dir() {
+        if !input.accepts_safe(opt, &p) {
             continue;
         }
-        let s = decay.powi(k as i32);
+        if input.full_raw.is_some() {
+            let s = opt.uniq_decay.powi(full_k as i32);
+            input
+                .full_uniq_scores
+                .entry(p.clone())
+                .and_modify(|old| {
+                    if s > *old {
+                        *old = s;
+                    }
+                })
+                .or_insert(s);
+            full_k += 1;
+        }
+        if !input.matches_query(&p) {
+            continue;
+        }
+        let s = opt.uniq_decay.powi(k as i32);
         // 若重复，保留更“新”的那次（分更大）
         scores
             .entry(p)
@@ -350,6 +421,44 @@ struct RawSignals {
     /// 从 `opt.pwd` 出发的转移权重：key = 紧跟在 pwd 之后访问的目录，
     /// value = Σ 0.5^((now-t)/half_life)（越近的转移权重越大）
     transitions: HashMap<String, f64>,
+    last_counted: HashMap<String, i64>,
+    prev: Option<String>,
+}
+
+impl RawSignals {
+    fn new(half_life: f64) -> Self {
+        Self {
+            idx: FrecencyIndex::new(Frecency::new(half_life)),
+            seen: HashSet::new(),
+            last_visit: HashMap::new(),
+            transitions: HashMap::new(),
+            last_counted: HashMap::new(),
+            prev: None,
+        }
+    }
+
+    fn record(&mut self, opt: &RecommendOpt, path: &str, t: i64, now: i64) {
+        self.last_visit
+            .entry(path.to_string())
+            .and_modify(|old| *old = (*old).max(t))
+            .or_insert(t);
+        self.seen.insert(path.to_string());
+        if let Some(&last) = self.last_counted.get(path) {
+            let dt = t - last;
+            if dt >= 0 && dt < opt.debounce_secs {
+                return;
+            }
+        }
+        self.last_counted.insert(path.to_string(), t);
+        if let (Some(pwd), Some(prev_path)) = (&opt.pwd, &self.prev) {
+            if prev_path == pwd && path != pwd {
+                *self.transitions.entry(path.to_string()).or_insert(0.0) +=
+                    decay_weight(now - t, opt.half_life);
+            }
+        }
+        self.idx.record_visit(path.to_string(), t);
+        self.prev = Some(path.to_string());
+    }
 }
 
 /// 流式扫描 raw：
@@ -357,24 +466,13 @@ struct RawSignals {
 ///   （新开 shell/多标签会反复记录同一目录，不防抖会把 $HOME 类目录分数灌爆）；
 /// - last_visit：始终更新（防抖只影响频次，不影响“最近去过”事实）；
 /// - transitions：统计紧跟在 pwd 之后访问的目录（一阶转移），带时间衰减。
-fn build_raw_signals(opt: &RecommendOpt, tokens_lc: &[String], now: i64) -> RawSignals {
-    let model = Frecency::new(opt.half_life);
-    let mut signals = RawSignals {
-        idx: FrecencyIndex::new(model),
-        seen: HashSet::new(),
-        last_visit: HashMap::new(),
-        transitions: HashMap::new(),
-    };
+fn build_raw_signals(opt: &RecommendOpt, input: &mut PathInput, now: i64) -> RawSignals {
+    let mut signals = RawSignals::new(opt.half_life);
 
     let f = match File::open(&opt.raw) {
         Ok(f) => f,
         Err(_) => return signals,
     };
-
-    // 每目录“上次计入频次”的时刻（防抖窗口判断用）
-    let mut last_counted: HashMap<String, i64> = HashMap::new();
-    // 上一条计入的访问（转移统计的前驱）
-    let mut prev: Option<(i64, String)> = None;
 
     for line in read_trimmed_lines(BufReader::new(f)) {
         let Some((ts, p)) = line.split_once('\t') else {
@@ -385,48 +483,17 @@ fn build_raw_signals(opt: &RecommendOpt, tokens_lc: &[String], now: i64) -> RawS
         };
         let path = p.trim().to_string();
 
-        if let Some(rx) = &opt.ignore_re {
-            if rx.is_match(&path) {
-                continue;
-            }
-        }
-        if !tokens_lc.is_empty() {
-            let lp = path.to_lowercase();
-            if !path_matches_tokens_lc(&lp, tokens_lc) {
-                continue;
-            }
-        }
-        if opt.check_dir && !opt.include_missing && !Path::new(&path).is_dir() {
+        if !input.accepts_safe(opt, &path) {
             continue;
         }
-
-        // 最近访问时刻始终更新
-        signals
-            .last_visit
-            .entry(path.clone())
-            .and_modify(|old| *old = (*old).max(t))
-            .or_insert(t);
-        signals.seen.insert(path.clone());
-
-        // 防抖：窗口内的重复访问不再计入频次/转移
-        if let Some(&last) = last_counted.get(&path) {
-            let dt = t - last;
-            if dt >= 0 && dt < opt.debounce_secs {
-                continue;
-            }
+        // Collect both views during the same read/stat pass. The query-filtered
+        // view preserves existing recommendation normalization and transitions.
+        if let Some(full) = &mut input.full_raw {
+            full.record(opt, &path, t, now);
         }
-        last_counted.insert(path.clone(), t);
-
-        // 转移统计：前驱是 pwd 且目标不同，则给目标加衰减权重
-        if let (Some(pwd), Some((_, prev_path))) = (&opt.pwd, &prev) {
-            if prev_path == pwd && path != *pwd {
-                *signals.transitions.entry(path.clone()).or_insert(0.0) +=
-                    decay_weight(now - t, opt.half_life);
-            }
+        if input.matches_query(&path) {
+            signals.record(opt, &path, t, now);
         }
-
-        signals.idx.record_visit(path.clone(), t);
-        prev = Some((t, path));
     }
     signals
 }
@@ -478,116 +545,6 @@ fn read_trimmed_lines(reader: impl BufRead) -> Vec<String> {
         }
     }
     lines
-}
-
-fn path_matches_tokens_lc(path_lc: &str, tokens_lc: &[String]) -> bool {
-    tokens_lc.iter().any(|token| path_lc.contains(token))
-}
-
-fn keyword_match_quality_lc(path_lc: &str, tokens_lc: &[String]) -> f64 {
-    if tokens_lc.is_empty() {
-        return 0.0;
-    }
-
-    let mut matched = 0usize;
-    let mut sum = 0.0f64;
-    let mut best = 0.0f64;
-
-    for token in tokens_lc {
-        let quality = token_match_quality_lc(path_lc, token);
-        if quality > 0.0 {
-            matched += 1;
-            sum += quality;
-            if quality > best {
-                best = quality;
-            }
-        }
-    }
-
-    if matched == 0 {
-        return 0.0;
-    }
-
-    let coverage = matched as f64 / tokens_lc.len() as f64;
-    let average_quality = sum / matched as f64;
-    coverage * 1000.0 + average_quality + best / 1000.0
-}
-
-fn token_match_quality_lc(path_lc: &str, token_lc: &str) -> f64 {
-    if token_lc.is_empty() {
-        return 0.0;
-    }
-
-    let bytes = path_lc.as_bytes();
-    let token_len = token_lc.len();
-    let mut best = 0.0;
-
-    for (start, _) in path_lc.match_indices(token_lc) {
-        let end = start + token_len;
-        let segment_start_idx = path_lc[..start]
-            .rfind(['/', '\\'])
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        let segment_end_idx = path_lc[end..]
-            .find(['/', '\\'])
-            .map(|idx| end + idx)
-            .unwrap_or(path_lc.len());
-        let distance_from_basename = path_lc[segment_end_idx..]
-            .bytes()
-            .filter(|&byte| matches!(byte, b'/' | b'\\'))
-            .count();
-
-        // Avoid letting broad ancestors such as `github.com` make every repository
-        // look like a strong match for `git`. A token must match the basename or
-        // its direct parent segment; broader ancestors are too generic for ranking.
-        if distance_from_basename >= 2 {
-            continue;
-        }
-
-        let segment_start = start == segment_start_idx;
-        let segment_end = end == segment_end_idx;
-        let before_boundary = start == 0 || is_match_boundary(bytes.get(start - 1).copied());
-        let after_boundary = end == path_lc.len() || is_match_boundary(bytes.get(end).copied());
-        let in_basename = distance_from_basename == 0;
-
-        let quality = if segment_start && segment_end {
-            if in_basename {
-                120.0
-            } else {
-                100.0
-            }
-        } else if before_boundary && after_boundary {
-            if in_basename {
-                110.0
-            } else {
-                90.0
-            }
-        } else if !in_basename {
-            // Parent directory matches are only useful when they match a clear token
-            // boundary. Prefixes like `git` in `github_parent` are too broad and
-            // would keep unrelated children such as `github_parent/plain-project`.
-            0.0
-        } else if segment_start {
-            100.0
-        } else if before_boundary {
-            90.0
-        } else {
-            35.0
-        };
-
-        if quality > best {
-            best = quality;
-        }
-    }
-
-    best
-}
-
-fn is_match_boundary(byte: Option<u8>) -> bool {
-    matches!(
-        byte,
-        None | Some(b'/') | Some(b'\\') | Some(b'-') | Some(b'_') | Some(b'.') | Some(b' ')
-    )
 }
 
 /* ---------------------------------- 测试 ---------------------------------- */
@@ -654,6 +611,142 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn scan_paths_collect_raw_and_uniq_before_query_limit_and_threshold() {
+        let case = TempCase::new("anchors");
+        let raw_dir = case.root.join("external/visited");
+        let uniq_dir = case.root.join("home/alpha");
+        fs::create_dir_all(&raw_dir).unwrap();
+        fs::create_dir_all(&uniq_dir).unwrap();
+        let raw = case.root.join("raw");
+        let uniq = case.root.join("uniq");
+        fs::write(
+            &raw,
+            format!(
+                "1000\t{}\ninvalid\t/invalid-anchor\n1000\t\n",
+                raw_dir.display()
+            ),
+        )
+        .unwrap();
+        fs::write(&uniq, format!("{}\n", uniq_dir.display())).unwrap();
+        let mut opt = RecommendOpt {
+            raw: raw.to_string_lossy().into_owned(),
+            uniq: uniq.to_string_lossy().into_owned(),
+            ..RecommendOpt::default()
+        };
+        let baseline = prepare_with_now(&opt, 1000, true);
+        let expected = baseline.scan_paths;
+        assert_eq!(expected.len(), 2);
+        for tokens in [vec!["alpha".into()], vec!["absent".into()]] {
+            opt.tokens = tokens;
+            opt.limit = Some(1);
+            opt.threshold = 2.0;
+            let input = prepare_with_now(&opt, 1000, true);
+            assert!(input.items.is_empty());
+            assert_eq!(input.scan_paths, expected);
+            assert_eq!(input.history_items.len(), 2);
+            for item in &input.history_items {
+                let original = baseline.items.iter().find(|r| r.path == item.path).unwrap();
+                assert_eq!(item.score, original.score);
+                assert_eq!(
+                    item.breakdown.frecency_norm,
+                    original.breakdown.frecency_norm
+                );
+                assert_eq!(item.breakdown.recency_norm, original.breakdown.recency_norm);
+                assert_eq!(item.breakdown.context_norm, original.breakdown.context_norm);
+                assert_eq!(item.breakdown.uniq_norm, original.breakdown.uniq_norm);
+                assert_eq!(item.exists, original.exists);
+            }
+        }
+        let non_interactive = prepare_with_now(&opt, 1000, false);
+        assert!(non_interactive.scan_paths.is_empty());
+        assert!(non_interactive.history_items.is_empty());
+    }
+
+    #[test]
+    fn scan_paths_keep_ignore_pwd_and_missing_policy_before_query() {
+        let case = TempCase::new("eligibility");
+        let keep = case.root.join("keep");
+        let ignore = case.root.join("ignore");
+        let pwd = case.root.join("cwd");
+        let missing = case.root.join("missing");
+        for path in [&keep, &ignore, &pwd] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let uniq = case.root.join("uniq");
+        fs::write(
+            &uniq,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                keep.display(),
+                ignore.display(),
+                pwd.display(),
+                missing.display()
+            ),
+        )
+        .unwrap();
+        let mut opt = RecommendOpt {
+            uniq: uniq.to_string_lossy().into_owned(),
+            tokens: vec!["absent".into()],
+            pwd: Some(pwd.to_string_lossy().into_owned()),
+            ignore_re: Some(Regex::new("/ignore$").unwrap()),
+            ..RecommendOpt::default()
+        };
+        let input = prepare_with_now(&opt, 1000, true);
+        assert_eq!(input.scan_paths, vec![keep.to_string_lossy().into_owned()]);
+        assert_eq!(input.history_items.len(), 1);
+        assert_eq!(input.history_items[0].path, keep.to_string_lossy());
+        assert!(input.history_items[0].exists);
+        opt.include_missing = true;
+        let input = prepare_with_now(&opt, 1000, true);
+        let stale = input
+            .history_items
+            .iter()
+            .find(|r| r.path == missing.to_string_lossy())
+            .unwrap();
+        assert!(!stale.exists);
+        let paths = input.scan_paths;
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&missing.to_string_lossy().into_owned()));
+        opt.check_dir = false;
+        opt.include_missing = false;
+        assert_eq!(prepare_with_now(&opt, 1000, true).scan_paths, paths);
+    }
+
+    #[test]
+    fn path_query_rejects_unrelated_history_and_basename_beats_multi_ancestor_hits() {
+        let case = TempCase::new("intent");
+        let dirs = [
+            case.root.join("alpha/beta/child"),
+            case.root.join("cold/alpha"),
+            case.root.join("alpha beta"),
+        ];
+        for path in &dirs {
+            fs::create_dir_all(path).unwrap();
+        }
+        let uniq = case.root.join("uniq");
+        fs::write(
+            &uniq,
+            dirs.iter()
+                .map(|p| format!("{}\n", p.display()))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let mut opt = RecommendOpt {
+            uniq: uniq.to_string_lossy().into_owned(),
+            tokens: vec!["alpha".into(), "beta".into()],
+            ..RecommendOpt::default()
+        };
+        assert_eq!(
+            recommend_with_now(&opt, 1000)[0].path,
+            dirs[1].to_string_lossy()
+        );
+        opt.tokens = vec![dirs[2].to_string_lossy().into_owned()];
+        let items = recommend_with_now(&opt, 1000);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, dirs[2].to_string_lossy());
     }
 
     #[test]
